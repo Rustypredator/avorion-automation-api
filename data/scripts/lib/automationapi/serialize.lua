@@ -53,6 +53,47 @@ end
 
 -- #### GAME TYPES #### --
 
+-- Format arguments arrive as PluralForm userdata. tostring() on one gives a raw pointer -
+-- meaningless to a caller, and different on every server run, so two otherwise identical
+-- responses would not compare equal. The readable text is on the object; if there is none,
+-- the argument is dropped rather than reported as an address.
+local function argumentText(value)
+    local kind = type(value)
+
+    if kind == "string" then return value end
+    if kind == "number" or kind == "boolean" then return tostring(value) end
+    if kind ~= "userdata" and kind ~= "table" then return nil end
+
+    -- Only fields PluralForm actually has, and only for userdata. Reading a property an
+    -- engine type does not have does not return nil - it raises, and the engine logs a
+    -- full traceback on the way out even though the pcall catches it. Probing `text` here
+    -- filled the server log with "Property not found: PluralForm.text", once per station
+    -- title argument of every predicted sector.
+    --
+    -- An empty string counts as an answer. Some arguments legitimately are empty - the
+    -- size suffix of an unsized factory, for one - and treating that as a miss is what
+    -- made the probe fall through to a field that does not exist.
+    if kind == "userdata" then
+        for _, field in ipairs({"translated", "singular"}) do
+            local ok, text = pcall(function() return value[field] end)
+            if ok and type(text) == "string" then return text end
+        end
+    else
+        local ok, text = pcall(function() return value.text end)
+        if ok and type(text) == "string" then return text end
+    end
+
+    local ok, text = pcall(tostring, value)
+    if ok and type(text) == "string" and not string.match(text, "^userdata: ") then
+        return text
+    end
+
+    return nil
+end
+
+Serialize.argumentText = argumentText
+
+
 -- Vanilla error and status strings are "..."%_T templates carrying named arguments.
 -- Both halves are kept: `template` is stable enough for a planner to branch on, while
 -- `text` is what a human should read.
@@ -75,12 +116,46 @@ function Serialize.format(fmt)
     local okArgs, raw = pcall(function() return fmt:arguments() end)
     if okArgs and type(raw) == "table" then
         for k, v in pairs(raw) do
-            args[tostring(k)] = Serialize.string(v)
+            args[tostring(k)] = argumentText(v)
         end
     end
     result.args = args
 
     return result
+end
+
+-- Flattens a Format or NamedFormat down to one readable string.
+--
+-- Wanted wherever the value is data rather than a message - station titles, which a
+-- caller searches on. evaluate() localizes, but it needs a language loaded and returns
+-- the raw template when there is none, so ${name} substitution is the fallback.
+function Serialize.formatText(value)
+    if value == nil then return nil end
+    if type(value) == "string" then return Serialize.displayName(value) end
+
+    local ok, evaluated = pcall(function() return value:evaluate() end)
+    if ok and type(evaluated) == "string" and evaluated ~= ""
+       and not string.find(evaluated, "${", 1, true) then
+        return Serialize.displayName(evaluated)
+    end
+
+    local template
+    local okText, raw = pcall(function() return value.text end)
+    template = (okText and type(raw) == "string") and raw or tostring(value)
+
+    local args = {}
+    local okArgs, rawArgs = pcall(function() return value:arguments() end)
+    if okArgs and type(rawArgs) == "table" then
+        for key, argument in pairs(rawArgs) do
+            args[tostring(key)] = argumentText(argument)
+        end
+    end
+
+    local filled = string.gsub(template, "%${(%w+)}", function(name)
+        return args[name] or ("${" .. name .. "}")
+    end)
+
+    return Serialize.displayName(filled)
 end
 
 -- Pairs a template with its argument table the way vanilla returns them:
@@ -91,7 +166,7 @@ function Serialize.message(template, args)
     if type(template) ~= "string" then
         local result = Serialize.format(template)
         if args then
-            for k, v in pairs(args) do result.args[tostring(k)] = Serialize.string(v) end
+            for k, v in pairs(args) do result.args[tostring(k)] = argumentText(v) end
         end
         return result
     end
@@ -99,13 +174,23 @@ function Serialize.message(template, args)
     local out = {template = template, args = {}, text = template}
 
     if type(args) == "table" then
-        for k, v in pairs(args) do out.args[tostring(k)] = Serialize.string(v) end
+        for k, v in pairs(args) do out.args[tostring(k)] = argumentText(v) end
     end
 
-    -- best-effort ${name} substitution so logs are readable without the game's locale
+    -- best-effort substitution so logs are readable without the game's locale. Vanilla
+    -- uses both named ${slots} and positional %1% ones, and ship status messages are
+    -- mostly the latter.
     out.text = string.gsub(template, "%${(%w+)}", function(name)
         return out.args[name] or ("${" .. name .. "}")
     end)
+
+    out.text = string.gsub(out.text, "%%(%d+)%%", function(index)
+        return out.args[index] or ("%" .. index .. "%")
+    end)
+
+    -- `template` stays raw so a caller can still match on it, but the rendered text drops
+    -- the translator hints the game embeds ("Idle /* ship AI status */").
+    out.text = Serialize.displayName(out.text)
 
     return out
 end

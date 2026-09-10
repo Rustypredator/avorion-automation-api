@@ -49,9 +49,10 @@ The mod is `serverSideOnly`, so clients do not download it and do not need it in
 | A | transport, auth, routing, `/ping` | done |
 | B | ship list and ship detail | done |
 | C | mission catalog, preview, start, status, recall, collect | done |
-| D | ship movement | not started |
-| E | map knowledge and station search | not started |
-| F | event stream, reference HTTP bridge | not started |
+| D | ship movement, in-sector orders, route planning | done |
+| E | map knowledge, seed prediction, station search | done |
+| F | per-ship event log | done |
+| F | reference HTTP bridge | not started |
 
 Reads work while the owning player is offline. Starting a mission does not: captain missions
 are driven by a player script, so they only run while that player is logged in. That is a
@@ -62,11 +63,36 @@ vanilla limitation - captain missions do not tick for offline players either.
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-lua5.4 tests/test_bridge.lua
-lua5.4 tests/test_ships.lua
-lua5.4 tests/test_missions.lua
+for t in bridge ships missions movement map; do lua5.4 tests/test_$t.lua; done
 ```
 
-`tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour - notably
-that `os.rename` reports success and then loses the file - so bugs that would only show up
-in game fail in tests instead.
+`tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather
+than a convenient version of it, so bugs that would otherwise only show up in game fail in
+tests instead. It reproduces, among others:
+
+- `os.rename` reporting success and then losing the file
+- `Player:invokeFunction` being fatal outside a player script
+- engine enums being userdata that `pairs()` will not iterate
+- `sectorspecifics` exposing its static functions only through an instance
+- `orderchain` reaching only functions the game marks `callable()`
+- a captured owner handle serving a cached `ShipInfo` that never advances
+- `Simulation.getCommandUIData` raising for an idle ship, traceback and all
+
+## Architecture
+
+Two scripts, because the game forces the split:
+
+- `data/scripts/galaxy/automationapi/bridge.lua` runs on the Galaxy, so it ticks whether or
+  not anyone is logged in. It owns the transport, auth, routing and every read.
+- `data/scripts/player/automationapi/agent.lua` runs on the Player. Everything that writes
+  goes through it.
+
+The split is not a style choice. A galaxy script calling `Player:invokeFunction` **segfaults
+the server** - no error, no return code, the process dies. Verified against 2.5.13 with the
+exact call shape vanilla uses, and every vanilla caller of the background simulation is a
+player script. So the bridge parks a job and the agent, running in the one context where the
+call is legal, executes it and reports back.
+
+Both vanilla overlays exist only to add one `addScriptOnce` line each:
+`data/scripts/galaxy/init.lua` attaches the bridge, `data/scripts/player/init.lua` attaches
+the agent.

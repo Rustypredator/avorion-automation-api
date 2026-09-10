@@ -5,6 +5,8 @@ local M = {}
 
 local root = os.getenv("MOCK_ROOT") or "/tmp/avorion-mock"
 
+local function keyOf(x, y) return x .. ":" .. y end
+
 local serverValues = {}
 local playerValues = {}
 local players = {}
@@ -22,6 +24,16 @@ function M.install()
         if M.stubs[path] then return M.stubs[path] end
         return require((string.gsub(path, "/", ".")))
     end
+
+    -- lib/ordertypes.lua defines this global as a side effect of being included. Values
+    -- are the game's own; the order confirmation matches published chains against them.
+    _G.OrderType =
+    {
+        Jump = 1, Mine = 2, Salvage = 3, Loop = 4, Aggressive = 5, Patrol = 6,
+        Escort = 9, AttackCraft = 10, FlyThroughWormhole = 11, FlyToPosition = 12,
+        GuardPosition = 13, RefineOres = 14, Board = 15, RepairTarget = 16, Repair = 17,
+        DockToStation = 19,
+    }
 
     _G.onClient = function() return false end
     _G.onServer = function() return true end
@@ -79,6 +91,8 @@ function M.install()
     _G.Server = function() return server end
 
     _G.Player = function(index)
+        -- In a player script Player() means "the player this script is attached to".
+        if index == nil then index = M.currentPlayer end
         if index == nil then return nil end
         local p = players[index]
         if not p then return nil end
@@ -180,9 +194,146 @@ function M.install()
         return
         {
             findFaction = function(_, index) return players[index] or M.alliances[index] end,
-            sectorInRift = function() return false end,
-            sectorLoaded = function() return true end,
+            sectorInRift = function(_, x, y) return M.riftSectors[keyOf(x, y)] == true end,
+            sectorLoaded = function(_, x, y)
+                if M.loadedSectors == nil then return true end
+                return M.loadedSectors[keyOf(x, y)] == true
+            end,
+            sectorExists = function() return true end,
+            jumpRouteUnobstructed = function() return M.jumpUnobstructed ~= false end,
+            keepSector = function() return true end,
+            -- The agent -> bridge direction, proven safe in game.
+            invokeFunction = function(_, script, functionName, ...)
+                local fn = AutomationApiBridge and AutomationApiBridge[functionName]
+                if not fn then return 4 end
+                return 0, fn(...)
+            end,
         }
+    end
+
+    _G.vec2 = function(x, y) return {x = x or 0, y = y or 0} end
+    _G.ivec2 = function(x, y) return {x = x or 0, y = y or 0} end
+
+    _G.GameSeed = function() return {int32 = 4242, string = "MOCKSEED"} end
+    _G.GameSettings = function() return {rifts = 200, mapFactions = 20} end
+
+    -- A SectorView is engine userdata with properties and a handful of vararg getters.
+    -- Modelled as a plain table, which is close enough: nothing in the mod does anything
+    -- to one but read it.
+    _G.SectorView = function(spec)
+        local v = spec or {}
+
+        v.x = v.x or 0
+        v.y = v.y or 0
+        v.name = v.name or (v.x .. " : " .. v.y)
+        v.visited = v.visited ~= false
+        v.factionIndex = v.factionIndex or 0
+        v.numStations = v.numStations or 0
+        v.numShips = v.numShips or 0
+        v.numAsteroids = v.numAsteroids or 0
+        v.numWrecks = v.numWrecks or 0
+        v.influence = v.influence or 0
+        v.timeStamp = v.timeStamp or 0
+        v.hasContent = v.hasContent or (v.numStations > 0)
+        v.deathLocation = v.deathLocation == true
+        v.manuallyTagged = v.manuallyTagged == true
+        v.note = v.note or "note"
+        v.stations = v.stations or {}
+        v.gates = v.gates or {}
+        v.wormholes = v.wormholes or {}
+
+        function v:getCoordinates() return self.x, self.y end
+        function v:setCoordinates(x, y) self.x, self.y = x, y end
+        function v:getStationTitles() return table.unpack(self.stations) end
+        function v:setStationTitles(...) self.stations = {...} end
+        function v:getGateDestinations() return table.unpack(self.gates) end
+        function v:setGateDestinations(...) self.gates = {...} end
+        function v:getWormHoleDestinations() return table.unpack(self.wormholes) end
+        function v:setWormHoleDestinations(...) self.wormholes = {...} end
+        function v:getCustomEntries() return self.customEntries or {} end
+        function v:getStationsByFaction() return self.stationsByFaction or {} end
+        function v:getShipsByFaction() return self.shipsByFaction or {} end
+        function v:getCraftsByFaction() return self.craftsByFaction or {} end
+        function v:calculateInfluence(stations) return (stations or 0) * 0.1 end
+
+        return v
+    end
+
+    -- calculateJumpPath is the engine's pathfinder. The mock walks a straight line in
+    -- jump-range steps, which is enough to exercise hop counting and the "route too
+    -- short" gate without pretending to be a pathfinder.
+    _G.calculateJumpPath = function(player, alliance, origin, destination, jumpRange, rifts)
+        if M.routeResult ~= nil then return M.routeResult end
+
+        local route = {{x = origin.x, y = origin.y}}
+        local x, y = origin.x, origin.y
+        local step = math.max(1, math.floor(jumpRange or 1))
+
+        for _ = 1, 200 do
+            if x == destination.x and y == destination.y then break end
+
+            local dx = math.max(-step, math.min(step, destination.x - x))
+            local dy = math.max(-step, math.min(step, destination.y - y))
+            x, y = x + dx, y + dy
+
+            route[#route + 1] = {x = x, y = y}
+        end
+
+        return route
+    end
+
+    -- Fire-and-forget by design; the mock records that it was asked, and then models the
+    -- one observable consequence: orderchain.lua publishes the resulting chain back to the
+    -- owning faction (setShipOrderInfo), which is how a dispatch can be confirmed at all.
+    local chainEffects =
+    {
+        clearAllOrders       = function(c) return {} end,
+        addJumpOrder         = function(c) c[#c + 1] = {name = "Jump", action = 1} return c end,
+        addAggressiveOrder   = function(c) c[#c + 1] = {name = "Aggressive", action = 5} return c end,
+        addPatrolOrder       = function(c) c[#c + 1] = {name = "Patrol", action = 6} return c end,
+        addRepairOrder       = function(c) c[#c + 1] = {name = "Repair", action = 17} return c end,
+        -- the one-shot wrappers replace the chain wholesale, as the engine's do
+        onUserMineOrder      = function() return {{name = "Mine", action = 2}} end,
+        onUserSalvageOrder   = function() return {{name = "Salvage", action = 3}} end,
+        onUserRefineOresOrder = function() return {{name = "Refine Ores", action = 14}} end,
+    }
+
+    _G.invokeEntityFunction = function(x, y, printErrors, target, script, functionName, ...)
+        M.entityCalls[#M.entityCalls + 1] =
+        {
+            x = x, y = y, target = target, script = script,
+            fn = functionName, args = {...},
+        }
+
+        local ship = target and M.getShip(target.faction, target.name)
+        -- orderChainFrozen models the engine refusing an order without saying so, which is
+        -- the case the confirmation step exists to catch
+        if ship and not M.orderChainFrozen then
+            ship.chain = ship.chain or {}
+            local effect = chainEffects[functionName]
+            if effect then
+                ship.chain = effect(ship.chain)
+                ship.chainIndex = 0
+            elseif functionName == "runOrders" then
+                ship.chainIndex = math.min(1, #ship.chain)
+            end
+
+            -- The engine raises onShipOrderInfoUpdated on the owning faction whenever the
+            -- chain changes; the player agent forwards it to the bridge. Tests install the
+            -- forwarding end as `shipEventSink`, standing in for the agent.
+            if M.shipEventSink and (effect or functionName == "runOrders") then
+                local chain = {}
+                for index, order in ipairs(ship.chain) do
+                    chain[index] = {name = order.name, action = order.action}
+                end
+
+                M.shipEventSink(target.faction, target.name, "order",
+                                {chain = chain, activeIndex = ship.chainIndex or 0,
+                                 finished = false, x = x, y = y})
+            end
+        end
+
+        return 0
     end
 
     -- asyncf runs on a worker thread in the game; here it queues so tests decide when
@@ -193,6 +344,9 @@ function M.install()
 
     M.stubs =
     {
+        -- lib/ordertypes.lua defines OrderType as a global and returns the display table.
+        -- Values mirror the game's exactly; the confirmation matches on them.
+        ordertypes = setmetatable({}, {__call = function() return {} end}),
         captainclass = {None = 0, Commodore = 1, Smuggler = 2, Merchant = 3, Miner = 4,
                         Scavenger = 5, Explorer = 6, Daredevil = 7, Scientist = 8, Hunter = 9},
         simulationutility =
@@ -214,6 +368,74 @@ function M.install()
                 }
             end,
         },
+        -- lib/galaxy.lua only exists for its Balancing_* globals, which are installed
+        -- below; the module itself is never indexed by this mod.
+        galaxy = {},
+
+        -- The seed-derived generator. The real one reproduces the galaxy generator's
+        -- decision layer; the mock reads a table the test set up, so the endpoints can
+        -- be exercised without shipping a galaxy.
+        -- Note the shape: the real module returns {new = new} with a __call metamethod
+        -- and NOT the class table, so determineFastContent is reachable only through an
+        -- instance. That is reproduced here, because getting it wrong silently rules out
+        -- every sector in the galaxy.
+        sectorspecifics = setmetatable({},
+        {
+            __call = function()
+                local instance =
+                {
+                    determineFastContent = function(x, y, seed)
+                        local spec = M.predicted[keyOf(x, y)]
+                        if not spec then return false, false, 0 end
+                        return spec.regular == true, spec.offgrid == true, spec.dustyness or 0
+                    end,
+                }
+
+                function instance:initialize(x, y, seed)
+                    local spec = M.predicted[keyOf(x, y)] or {}
+
+                    M.predictions = M.predictions + 1
+
+                    self.coordinates = {x = x, y = y}
+                    self.name = spec.name or (x .. " : " .. y)
+                    self.regular = spec.regular == true
+                    self.offgrid = spec.offgrid == true
+                    self.blocked = spec.blocked == true
+                    self.gates = spec.gates == true
+                    self.ancientGates = false
+                    self.dustyness = spec.dustyness or 0
+                    self.factionIndex = spec.factionIndex or 0
+                    self.centralArea = spec.centralArea == true
+                    self.stations = spec.stations or {}
+                    self.generationTemplate =
+                        (self.regular or self.offgrid) and {path = spec.template or "sectors/mock"}
+                        or nil
+                end
+
+                function instance:getScript()
+                    return self.generationTemplate and self.generationTemplate.path or ""
+                end
+
+                function instance:fillSectorView(view, gatesMap, withContent)
+                    view:setCoordinates(self.coordinates.x, self.coordinates.y)
+                    view.factionIndex = self.factionIndex
+                    view.name = self.name
+
+                    if withContent then
+                        view.numStations = #self.stations
+                        view:setStationTitles(table.unpack(self.stations))
+                    end
+                end
+
+                return instance
+            end,
+        }),
+
+        gatesmap = setmetatable({}, {__call = function()
+            return {getConnectedSectors = function() return {} end,
+                    hasGates = function() return false end}
+        end}),
+
         commandtype = M.commandTypes,
         commandfactory =
         {
@@ -232,6 +454,27 @@ function M.install()
         os.remove(oldname)
         return true
     end
+
+    -- lib/galaxy.lua's balancing curves. Straight-line stand-ins: the mod only passes
+    -- them through, so what matters is that they are called and produce finite numbers.
+    _G.Balancing_GetDimensions = function() return 1000 end
+    _G.Balancing_GetMaxCoordinates = function() return 500 end
+    _G.Balancing_GetMinCoordinates = function() return -499 end
+    _G.Balancing_GetBlockRingMin = function() return 147 end
+    _G.Balancing_GetBlockRingMax = function() return 150 end
+    _G.Balancing_InsideRing = function(x, y) return x * x + y * y < 147 * 147 end
+    _G.Balancing_GetTechLevel = function(x, y)
+        return math.max(1, 52 - math.floor(math.sqrt(x * x + y * y) / 10))
+    end
+    _G.Balancing_GetSectorRichnessFactor = function() return 3.5 end
+    _G.Balancing_GetPirateLevel = function() return 12 end
+    _G.Balancing_GetMaterialBeltRadius = function(material)
+        return (7 - material) / 7 - 0.1
+    end
+    _G.Balancing_GetMaterialProbability = function()
+        return {[0] = 0.5, [1] = 0.3, [2] = 0.2, [3] = 0, [4] = 0, [5] = 0, [6] = 0}
+    end
+    _G.Balancing_GetHighestAvailableMaterial = function() return 2 end
 
     M.errors = {}
 end
@@ -261,10 +504,33 @@ M.asyncQueue = {}
 M.alliances = {}
 M.simulationCalls = {}
 
+-- Map-layer state. `predicted` stands in for what the galaxy seed would generate;
+-- `entityCalls` records order-chain dispatch, which the engine gives no way to observe.
+M.predicted = {}
+M.predictions = 0
+M.entityCalls = {}
+M.orderChainFrozen = false
+-- set by tests to the bridge's pushShipEvent, standing in for the player agent
+M.shipEventSink = nil
+M.riftSectors = {}
+M.loadedSectors = nil
+M.jumpUnobstructed = true
+M.routeResult = nil
+
+-- How long the game takes to run its own area analysis, in seconds.
+M.analysisDelay = 1.2
+
+-- True while an area analysis callback is running, i.e. while on a background thread.
+M.inAsyncCallback = false
+
+-- True while the player agent is running, i.e. while Simulation calls are legal.
+M.inPlayerAgent = false
+
 -- Overridable by tests to drive the validation paths.
 M.commandError = nil
 M.commandErrorArgs = nil
 M.predictionError = nil
+M.predictionRaises = nil
 M.areaSize = {x = 15, y = 15}
 M.areaFixed = false
 
@@ -280,6 +546,11 @@ function M.makeCommand(missionType, shipName, area, config)
     function c:getPredictableValues() return {yields = {}, attackChance = {value = 0}} end
     function c:getErrors() return M.commandError, M.commandErrorArgs end
     function c:calculatePrediction()
+        -- Vanilla prediction code indexes things it assumes are there - the captain,
+        -- most often - and raises outright when they are not. That is a different
+        -- failure from returning an error, and the mod has to survive both.
+        if M.predictionRaises then error(M.predictionRaises, 0) end
+
         return {attackChance = {value = 0.12}, yields = {{from = 100, to = 200}},
                 error = M.predictionError}
     end
@@ -304,13 +575,24 @@ function M.flushAsync(results)
             biggestFactionInArea = 0,
         }
 
-        AutomationApiBridge[job.callback](shipName, missionType, area, analysis, callingPlayer)
+        -- The real callback resumes on the background thread that ran the analysis.
+        -- Engine reads survive that; invokeFunction takes the whole server down with a
+        -- SIGSEGV. Standing in an error for the segfault keeps that discipline testable.
+        M.inAsyncCallback = true
+        local ok, err = pcall(AutomationApiBridge[job.callback],
+                              shipName, missionType, area, analysis, callingPlayer)
+        M.inAsyncCallback = false
+
+        if not ok then error(err, 0) end
     end
 
     return #queued
 end
 
 local ships = {}
+
+-- Reaching a player object back out of the mock, so a test can move them between sectors.
+function M.player(index) return players[index] end
 
 function M.getShip(factionIndex, name)
     return ships[factionIndex] and ships[factionIndex][name] or nil
@@ -351,9 +633,79 @@ local function addCraftApi(faction)
     function faction:getShipAvailability(name)
         local s = M.getShip(self.index, name); return s and s.availability
     end
+    -- The engine hands this back as a JSON string, so the mock must too - the handler
+    -- decodes it rather than trusting a table.
+    function faction:getShipOrderInfo(name)
+        local s = M.getShip(self.index, name)
+        if not s then return nil end
+
+        local parts = {}
+        for _, order in ipairs(s.chain or {}) do
+            parts[#parts + 1] = string.format('{"action":%d,"name":"%s"}',
+                                              order.action or 0, order.name or "")
+        end
+
+        local ship = M.getShip(self.index, name)
+        return string.format('{"chain":[%s],"currentIndex":%d,"finished":%s}',
+                             table.concat(parts, ","), ship.chainIndex or 0,
+                             tostring(ship.chainFinished == true))
+    end
+
     function faction:getShipStatus(name)
         local s = M.getShip(self.index, name); return s and s.statusText
     end
+
+    function faction:getKnownSectorCoordinates()
+        local owned = M.known[self.index] or {}
+
+        local coords = {}
+        for _, view in pairs(owned) do
+            coords[#coords + 1] = {x = view.x, y = view.y}
+        end
+
+        table.sort(coords, function(a, b)
+            if a.y ~= b.y then return a.y < b.y end
+            return a.x < b.x
+        end)
+
+        return table.unpack(coords)
+    end
+
+    function faction:getKnownSector(x, y)
+        return (M.known[self.index] or {})[x .. ":" .. y]
+    end
+
+    function faction:getKnownSectors()
+        local owned = M.known[self.index] or {}
+        local views = {}
+        for _, view in pairs(owned) do views[#views + 1] = view end
+        return table.unpack(views)
+    end
+
+    function faction:getHomeSectorCoordinates()
+        local home = M.homeSectors[self.index]
+        if not home then return 0, 0 end
+        return home.x, home.y
+    end
+end
+
+M.known = {}
+M.homeSectors = {}
+
+-- spec fields mirror the SectorView properties; `stations` is a list of plain names
+function M.addKnownSector(factionIndex, x, y, spec)
+    spec = spec or {}
+    spec.x, spec.y = x, y
+
+    M.known[factionIndex] = M.known[factionIndex] or {}
+    M.known[factionIndex][x .. ":" .. y] = SectorView(spec)
+
+    return M.known[factionIndex][x .. ":" .. y]
+end
+
+-- What the seed would generate for a sector nobody has visited.
+function M.addPredictedSector(x, y, spec)
+    M.predicted[x .. ":" .. y] = spec or {}
 end
 
 function M.addPlayer(index, name)
@@ -369,21 +721,66 @@ function M.addPlayer(index, name)
     function p:setValue(key, value) values[key] = value end
     function p:getValue(key) return values[key] end
     function p:getValues() return values end
+    -- A galaxy script calling this segfaults the real server, so the mock refuses it
+    -- outright: only the player agent may reach Simulation. M.asPlayerAgent(fn) marks
+    -- the window in which that is legal.
     function p:invokeFunction(script, functionName, ...)
+        if not M.inPlayerAgent then
+            error("SIGSEGV: Player:invokeFunction is only legal from a player script, "
+                  .. "not from the galaxy bridge (" .. functionName .. ")", 0)
+        end
+
         local args = {...}
         M.simulationCalls[#M.simulationCalls + 1] = {fn = functionName, args = args}
 
-        -- startCommand reports failure only by chat message; a ship marked refuseStart
-        -- stands in for that, staying Available instead of going InBackground
-        if functionName == "startCommand" then
+        -- The game insists on a two-step handshake: startCommand refuses unless the
+        -- simulation is already holding an analysis it ran itself for that exact
+        -- mission type, and it announces the refusal only by chat message. The delay
+        -- is what forces the agent to retry rather than start in one pass.
+        if functionName == "startAreaAnalysis" then
             local ship = M.getShip(self.index, args[1])
-            if ship and not ship.refuseStart then
+            if ship then
+                ship.analyzedType = nil
+                ship.analysisReadyAt = clock + M.analysisDelay
+                ship.analysisPendingType = args[2]
+            end
+
+        elseif functionName == "startCommand" then
+            local ship = M.getShip(self.index, args[1])
+
+            if ship and ship.analysisReadyAt and clock >= ship.analysisReadyAt then
+                ship.analyzedType = ship.analysisPendingType
+                ship.analysisReadyAt = nil
+            end
+
+            if ship and not ship.refuseStart and ship.analyzedType == args[2] then
                 ship.availability = ShipAvailability.InBackground
             end
+
+        elseif functionName == "recall" or functionName == "forceRecall" then
+            local ship = M.getShip(self.index, args[1])
+            if ship and (functionName == "forceRecall" or not ship.refuseRecall) then
+                ship.availability = ShipAvailability.Available
+            end
+
+        elseif functionName == "takeYield" then
+            local ship = M.getShip(self.index, args[1])
+            if ship then ship.yields = 0 end
+        end
+
+        if functionName == "getNumYields" then
+            local ship = M.getShip(self.index, args[1])
+            return 0, (ship and ship.yields) or 0
         end
 
         return M.invokeResult or 0, M.invokeReturns and M.invokeReturns[functionName] or nil
     end
+
+    -- Where the player is standing. canReceivePlayerOrder() lets a captainless craft take
+    -- orders only while its owner shares its sector, so the order tests need to move this.
+    p.sectorX, p.sectorY = 0, 0
+    function p:getSectorCoordinates() return self.sectorX, self.sectorY end
+
     addCraftApi(p)
 
     players[index] = p
@@ -408,6 +805,19 @@ function M.addAlliance(index, name, memberIndex, privileges)
     return a
 end
 
+-- Runs fn in the context the player agent runs in: Simulation calls are legal and
+-- Player() resolves to the player the agent is attached to.
+function M.asPlayerAgent(index, fn)
+    if fn == nil then index, fn = 1, index end
+
+    M.inPlayerAgent = true
+    M.currentPlayer = index
+    local ok, err = pcall(fn)
+    M.inPlayerAgent = false
+    M.currentPlayer = nil
+    if not ok then error(err, 0) end
+end
+
 function M.setOffline(index) if players[index] then players[index].online = false end end
 function M.setOnline(index) if players[index] then players[index].online = true end end
 
@@ -426,8 +836,18 @@ function M.reset()
     M.alliances = {}
     M.asyncQueue = {}
     M.simulationCalls = {}
+    M.known = {}
+    M.homeSectors = {}
+    M.predicted = {}
+    M.predictions = 0
+    M.entityCalls = {}
+    M.riftSectors = {}
+    M.loadedSectors = nil
+    M.jumpUnobstructed = true
+    M.routeResult = nil
     M.commandError = nil
     M.predictionError = nil
+    M.predictionRaises = nil
     M.invokeResult = nil
     M.invokeReturns = nil
     clock = 1000.0

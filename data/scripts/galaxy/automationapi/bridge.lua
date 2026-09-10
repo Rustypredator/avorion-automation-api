@@ -19,6 +19,9 @@ local Serialize = include("automationapi/serialize")
 local MetaHandler = include("automationapi/handlers/meta")
 local ShipsHandler = include("automationapi/handlers/ships")
 local MissionsHandler = include("automationapi/handlers/missions")
+local MovementHandler = include("automationapi/handlers/movement")
+local ShipEvents = include("automationapi/shipevents")
+local MapHandler = include("automationapi/handlers/map")
 
 local Analysis = include("automationapi/analysis")
 
@@ -311,6 +314,8 @@ function AutomationApiBridge.initialize()
     MetaHandler.register(router)
     ShipsHandler.register(router)
     MissionsHandler.register(router)
+    MovementHandler.register(router)
+    MapHandler.register(router)
 
     ready = true
 
@@ -333,11 +338,53 @@ function AutomationApiBridge.onAreaAnalysisFinished(shipName, missionType, area,
     end
 end
 
+-- Called by player/automationapi/agent.lua, which is the only context allowed to talk to
+-- a player's Simulation. Payloads cross as JSON strings; see Missions.takeJobs.
+function AutomationApiBridge.takeJobs(playerIndex)
+    local ok, payload = pcall(MissionsHandler.takeJobs, playerIndex)
+
+    if not ok then
+        logError("takeJobs failed for %s: %s", tostring(playerIndex), tostring(payload))
+        return ""
+    end
+
+    return payload
+end
+
+function AutomationApiBridge.reportJobs(payload)
+    local ok, err = pcall(MissionsHandler.report, payload)
+
+    if not ok then
+        logError("reportJobs failed: %s", tostring(err))
+        return false
+    end
+
+    return true
+end
+
+-- Called by the player agent whenever the game raises a ShipInfo callback. Fire and
+-- forget from the agent's side, so failures are logged here or nowhere.
+function AutomationApiBridge.pushShipEvent(ownerIndex, shipName, kind, payload)
+    local ok, stored = pcall(ShipEvents.push, ownerIndex, shipName, kind, payload)
+
+    if not ok then
+        logError("pushShipEvent failed for %s: %s", tostring(shipName), tostring(stored))
+        return false
+    end
+
+    -- false means the event was a duplicate or malformed, not that the call failed
+    return stored == true
+end
+
 function AutomationApiBridge.update(timeStep)
     if not ready then return end
 
     sinceLastPoll = sinceLastPoll + timeStep
     if sinceLastPoll < Config.pollInterval then return end
+
+    -- Capture before resetting: the accumulator is the elapsed time the pending-start
+    -- queue needs, and zeroing it first would hand every tick a 0 and stall the queue.
+    local elapsed = sinceLastPoll
     sinceLastPoll = 0
 
     -- This runs inside the server tick. An uncaught error here would take the whole
@@ -347,6 +394,9 @@ function AutomationApiBridge.update(timeStep)
 
         poll()
         Analysis.tick()
+        MissionsHandler.tick(elapsed)
+        MovementHandler.tick(elapsed)
+        MapHandler.tick()
         expirePending(now)
         expireResponses(now)
     end)

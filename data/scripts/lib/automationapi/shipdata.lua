@@ -63,6 +63,16 @@ function ShipData.usable(ownerIndex, name, ignoredErrors)
     }
 end
 
+-- Whether the ship carries a captain. The order chain gates most orders on this and
+-- reports the refusal only as a chat message to a calling player, which we are not, so
+-- every order path has to ask this question up front instead of dispatching into silence.
+function ShipData.hasCaptain(ownerIndex, name)
+    local entry = ShipDatabaseEntry(ownerIndex, name)
+    if not entry then return false end
+
+    return safe(function() return entry:getCaptain() end) ~= nil
+end
+
 -- #### COMPONENTS #### --
 
 local function captainOf(entry)

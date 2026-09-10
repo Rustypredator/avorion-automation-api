@@ -272,6 +272,55 @@ function MissionTypes.describeConfig(key, config)
     return result
 end
 
+-- #### START-TIME CHECKS #### --
+
+-- Vanilla runs a second round of validation inside command:initialize(), which only
+-- startCommand reaches. Preview never gets there, so without this a preview reports
+-- canStart on a mission the game will refuse - the "route too short" case is real and
+-- was hit in testing. Only checks that can be answered from the area analysis belong
+-- here; anything else would need the command to actually be started.
+local startChecks = {}
+
+function startChecks.travel(owner, shipName, area)
+    local analysis = area.analysis
+    if type(analysis) ~= "table" then return nil end
+
+    local entry = ShipDatabaseEntry(owner.index, shipName)
+    if not entry then return nil end
+
+    local x, y = entry:getCoordinates()
+    if area.lower.x == x and area.lower.y == y then
+        return "The ship is already in this sector."
+    end
+
+    -- TravelCommand:initialize refuses a route of two sectors or fewer, i.e. anything
+    -- the ship could reach in a single jump.
+    if type(analysis.route) == "table" and #analysis.route <= 2 then
+        return "This route is too short."
+    end
+
+    local values = analysis.values
+    if type(values) == "table" then
+        local jumpRange, canPassRifts = entry:getHyperspaceProperties()
+        if jumpRange ~= values.jumpRange or canPassRifts ~= values.canPassRifts then
+            return "Hyperspace properties changed since planning the route."
+        end
+    end
+
+    return nil
+end
+
+-- Returns a plain error string, or nil when the game would let the mission start.
+function MissionTypes.startErrors(key, owner, shipName, area)
+    local check = startChecks[string.lower(key or "")]
+    if not check then return nil end
+
+    local ok, message = pcall(check, owner, shipName, area)
+    if not ok then return nil end
+
+    return message
+end
+
 -- #### AREAS #### --
 
 local function rectangle(lowerX, lowerY, sizeX, sizeY)

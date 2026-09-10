@@ -161,6 +161,18 @@ local _, noYield = call("POST", "/ships/Prospector/missions/mine/preview", {})
 check(noYield.canStart == false, "a prediction error blocks starting")
 Mock.predictionError = nil
 
+-- Vanilla raises rather than returning an error when the ship is missing something it
+-- assumed was there. Verified in game: previewing a travel mission for a captainless ship
+-- dies in travelcommand.lua indexing a nil captain.
+Mock.predictionRaises = "travelcommand.lua:278: attempt to index local 'captain' (a nil value)"
+local status, raised = call("POST", "/ships/Prospector/missions/mine/preview", {})
+check(status == 200, "a vanilla crash inside the prediction is not a 500")
+check(raised.canStart == false, "the mission is reported as unstartable")
+check(raised.errors.prediction ~= nil
+      and string.find(raised.errors.prediction.text, "captain", 1, true) ~= nil,
+      "and the game's own failure is reported rather than swallowed")
+Mock.predictionRaises = nil
+
 Mock.addShip(1, "Hulk", {x = 0, y = 0, usableError = 3})
 local _, unusable = call("POST", "/ships/Hulk/missions/mine/preview", {})
 check(unusable.canStart == false, "an unusable ship cannot start")
@@ -170,22 +182,57 @@ check(unusable.errors.usable.code == "NoCaptain", "and reports why")
 
 print("\nstart")
 
+-- Starting is not a single call, and none of it happens in the bridge. The request parks
+-- a job; the player agent claims it, asks the game to run its own area analysis, and
+-- retries startCommand until it takes. So a tick has to drive both scripts.
+dofile("data/scripts/player/automationapi/agent.lua")
+local Agent = AutomationApiAgent
+
+local function tick(seconds)
+    Mock.advanceClock(seconds)
+    Mock.asPlayerAgent(1, function() Agent.update(seconds) end)
+    Bridge.update(seconds)
+end
+
 Mock.simulationCalls = {}
-local status, started = call("POST", "/ships/Prospector/missions/mine/start",
-                             {config = {duration = 1}, materials = {"Iron"}})
-check(status == 200, "start returns 200")
+local read = send("POST", "/ships/Prospector/missions/mine/start",
+                  {config = {duration = 1}, materials = {"Iron"}})
+Mock.flushAsync()
+Bridge.update(Config.pollInterval)
+check(read() == nil, "start does not answer before the game's analysis lands")
+check(#Mock.simulationCalls == 0, "the bridge itself never calls into the simulation")
+
+tick(0.3)
+
+local dispatch = Mock.simulationCalls[1]
+check(dispatch ~= nil and dispatch.fn == "startAreaAnalysis",
+      "the agent asks the game to run the analysis itself")
+check(dispatch.args[2] == Mock.commandTypes.Mine, "the real CommandType uuid is used")
+check(dispatch.args[3].lower ~= nil and dispatch.args[3].analysis == nil,
+      "and is handed a plain area with no engine userdata attached")
+
+for _ = 1, 4 do tick(0.6) end
+
+local status, started = read()
+check(status == 200, "start returns 200 once the analysis has landed")
 check(started.started == true, "reports the mission as started")
 
-local calls = Mock.simulationCalls
-check(#calls == 2, "two simulation calls were made (got " .. #calls .. ")")
-check(calls[1].fn == "areaAnalysisFinished", "the analysis is handed over first")
-check(calls[2].fn == "startCommand", "then the command is started")
-check(calls[1].args[2] == Mock.commandTypes.Mine, "the real CommandType uuid is used")
-check(calls[2].args[1] == "Prospector", "for the right ship")
+local commandCall
+for _, c in ipairs(Mock.simulationCalls) do
+    if c.fn == "startCommand" then commandCall = commandCall or c end
+end
+check(commandCall ~= nil and commandCall.args[1] == "Prospector",
+      "startCommand was issued for the right ship")
 
 -- startCommand reports failure only by chat message, so the mod must verify afterwards
-Mock.addShip(1, "Stubborn", {x = 0, y = 0, refuseStart = true})
-local status, refused = call("POST", "/ships/Stubborn/missions/mine/start", {})
+Mock.addShip(1, "Stubborn", {x = 0, y = 0, refuseStart = true,
+                             captain = {name = "Ludd", level = 3, tier = 3, primaryClass = 4}})
+local read = send("POST", "/ships/Stubborn/missions/mine/start", {})
+Mock.flushAsync()
+Bridge.update(Config.pollInterval)
+for _ = 1, 16 do tick(0.6) end
+
+local status, refused = read()
 check(status == 422 and refused.started == false,
       "a silently refused start is detected and reported")
 check(refused.error.code == "start_rejected", "with a specific code")

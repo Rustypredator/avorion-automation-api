@@ -21,44 +21,62 @@ local FactionScope = include("automationapi/factionscope")
 
 local SimulationUtility = include("simulationutility")
 
-local SIMULATION_SCRIPT = "data/scripts/player/background/simulation/simulation.lua"
-
 local Missions = {}
 
 -- #### HELPERS #### --
 
--- Player:invokeFunction returns a status int first: 0 on success, 3 script not found,
--- 4 function not found, 5 invalid script state.
-local function invokeSimulation(owner, functionName, ...)
-    local ok, status, a, b = pcall(function(...)
-        return owner.faction:invokeFunction(SIMULATION_SCRIPT, functionName, ...)
-    end, ...)
+-- Simulation is deliberately NOT called from here. It lives on the Player, and a galaxy
+-- script calling Player:invokeFunction segfaults the server - no error, no return code,
+-- the process dies. Verified against 2.5.13 using the exact call shape vanilla uses, and
+-- corroborated by the vanilla tree: every caller of simulation.lua is a player script.
+-- Everything that needs Simulation goes through the job queue below and is executed by
+-- player/automationapi/agent.lua.
 
-    if not ok then
-        Router.fail(500, "simulation_call_failed",
-                    "Could not call " .. functionName .. ": " .. tostring(status))
-    end
-
-    if status ~= 0 then
-        Router.fail(409, "simulation_unavailable",
-                    "The background simulation is not running for this owner (code "
-                    .. tostring(status) .. "). The owning player has to be logged in.",
-                    {functionName = functionName})
-    end
-
-    return a, b
-end
-
--- Mission state lives in a script attached to the Player or Alliance, and those scripts
--- only exist while that player is in game. Reads work regardless; writes do not.
-local function requireOnline(owner)
+function Missions.requireOnline(owner)
     local ok, online = pcall(function() return Server():isOnline(owner.index) end)
 
     if not ok or not online then
         Router.fail(409, "owner_offline",
-                    "Captain missions only run while the owning player is logged in. "
-                    .. "This is a vanilla limitation, not one this API adds.")
+                    "Writes need the owning player online: the game only runs a player's "
+                    .. "scripts while they are logged in, so nothing can be dispatched on "
+                    .. "their behalf. This is a vanilla limitation, not one this API adds. "
+                    .. "Reads work offline.")
     end
+end
+
+-- Only plain numbers cross the script boundary. The analysis results table is full of
+-- engine userdata (materials, trading goods, faction handles) and passing it through
+-- invokeFunction segfaults the server outright, so nothing but this ever gets handed over.
+local function plainArea(area)
+    return
+    {
+        lower = {x = math.floor(area.lower.x), y = math.floor(area.lower.y)},
+        upper = {x = math.floor(area.upper.x), y = math.floor(area.upper.y)},
+    }
+end
+
+-- Same reasoning as plainArea, for the config table. clampConfig runs vanilla code over
+-- it and Json.array leaves a metatable behind; neither belongs on the other side of the
+-- boundary, so the table is rebuilt from scratch out of numbers, strings and booleans.
+local function plainConfig(config)
+    local result = {}
+
+    for key, value in pairs(config or {}) do
+        local keyType = type(key)
+
+        if keyType == "string" or keyType == "number" then
+            local valueType = type(value)
+
+            if valueType == "table" then
+                result[key] = plainConfig(value)
+            elseif valueType == "number" or valueType == "string"
+                   or valueType == "boolean" then
+                result[key] = value
+            end
+        end
+    end
+
+    return result
 end
 
 local function ignoredErrorsOf(command)
@@ -138,15 +156,37 @@ local function assess(owner, shipName, key, missionType, area, results, config)
 
     local usable = ShipData.usable(owner.index, shipName, ignoredErrorsOf(command))
 
-    local commandError, commandArgs = FactionScope.with(owner.faction, function()
-        return command:getErrors(owner.index, shipName, area, command.config)
+    -- Both of these are vanilla code running on data vanilla does not usually hand it.
+    -- TravelCommand:calculatePrediction, for one, indexes the captain without checking,
+    -- so previewing a travel mission for a captainless ship raises rather than returning
+    -- an error - and a request about a perfectly ordinary ship would become a 500. The
+    -- failure is caught and reported as what it is: something wrong with the ship, not
+    -- with the request.
+    local commandError, commandArgs
+    local commandFailure
+
+    local okErrors, errorText, errorArgs = pcall(function()
+        return FactionScope.with(owner.faction, function()
+            return command:getErrors(owner.index, shipName, area, command.config)
+        end)
     end)
 
-    local prediction = FactionScope.with(owner.faction, function()
-        return command:calculatePrediction(owner.index, shipName, area, command.config)
+    if okErrors then
+        commandError, commandArgs = errorText, errorArgs
+    else
+        commandFailure = tostring(errorText)
+    end
+
+    local predictionFailure
+
+    local okPrediction, predicted = pcall(function()
+        return FactionScope.with(owner.faction, function()
+            return command:calculatePrediction(owner.index, shipName, area, command.config)
+        end)
     end)
 
-    prediction = prediction or {}
+    local prediction = okPrediction and (predicted or {}) or {}
+    if not okPrediction then predictionFailure = tostring(predicted) end
 
     -- The captain's own read on the job. Needs a captain, so a captainless ship simply
     -- has no assessment - the usable check already reports why.
@@ -194,6 +234,25 @@ local function assess(owner, shipName, key, missionType, area, results, config)
 
     if not usable.ok then errors.usable = usable end
 
+    if commandFailure and not errors.command then
+        errors.command = Serialize.message(
+            "The game could not validate this mission for this ship: ${reason}",
+            {reason = commandFailure})
+    end
+
+    if predictionFailure and not errors.prediction then
+        errors.prediction = Serialize.message(
+            "The game could not predict this mission for this ship: ${reason}",
+            {reason = predictionFailure})
+    end
+
+    -- The game validates twice: once through getErrors, which preview reaches, and again
+    -- inside command:initialize(), which only a start reaches. Whatever of the second
+    -- round can be answered from the analysis is folded in here, so canStart means what
+    -- it says instead of "canStart, probably".
+    local startError = MissionTypes.startErrors(key, owner, shipName, area)
+    if startError then errors.start = Serialize.message(startError) end
+
     local areaStats
     local okStats, stats = pcall(function() return SimulationUtility.getAreaStats(area) end)
     if okStats then areaStats = Serialize.value(stats) end
@@ -219,7 +278,8 @@ local function assess(owner, shipName, key, missionType, area, results, config)
             errors = errors,
             canStart = errors.usable == nil
                        and errors.command == nil
-                       and errors.prediction == nil,
+                       and errors.prediction == nil
+                       and errors.start == nil,
         },
     }
 end
@@ -257,6 +317,178 @@ local function withAssessment(ctx, params, onAssessed)
         end)
 
     return Router.DEFERRED
+end
+
+-- The queue of missions waiting to be started.
+--
+-- Two constraints shape it. First, startCommand refuses unless Simulation already holds a
+-- matching analysis it ran itself, and there is no way to be told when one finishes -
+-- handing over the analysis this mod computed is not an option (see plainArea) - so the
+-- game is asked to run its own and startCommand is retried until it takes.
+--
+-- Second, and the reason the work happens somewhere else entirely: Simulation lives on
+-- the Player, and a galaxy script calling Player:invokeFunction segfaults the server -
+-- no error, no return code, the process dies. Verified against 2.5.13 with the exact call
+-- shape vanilla uses. No vanilla galaxy script makes that call either; every caller of
+-- simulation.lua is a player script. So this queue only ever holds plain data, and
+-- player/automationapi/agent.lua drains it and does the talking.
+local pendingJobs = {}
+local nextJobId = 0
+
+-- How long a job may live before the request gives up. This has to sit between the
+-- agent's worst case for a start (1.0s + 5 retries at 1.5s = 8.5s) and Config.requestTimeout,
+-- or a slow-but-succeeding start would be reported as a failure.
+local JOB_TIMEOUT = 12
+
+Missions.uptime = 0
+
+-- Called by the bridge on behalf of the player agent. Returns a JSON string rather than
+-- a table: tables are known to cross Player->Simulation safely because vanilla does it,
+-- but nothing proves it for the galaxy boundary, and after the segfault above this code
+-- does not assume. Strings are proven.
+function Missions.takeJobs(playerIndex)
+    local claimed = {}
+
+    for _, job in ipairs(pendingJobs) do
+        if job.playerIndex == playerIndex and not job.claimed then
+            job.claimed = true
+
+            claimed[#claimed + 1] =
+            {
+                id = job.id,
+                kind = job.kind,
+                ownerKind = job.owner.kind,
+                shipName = job.shipName,
+                missionType = job.missionType,
+                area = job.area,
+                config = job.config,
+                force = job.force,
+                -- in-sector orders; see handlers/movement.lua
+                sector = job.sector,
+                clear = job.clear,
+                calls = job.calls,
+            }
+        end
+    end
+
+    if #claimed == 0 then return "" end
+
+    return Json.encode(Json.array(claimed))
+end
+
+-- Called by the bridge when the agent reports back. Each result resolves one request.
+function Missions.report(payload)
+    local ok, results = pcall(Json.decode, payload)
+    if not ok or type(results) ~= "table" then return false end
+
+    for _, result in ipairs(results) do
+        for index, job in ipairs(pendingJobs) do
+            if job.id == result.id then
+                table.remove(pendingJobs, index)
+
+                if result.ok == false and job.kind ~= "start" then
+                    job.complete(502, {error =
+                    {
+                        code = result.code or "simulation_call_failed",
+                        message = result.message
+                                  or "The background simulation refused the call.",
+                    }})
+                    break
+                end
+
+                local handled, err = pcall(job.onResult, result)
+                if not handled then
+                    job.complete(500, {error = {code = "internal_error",
+                                                message = tostring(err)}})
+                end
+
+                break
+            end
+        end
+    end
+
+    return true
+end
+
+-- Parks a unit of work for the agent. onResult(result) resolves the request; it is
+-- called on the bridge's own tick, so it may complete the response directly.
+function Missions.enqueue(job)
+    nextJobId = nextJobId + 1
+
+    job.id = nextJobId
+    job.expiresAt = Missions.uptime + JOB_TIMEOUT
+    pendingJobs[#pendingJobs + 1] = job
+
+    return Router.DEFERRED
+end
+
+function Missions.tick(elapsed)
+    Missions.uptime = Missions.uptime + (elapsed or 0)
+
+    local remaining = {}
+
+    for _, job in ipairs(pendingJobs) do
+        if Missions.uptime < job.expiresAt then
+            remaining[#remaining + 1] = job
+        else
+            job.complete(409, {error =
+            {
+                code = "agent_unavailable",
+                message = "The owner's player agent did not pick the request up. The "
+                          .. "owning player has to be logged in.",
+            }})
+        end
+    end
+
+    pendingJobs = remaining
+end
+
+-- Exposed rather than registered inline: POST /ships/{name}/travel is the same start,
+-- with the mission type fixed and the destination validated first, and the two must not
+-- be allowed to drift apart. See handlers/movement.lua.
+function Missions.startHandler(ctx, params)
+    return withAssessment(ctx, params,
+        function(assessed, area, results, owner, shipName, key, missionType)
+            local body = assessed.body
+
+            if not body.canStart then
+                body.started = false
+                ctx.complete(422, body)
+                return
+            end
+
+            Missions.requireOnline(owner)
+
+            -- Nothing here talks to the simulation; see the note on pendingJobs.
+            Missions.enqueue
+            {
+                kind = "start",
+                owner = owner,
+                playerIndex = ctx.playerIndex,
+                shipName = shipName,
+                missionType = missionType,
+                area = plainArea(area),
+                config = plainConfig(assessed.command.config),
+                complete = ctx.complete,
+                onResult = function(result)
+                    body.started = result.started == true
+
+                    if result.started then
+                        ctx.complete(200, body)
+                    else
+                        body.error =
+                        {
+                            code = result.code or "start_rejected",
+                            message = result.message
+                                      or "The game did not start the mission. Its reason, "
+                                         .. "if any, was sent to the owner as an in-game "
+                                         .. "chat message.",
+                        }
+                        ctx.complete(422, body)
+                    end
+                end,
+            }
+        end)
 end
 
 -- #### ENDPOINTS #### --
@@ -301,45 +533,8 @@ function Missions.register(router)
         end)
     end)
 
-    router:post("/ships/{name}/missions/{key}/start", function(ctx, params)
-        return withAssessment(ctx, params,
-            function(assessed, area, results, owner, shipName, key, missionType)
-                local body = assessed.body
+    router:post("/ships/{name}/missions/{key}/start", Missions.startHandler)
 
-                if not body.canStart then
-                    body.started = false
-                    ctx.complete(422, body)
-                    return
-                end
-
-                requireOnline(owner)
-
-                -- startCommand refuses to run without a matching analysis already stored
-                -- in Simulation, and reports failures by chat message with no return
-                -- value. So: hand it our analysis, start, then verify by reading the
-                -- ship's availability back.
-                invokeSimulation(owner, "areaAnalysisFinished", shipName, missionType,
-                                 area, results, ctx.playerIndex)
-                invokeSimulation(owner, "startCommand", shipName, missionType,
-                                 assessed.command.config)
-
-                local availability = owner.faction:getShipAvailability(shipName)
-                body.started = availability == ShipAvailability.InBackground
-
-                if not body.started then
-                    body.error =
-                    {
-                        code = "start_rejected",
-                        message = "The game rejected the command. Its reason was sent to "
-                                  .. "the owner as an in-game chat message.",
-                    }
-                    ctx.complete(422, body)
-                    return
-                end
-
-                ctx.complete(200, body)
-            end)
-    end)
 
     router:get("/ships/{name}/mission", function(ctx, params)
         local owner = Owner.findShip(ctx, params.name)
@@ -350,68 +545,99 @@ function Missions.register(router)
                     availability = "Available", status = nil}
         end
 
-        requireOnline(owner)
+        Missions.requireOnline(owner)
 
-        local description = invokeSimulation(owner, "getDescription", params.name)
-        local uiData, descriptionArgs = invokeSimulation(owner, "getCommandUIData", params.name)
-
-        local result =
+        return Missions.enqueue
         {
-            ship = params.name,
-            owner = Owner.describe(owner),
-            active = true,
-            availability = "InBackground",
+            kind = "status",
+            owner = owner,
+            playerIndex = ctx.playerIndex,
+            shipName = params.name,
+            complete = ctx.complete,
+            onResult = function(result)
+                local data = result.data or {}
+                local description = data.description
+                local uiData = data.uiData
+
+                local body =
+                {
+                    ship = params.name,
+                    owner = Owner.describe(owner),
+                    active = true,
+                    availability = "InBackground",
+                    yields = Serialize.number(data.yields, 0),
+                }
+
+                if type(description) == "table" then
+                    body.mission = MissionTypes.keyOf(description.command)
+                    body.progress = description.progress
+                    body.area = description.area
+                    body.escorting = description.escortee
+                end
+
+                if type(uiData) == "table" then
+                    body.config = uiData.config
+                    body.prediction = uiData.prediction
+                    body.areaStats = uiData.area
+                end
+
+                ctx.complete(200, body)
+            end,
         }
-
-        if type(description) == "table" then
-            result.mission = MissionTypes.keyOf(description.command)
-            result.progress = Serialize.message(description.text, description.arguments)
-            result.area = Serialize.value(description.area)
-            result.escorting = Serialize.string(description.escortee)
-        end
-
-        if type(uiData) == "table" then
-            result.config = Serialize.value(uiData.config)
-            result.prediction = Serialize.value(uiData.prediction)
-            result.areaStats = Serialize.value(uiData.area)
-        end
-
-        result.yields = Serialize.number(invokeSimulation(owner, "getNumYields", params.name), 0)
-
-        return result
     end)
 
     router:post("/ships/{name}/mission/recall", function(ctx, params)
         local owner = Owner.findShip(ctx, params.name)
-        requireOnline(owner)
+        Missions.requireOnline(owner)
 
         local force = ctx.query.force == "true" or ctx.body.force == true
 
-        invokeSimulation(owner, force and "forceRecall" or "recall", params.name)
-
-        local availability = owner.faction:getShipAvailability(params.name)
-
-        return
+        return Missions.enqueue
         {
-            ship = params.name,
-            recalled = availability ~= ShipAvailability.InBackground,
-            forced = force,
-            -- a command may refuse recall, e.g. a ship mid-repair
-            note = availability == ShipAvailability.InBackground
-                   and "Still on mission; the command refused the recall. Retry with force=true."
-                   or nil,
+            kind = "recall",
+            owner = owner,
+            playerIndex = ctx.playerIndex,
+            shipName = params.name,
+            force = force,
+            complete = ctx.complete,
+            onResult = function(result)
+                local stillOut = (result.data or {}).active == true
+
+                ctx.complete(200,
+                {
+                    ship = params.name,
+                    recalled = not stillOut,
+                    forced = force,
+                    -- a command may refuse recall, e.g. a ship mid-repair
+                    note = stillOut
+                           and "Still on mission; the command refused the recall. "
+                               .. "Retry with force=true."
+                           or nil,
+                })
+            end,
         }
     end)
 
     router:post("/ships/{name}/mission/collect", function(ctx, params)
         local owner = Owner.findShip(ctx, params.name)
-        requireOnline(owner)
+        Missions.requireOnline(owner)
 
-        local before = Serialize.number(invokeSimulation(owner, "getNumYields", params.name), 0)
-        invokeSimulation(owner, "takeYield", params.name)
-        local after = Serialize.number(invokeSimulation(owner, "getNumYields", params.name), 0)
+        return Missions.enqueue
+        {
+            kind = "collect",
+            owner = owner,
+            playerIndex = ctx.playerIndex,
+            shipName = params.name,
+            complete = ctx.complete,
+            onResult = function(result)
+                local data = result.data or {}
+                local before = Serialize.number(data.before, 0)
+                local after = Serialize.number(data.after, 0)
 
-        return {ship = params.name, collected = before - after, remaining = after}
+                ctx.complete(200, {ship = params.name,
+                                   collected = before - after, remaining = after})
+            end,
+        }
     end)
 
 end

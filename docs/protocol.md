@@ -117,6 +117,59 @@ transport latency. Endpoints that need a background area analysis take seconds; 
 simply withholds the response until the work lands, so the client makes one ordinary
 request and waits. After 20 seconds it answers `504` instead.
 
+Three kinds of request take noticeably longer than transport latency, and all three answer
+on one connection rather than handing back a job id:
+
+| kind | why | typical |
+|---|---|---|
+| mission preview and start | a background area analysis has to run | 1-3s |
+| writes (start, recall, collect, travel, orders) | the request is parked for the player agent, which polls four times a second | +0.5s |
+| `/map/search?predict=true` | the galaxy generator is run over the box, sliced across server ticks so it cannot stall one | ~9s for the 10000-sector cap |
+
+A predicted search answers with partial results and `truncated: "timeout"` rather than
+letting the request hit the 504.
+
+## Where the mod runs
+
+Two scripts, and the split is forced by the engine rather than chosen:
+
+- `data/scripts/galaxy/automationapi/bridge.lua` is attached to the Galaxy by a one-line
+  overlay of `data/scripts/galaxy/init.lua`. It runs whenever the server runs, which is what
+  lets every read work with nobody logged in.
+- `data/scripts/player/automationapi/agent.lua` is attached to each Player by a one-line
+  overlay of `data/scripts/player/init.lua`. Everything that writes goes through it.
+
+A galaxy script calling `Player:invokeFunction` segfaults the server outright - no error, no
+return code, the process dies - so the bridge parks writes as jobs and the agent, which runs
+in the one context where the call is legal, executes them and reports back. Nothing but
+plain JSON crosses between the two.
+
+Both overlays are copies of the vanilla files with a single `addScriptOnce` line added. They
+are the only vanilla files this mod replaces, and they need re-checking against the game's
+copies after an Avorion update.
+
+### The ship event feed
+
+The agent also carries traffic the other way. It registers `onShipOrderInfoUpdated` and
+`onShipStatusMessageUpdated` on the owning Player - and on the Alliance for alliance craft,
+since those publish on the alliance object - and forwards each one to the bridge with
+`Galaxy():invokeFunction(..., "pushShipEvent", ...)`, which a player script may legally do.
+The bridge keeps a per-ship ring buffer that `GET /ships/{name}/events` reads.
+
+This is the only way to learn *why* a ship stopped. The order chain reports itself with
+`sendChatMessage` to whoever gave the order; there is no server-side hook on outgoing chat,
+and `onChatMessage` fires only for messages a player sends, so that channel is closed. The
+ShipInfo callbacks carry the same information and are reachable.
+
+Two things follow from the callbacks living on player scripts:
+
+- Nothing is recorded while the owner is logged out. `recording` in the response says so,
+  because "no events" and "nobody watching" are not the same answer.
+- The feed is also what confirms a dispatch. Reading `getShipOrderInfo` back off the owner
+  handle a request captured does *not* work: that handle serves a cached ShipInfo and keeps
+  returning the state it held when the request arrived, so a chain that has plainly moved
+  reads as unchanged. The pushed events are the live view.
+
 ## Authentication
 
 Keys are created in game:
