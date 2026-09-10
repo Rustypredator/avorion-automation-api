@@ -26,9 +26,41 @@ $root = $galaxy . '/moddata/AutomationAPI';
 $requestDir = $root . '/requests';
 $responseDir = $root . '/responses';
 
+/**
+ * Cross-origin access, so a browser page - the bundled console, or anything else - can
+ * call the API directly.
+ *
+ * This is safe to leave open because the credential is a header, never a cookie: a
+ * browser sends no key of its own, so a hostile page reaches exactly what an ordinary
+ * HTTP client already reaches. Credentialed requests are refused outright, which is what
+ * keeps that true. Set CORS_ORIGIN to a specific origin, or to an empty string to turn
+ * the headers off entirely.
+ */
+function cors(): void
+{
+    $origin = getenv('CORS_ORIGIN');
+    if ($origin === false) {
+        $origin = '*';
+    }
+    if ($origin === '') {
+        return;
+    }
+
+    header('Access-Control-Allow-Origin: ' . $origin);
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, X-API-Key, Authorization');
+    header('Access-Control-Max-Age: 86400');
+
+    // A named origin means the answer varies by it, so caches have to be told.
+    if ($origin !== '*') {
+        header('Vary: Origin');
+    }
+}
+
 function reply(int $status, mixed $body): never
 {
     http_response_code($status);
+    cors();
     header('Content-Type: application/json');
     echo json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
@@ -39,13 +71,22 @@ function fail(int $status, string $code, string $message): never
     reply($status, ['error' => ['code' => $code, 'message' => $message]]);
 }
 
-if (!is_dir($requestDir)) {
-    fail(503, 'bridge_unavailable', 'No request directory in the galaxy folder - is the mod loaded?');
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+// The console sends X-API-Key, which is not a CORS-safelisted header, so every call is
+// preflighted. Answer it before the key check - a preflight carries no key by design.
+if ($method === 'OPTIONS') {
+    http_response_code(204);
+    cors();
+    exit;
 }
 
-$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 if ($method !== 'GET' && $method !== 'POST') {
     fail(405, 'method_not_allowed', 'The API speaks GET and POST only.');
+}
+
+if (!is_dir($requestDir)) {
+    fail(503, 'bridge_unavailable', 'No request directory in the galaxy folder - is the mod loaded?');
 }
 
 // Take the key from a header rather than the URL so it stays out of access logs, and

@@ -38,9 +38,13 @@ services:
       - caddy_config:/config
 
     # Root writes request files the game server can still read and delete. Set
-    # BRIDGE_USER to the game account's uid:gid to have it own them instead - then
-    # chown the caddy_data volume to match, or certificates cannot be written.
+    # BRIDGE_USER to the game account's uid:gid to have it own them instead; the init
+    # service below hands it the caddy volumes so this stays the only knob to set.
     user: "${BRIDGE_USER:-root}"
+
+    depends_on:
+      init:
+        condition: service_completed_successfully
 
     healthcheck:
       # Unauthenticated, so a healthy bridge answers 401 - which is proof enough that
@@ -50,6 +54,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Docker creates a named volume owned by root, so with BRIDGE_USER set the API cannot
+  # write /data - and Caddy needs it on startup even in plain-HTTP mode, because
+  # skip_install_trust makes it provision the local CA whether or not TLS is served.
+  # Failing that mkdir aborts the whole config load, so the container never comes up.
+  #
+  # This runs as root just long enough to hand both volumes over, then exits. It uses
+  # the image the bridge is built from, which is already pulled, rather than adding one.
+  init:
+    image: dunglas/frankenphp:1-php8.3-alpine
+    user: root
+    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config"]
+    restart: "no"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
 
 volumes:
   caddy_data:

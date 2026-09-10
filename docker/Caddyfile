@@ -38,8 +38,13 @@
 
 	# Clients branch on body.error.code, so failures Caddy generates itself - a body
 	# over the limit, PHP unreachable - keep the same shape as the mod's own errors.
+	#
+	# PHP never ran for these, so its CORS headers were never sent. Repeat them here or a
+	# browser client sees an opaque network failure instead of the reason. Nowhere else
+	# may set them: two Access-Control-Allow-Origin headers are rejected outright.
 	handle_errors {
 		header Content-Type application/json
+		header Access-Control-Allow-Origin "{$CORS_ORIGIN:*}"
 		respond `{"error":{"code":"bridge_unavailable","message":"{err.status_code} {err.status_text}"}}` {err.status_code}
 	}
 }
