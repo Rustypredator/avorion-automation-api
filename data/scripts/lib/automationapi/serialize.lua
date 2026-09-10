@@ -32,6 +32,21 @@ function Serialize.string(v, default)
     return tostring(v)
 end
 
+-- Engine display strings carry translator hints, e.g. "Chaingun /* Weapon Name*/".
+-- The game strips those when it localizes; an API wants the bare, stable English name.
+function Serialize.displayName(v)
+    if v == nil then return nil end
+
+    local text = Serialize.string(v)
+
+    -- translator hints, e.g. "Chaingun /* Weapon Name*/"
+    text = string.gsub(text, "/%*.-%*/", "")
+    -- colour markup, e.g. "\c(dd5)warning\c()"
+    text = string.gsub(text, "\\c%b()", "")
+
+    return string.gsub(text, "^%s*(.-)%s*$", "%1")
+end
+
 function Serialize.vec2(x, y)
     return {x = Serialize.number(x, 0), y = Serialize.number(y, 0)}
 end
@@ -100,8 +115,8 @@ function Serialize.tradingGood(good, amount)
 
     return
     {
-        name = Serialize.string(good.name),
-        plural = Serialize.string(good.plural),
+        name = Serialize.displayName(good.name),
+        plural = Serialize.displayName(good.plural),
         price = Serialize.number(good.price, 0),
         size = Serialize.number(good.size, 0),
         amount = Serialize.number(amount),

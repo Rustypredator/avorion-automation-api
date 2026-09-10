@@ -61,7 +61,31 @@ end
 
 -- #### PUBLIC API #### --
 
--- Returns the new key string.
+-- Avorion's chat window cannot be copied from, so a new key is also dropped into a file
+-- next to the request directory. Anyone who can read it can already drive this API
+-- through that same directory, so this gives away nothing new.
+local function writeKeyFile(player, key, label)
+    local path = Config.getKeysDir() .. "/" .. Auth.fingerprint(key) .. ".txt"
+
+    local ok = pcall(function()
+        createDirectory(Config.getKeysDir())
+
+        local file = io.open(path, "wb")
+        if not file then return end
+
+        file:write("# Avorion Automation API key\n")
+        file:write("# player: " .. tostring(player.name) .. "\n")
+        if label and label ~= "" then file:write("# label:  " .. label .. "\n") end
+        file:write(key .. "\n")
+        file:close()
+    end)
+
+    if not ok then return nil end
+
+    return path
+end
+
+-- Returns the new key string, and the path it was also written to.
 function Auth.createKey(playerIndex, label)
     local player = Player(playerIndex)
     if not player then return nil, "Player not found." end
@@ -79,7 +103,7 @@ function Auth.createKey(playerIndex, label)
     }
     saveKeys(player, keys)
 
-    return key
+    return key, writeKeyFile(player, key, label)
 end
 
 -- Returns the owning player index, or nil.
@@ -126,6 +150,7 @@ function Auth.revokeKey(playerIndex, fingerprint)
     for _, entry in ipairs(keys) do
         if not removed and Auth.fingerprint(entry.key) == fingerprint then
             Server():setValue(Config.keyValuePrefix .. entry.key, nil)
+            pcall(function() deleteFile(Config.getKeysDir() .. "/" .. fingerprint .. ".txt") end)
             removed = true
         else
             remaining[#remaining + 1] = entry
@@ -145,6 +170,9 @@ function Auth.revokeAll(playerIndex)
     local keys = loadKeys(player)
     for _, entry in ipairs(keys) do
         Server():setValue(Config.keyValuePrefix .. entry.key, nil)
+        pcall(function()
+            deleteFile(Config.getKeysDir() .. "/" .. Auth.fingerprint(entry.key) .. ".txt")
+        end)
     end
 
     saveKeys(player, {})

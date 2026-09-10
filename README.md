@@ -48,7 +48,7 @@ The mod is `serverSideOnly`, so clients do not download it and do not need it in
 |---|---|---|
 | A | transport, auth, routing, `/ping` | done |
 | B | ship list and ship detail | done |
-| C | mission catalog, preview, start, status, recall, collect | not started |
+| C | mission catalog, preview, start, status, recall, collect | done |
 | D | ship movement | not started |
 | E | map knowledge and station search | not started |
 | F | event stream, reference HTTP bridge | not started |
@@ -63,6 +63,8 @@ The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
 lua5.4 tests/test_bridge.lua
+lua5.4 tests/test_ships.lua
+lua5.4 tests/test_missions.lua
 ```
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour - notably

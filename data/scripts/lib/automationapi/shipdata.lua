@@ -9,6 +9,7 @@ package.path = package.path .. ";data/scripts/player/background/simulation/?.lua
 
 local Json = include("automationapi/json")
 local Serialize = include("automationapi/serialize")
+local Enums = include("automationapi/enums")
 
 local SimulationUtility = include("simulationutility")
 -- captainclass returns its table rather than defining a global, unlike the engine enums
@@ -18,17 +19,12 @@ local ShipData = {}
 
 -- #### HELPERS #### --
 
--- Enum values are ints; their names live in global tables. Deriving the name at runtime
--- avoids hardcoding numbers the game is free to renumber between versions.
-local function enumName(enumTable, value)
-    if type(enumTable) ~= "table" or value == nil then return nil end
+local enumName = Enums.name
 
-    for name, v in pairs(enumTable) do
-        if v == value then return name end
-    end
-
-    return nil
-end
+-- These two are genuine Lua tables rather than engine userdata, so they reverse by
+-- iteration; built once here rather than per call.
+local usableErrorNames = Enums.reverse(SimulationUtility.UsableError)
+local captainClassNames = Enums.reverse(CaptainClasses)
 
 -- Database getters can raise if a ship is in an odd state; one bad field should degrade
 -- that field, not fail the whole request.
@@ -62,7 +58,7 @@ function ShipData.usable(ownerIndex, name, ignoredErrors)
     return
     {
         ok = false,
-        code = enumName(SimulationUtility.UsableError, err),
+        code = enumName(usableErrorNames, err),
         message = usableErrorMessages[err] or "Ship cannot be used.",
     }
 end
@@ -76,7 +72,7 @@ local function captainOf(entry)
     local classes = Json.array({})
     for _, class in ipairs({captain.primaryClass, captain.secondaryClass}) do
         if class and class ~= 0 then
-            classes[#classes + 1] = {value = class, name = enumName(CaptainClasses, class)}
+            classes[#classes + 1] = {value = class, name = enumName(captainClassNames, class)}
         end
     end
 
@@ -104,16 +100,21 @@ local function crewBreakdown(crew)
     local result = Json.array({})
     if not crew then return result end
 
-    local workforce = safe(function() return crew:getWorkforce() end, {}) or {}
+    -- Both getters key by CrewProfession userdata, but each call hands back fresh
+    -- instances, so the two tables can only be joined on the profession's value.
+    local workforce = {}
+    for profession, amount in pairs(safe(function() return crew:getWorkforce() end, {}) or {}) do
+        workforce[profession.value] = amount
+    end
 
     local counts = safe(function() return crew:getNumMembersByProfession() end, {}) or {}
     for profession, count in pairs(counts) do
         result[#result + 1] =
         {
-            profession = enumName(CrewProfessionType, profession.value) or tostring(profession.value),
+            profession = enumName(Enums.crewProfession, profession.value) or tostring(profession.value),
             value = profession.value,
             count = Serialize.number(count, 0),
-            workforce = Serialize.number(workforce[profession], 0),
+            workforce = Serialize.number(workforce[profession.value], 0),
         }
     end
 
@@ -176,7 +177,7 @@ local function durabilityOf(entry)
         max = Serialize.number(maxHp, 0),
         percentage = Serialize.number(percentage, 0),
         malusFactor = Serialize.number(malusFactor, 1),
-        malusReason = enumName(MalusReason, malusReason),
+        malusReason = enumName(Enums.malusReason, malusReason),
         damaged = damaged == true,
     }
 end
@@ -189,18 +190,21 @@ local function energyOf(entry)
     return {required = required, produced = produced, sufficient = required <= produced}
 end
 
--- Ships carry many copies of the same turret, so identical designs are collapsed into
--- one entry with a count rather than repeated.
+-- Ships carry many copies of the same turret and getTurrets() keys by design instance,
+-- so two identical turrets arrive as two separate entries. They are grouped here by
+-- their visible characteristics, which is what a planner actually cares about.
 local function turretsOf(entry)
     local turrets = safe(function() return entry:getTurrets() end, {}) or {}
 
-    local result = Json.array({})
+    local grouped = {}
+    local order = {}
+
     for turret, count in pairs(turrets) do
         local ok, described = pcall(function()
             return
             {
-                name = Serialize.string(turret.weaponName or turret.name),
-                category = enumName(WeaponCategory, turret.category),
+                name = Serialize.displayName(turret.weaponName or turret.name),
+                category = enumName(Enums.weaponCategory, turret.category),
                 rarity = turret.rarity and Serialize.string(turret.rarity.name) or nil,
                 material = turret.material and Serialize.string(turret.material.name) or nil,
                 armed = turret.armed == true,
@@ -218,8 +222,22 @@ local function turretsOf(entry)
             }
         end)
 
-        if ok then result[#result + 1] = described end
+        if ok then
+            local signature = table.concat({described.name or "", described.category or "",
+                                            described.rarity or "", described.material or "",
+                                            string.format("%.3f", described.dps or 0)}, "|")
+
+            if grouped[signature] then
+                grouped[signature].count = grouped[signature].count + described.count
+            else
+                grouped[signature] = described
+                order[#order + 1] = signature
+            end
+        end
     end
+
+    local result = Json.array({})
+    for _, signature in ipairs(order) do result[#result + 1] = grouped[signature] end
 
     table.sort(result, function(a, b) return (a.dps or 0) > (b.dps or 0) end)
 
@@ -235,7 +253,7 @@ local function systemsOf(entry)
             return
             {
                 script = Serialize.string(system.script),
-                name = Serialize.string(system.name),
+                name = Serialize.displayName(system.name),
                 rarity = system.rarity and Serialize.string(system.rarity.name) or nil,
                 count = Serialize.number(count, 1),
             }
@@ -284,9 +302,9 @@ function ShipData.summary(owner, name)
     {
         name = name,
         owner = {kind = owner.kind, index = owner.index, name = owner.name},
-        type = enumName(EntityType, entityType),
+        type = enumName(Enums.entityType, entityType),
         position = Serialize.vec2(x, y),
-        availability = enumName(ShipAvailability, availability),
+        availability = enumName(Enums.shipAvailability, availability),
         status = Serialize.string(safe(function() return faction:getShipStatus(name) end)),
         usable = ShipData.usable(owner.index, name),
     }

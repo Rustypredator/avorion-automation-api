@@ -29,16 +29,6 @@ local function ownersFor(ctx)
     return {Owner.resolve(ctx)}
 end
 
--- Resolves {name} against one owner, or 404s.
-local function findOwnerOf(ctx, name)
-    for _, owner in ipairs(ownersFor(ctx)) do
-        local ok, owns = pcall(function() return owner.faction:ownsShip(name) end)
-        if ok and owns then return owner end
-    end
-
-    Router.fail(404, "no_such_ship", "You do not own a craft named '" .. name .. "'.")
-end
-
 function Ships.register(router)
 
     router:get("/ships", function(ctx)
@@ -62,7 +52,7 @@ function Ships.register(router)
     end)
 
     router:get("/ships/{name}", function(ctx, params)
-        local owner = findOwnerOf(ctx, params.name)
+        local owner = Owner.findShip(ctx, params.name)
 
         local detail = ShipData.detail(owner, params.name)
         if not detail then

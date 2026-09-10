@@ -65,5 +65,6 @@ end
 function Config.getRequestsDir()  return Config.getRoot() .. "/requests" end
 function Config.getResponsesDir() return Config.getRoot() .. "/responses" end
 function Config.getEventsDir()    return Config.getRoot() .. "/events" end
+function Config.getKeysDir()      return Config.getRoot() .. "/keys" end
 
 return Config

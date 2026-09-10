@@ -53,13 +53,20 @@ function execute(sender, commandName, ...)
     if action == "new" then
         local label = table.concat(args, " ", 2)
 
-        local key, err = Auth.createKey(sender, label)
+        local key, path = Auth.createKey(sender, label)
         if not key then
-            return 1, "", err or "Could not create a key."
+            return 1, "", path or "Could not create a key."
         end
 
-        return 0, "New Automation API key (store it now, it is not shown again):\n"
-                  .. key .. "\nFingerprint: " .. Auth.fingerprint(key), ""
+        local response = "New Automation API key (store it now, it is not shown again):\n"
+                         .. key .. "\nFingerprint: " .. Auth.fingerprint(key)
+
+        -- the chat window cannot be copied from, so point at the file instead
+        if path then
+            response = response .. "\nAlso written to: " .. path
+        end
+
+        return 0, response, ""
     end
 
     if action == "list" then

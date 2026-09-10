@@ -71,6 +71,24 @@ function Owner.all(ctx)
     return owners
 end
 
+-- Resolves a craft name to the owner that actually holds it, honouring ?owner. Fails
+-- with 404 rather than returning nil, since every caller wants that behaviour.
+function Owner.findShip(ctx, name)
+    local candidates
+    if ctx.query.owner == "all" then
+        candidates = Owner.all(ctx)
+    else
+        candidates = {Owner.resolve(ctx)}
+    end
+
+    for _, owner in ipairs(candidates) do
+        local ok, owns = pcall(function() return owner.faction:ownsShip(name) end)
+        if ok and owns then return owner end
+    end
+
+    Router.fail(404, "no_such_ship", "You do not own a craft named '" .. name .. "'.")
+end
+
 -- Serialized form for embedding in responses.
 function Owner.describe(owner)
     return {kind = owner.kind, index = owner.index, name = owner.name}

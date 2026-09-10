@@ -18,6 +18,9 @@ local Serialize = include("automationapi/serialize")
 
 local MetaHandler = include("automationapi/handlers/meta")
 local ShipsHandler = include("automationapi/handlers/ships")
+local MissionsHandler = include("automationapi/handlers/missions")
+
+local Analysis = include("automationapi/analysis")
 
 -- Don't remove or alter the following comment, it tells the game the namespace this script lives in. If you remove it, the script will break.
 -- namespace AutomationApiBridge
@@ -307,6 +310,7 @@ function AutomationApiBridge.initialize()
     router = Router.new()
     MetaHandler.register(router)
     ShipsHandler.register(router)
+    MissionsHandler.register(router)
 
     ready = true
 
@@ -317,6 +321,16 @@ end
 -- Galaxy ones, so update() throttles itself as well rather than trusting it.
 function AutomationApiBridge.getUpdateInterval()
     return Config.pollInterval
+end
+
+-- asyncf() resolves its callback name against this script's namespace, so the area
+-- analysis worker lands here and is routed to whichever request is waiting on it.
+function AutomationApiBridge.onAreaAnalysisFinished(shipName, missionType, area, results)
+    local ok, err = pcall(Analysis.deliver, shipName, missionType, area, results)
+
+    if not ok then
+        logError("area analysis callback failed for %s: %s", tostring(shipName), tostring(err))
+    end
 end
 
 function AutomationApiBridge.update(timeStep)
@@ -332,6 +346,7 @@ function AutomationApiBridge.update(timeStep)
         local now = Server().unpausedRuntime
 
         poll()
+        Analysis.tick()
         expirePending(now)
         expireResponses(now)
     end)
