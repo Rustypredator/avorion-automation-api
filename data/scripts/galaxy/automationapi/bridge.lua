@@ -17,6 +17,7 @@ local Router = include("automationapi/router")
 local Serialize = include("automationapi/serialize")
 
 local MetaHandler = include("automationapi/handlers/meta")
+local ShipsHandler = include("automationapi/handlers/ships")
 
 -- Don't remove or alter the following comment, it tells the game the namespace this script lives in. If you remove it, the script will break.
 -- namespace AutomationApiBridge
@@ -305,6 +306,7 @@ function AutomationApiBridge.initialize()
 
     router = Router.new()
     MetaHandler.register(router)
+    ShipsHandler.register(router)
 
     ready = true
 

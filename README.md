@@ -47,7 +47,7 @@ The mod is `serverSideOnly`, so clients do not download it and do not need it in
 | phase | scope | state |
 |---|---|---|
 | A | transport, auth, routing, `/ping` | done |
-| B | ship list and ship detail | not started |
+| B | ship list and ship detail | done |
 | C | mission catalog, preview, start, status, recall, collect | not started |
 | D | ship movement | not started |
 | E | map knowledge and station search | not started |
