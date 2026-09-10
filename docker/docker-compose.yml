@@ -1,0 +1,56 @@
+# Everything in this directory is deployment, not mod: the game never loads any of it,
+# and it is not part of a Workshop upload.
+#
+# The mod has no socket - it speaks JSON over files in the galaxy's moddata folder - so
+# this runs the bridge that turns HTTP into those files, inside FrankenPHP (Caddy with
+# PHP embedded). One container both terminates TLS and writes to the galaxy directory.
+#
+#   cd docker
+#   cp .env.example .env    # point GALAXY_DIR at your galaxy
+#   docker compose up -d --build
+#   curl -H 'X-API-Key: avo_...' http://localhost/ping
+
+# Otherwise Compose names the project after this directory, i.e. "docker".
+name: avorion-automation-api
+
+services:
+  api:
+    build: ./bridge
+    restart: unless-stopped
+
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+
+    environment:
+      # Defaults to plain HTTP on :80. A hostname here turns on automatic HTTPS.
+      API_DOMAIN: "${API_DOMAIN:-:80}"
+      GALAXY_DIR: /galaxy
+
+    # Only the API's own two directories, so a bridge process that misbehaves cannot
+    # touch saves or the globals file the API keys live in.
+    volumes:
+      - ./Caddyfile:/etc/frankenphp/Caddyfile:ro
+      - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/requests:/galaxy/moddata/AutomationAPI/requests
+      - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/responses:/galaxy/moddata/AutomationAPI/responses
+      - caddy_data:/data
+      - caddy_config:/config
+
+    # Root writes request files the game server can still read and delete. Set
+    # BRIDGE_USER to the game account's uid:gid to have it own them instead - then
+    # chown the caddy_data volume to match, or certificates cannot be written.
+    user: "${BRIDGE_USER:-root}"
+
+    healthcheck:
+      # Unauthenticated, so a healthy bridge answers 401 - which is proof enough that
+      # Caddy, PHP and the route are all up.
+      test: ["CMD", "sh", "-c", "wget -qS -O /dev/null http://127.0.0.1:80/ping 2>&1 | grep -q ' 401 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  caddy_data:
+  caddy_config:

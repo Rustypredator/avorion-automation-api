@@ -1,0 +1,45 @@
+{
+	frankenphp {
+		# Every in-flight call holds a PHP thread while it waits on its response file,
+		# so this - not CPU - is the concurrency limit. The mod itself tops out around
+		# 20 requests per second.
+		num_threads 16
+	}
+	order php_server before file_server
+
+	# Nothing here needs the admin API, and it would otherwise listen on :2019.
+	admin off
+
+	# Only relevant if API_DOMAIN is a local name Caddy signs itself: do not try to
+	# install a CA certificate into the container's trust store.
+	skip_install_trust
+}
+
+# Set API_DOMAIN to a hostname that resolves here and Caddy provisions a certificate
+# for it automatically. Leave it unset and the API is served over plain HTTP on :80 -
+# fine on a private network or behind your own TLS, not on the open internet.
+{$API_DOMAIN::80} {
+	root * /app/public
+
+	# Caddy logs no request headers, so the API key stays out of the access log. Keep
+	# it that way if you switch to a custom format.
+	log
+
+	encode zstd gzip
+
+	# The mod refuses anything larger with a 400; reject it before it reaches PHP.
+	request_body {
+		max_size 256KB
+	}
+
+	# Every path is handled by public/index.php - /ships/Ore%20Hound is a route, not a
+	# file - and the path reaches PHP still percent-encoded, which is what the mod wants.
+	php_server
+
+	# Clients branch on body.error.code, so failures Caddy generates itself - a body
+	# over the limit, PHP unreachable - keep the same shape as the mod's own errors.
+	handle_errors {
+		header Content-Type application/json
+		respond `{"error":{"code":"bridge_unavailable","message":"{err.status_code} {err.status_text}"}}` {err.status_code}
+	}
+}
