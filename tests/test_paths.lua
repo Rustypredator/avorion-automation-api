@@ -38,7 +38,7 @@ io.open = function(path, mode)
 end
 
 -- Engine calls do not go through that check. That asymmetry is the whole trap.
-_G.createDirectory = function(dir) os.execute("mkdir -p '" .. dir .. "'") return 0 end
+_G.createDirectory = function(dir) os.execute("mkdir -p '" .. dir .. "' 2>/dev/null") return 0 end
 _G.deleteFile = function(file) os.remove(file) return 0 end
 
 -- The bridge finds its work by listing, not by opening, so root resolution probes this
@@ -164,6 +164,36 @@ local Config3 = freshConfig()
 check(Config3.getRoot() == "galaxy/Avorion/moddata/AutomationAPI",
       "with every candidate refused it falls back to the galaxy folder")
 check(Config3.rootIsUsable() == false, "and reports the root as unusable")
+
+-- #### THE OPERATOR SAYS WHERE #### --
+
+-- Last resort on a server where every spelling the mod can construct is refused. It has
+-- no way to discover the working directory - os.getenv is nil inside the sandbox - so the
+-- only thing left is to be told.
+
+io.open = function(path, mode)
+    if string.sub(path, 1, 1) ~= "/" or string.sub(path, 1, #cwd) ~= cwd then
+        return nil, "filename is not secure"
+    end
+    return realOpen(path, mode)
+end
+
+serverFolder = galaxy
+
+local Config5 = freshConfig()
+Config5.rootOverride = cwd .. "/" .. galaxy .. "/elsewhere"
+
+check(Config5.getRoot() == Config5.rootOverride, "an override is used ahead of every guess")
+check(#Config5.getRootAttempts() == 1, "and nothing else is even tried")
+
+-- An override still has to earn it. Taking one on trust would turn a typo into the same
+-- silent transport failure this whole search exists to avoid.
+local Config6 = freshConfig()
+Config6.rootOverride = "/refused/by/the/sandbox"
+
+check(Config6.getRoot() ~= Config6.rootOverride, "a bad override is not taken on trust")
+check(Config6.getRootAttempts()[1].ok == false, "it is probed and rejected like any other")
+check(Config6.rootIsUsable(), "and the ordinary search still runs behind it")
 
 cleanup()
 

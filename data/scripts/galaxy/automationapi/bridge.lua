@@ -68,57 +68,13 @@ local function console(format, ...)
     print("AutomationAPI: " .. string.format(format, ...))
 end
 
--- Whether a directory is actually there and actually usable.
+-- Whether a directory is genuinely usable, and if not, what about it is not.
 --
--- There is no stat() in the sandbox, and listFilesOfDirectory() answers the same empty
--- list for a directory that is missing as for one that is merely empty. So ask the only
--- question that matters to this protocol - can a file be written here and read back - by
--- doing it. io.open cannot create a directory, so a probe that opens proves one exists.
---
--- The name fails the mod's own ^[A-Za-z0-9_-]+%.json$ request filter, so a probe left
--- behind by a crash is never mistaken for a request.
+-- Config owns this because root resolution asks the same question of its candidates, and
+-- the two must not be allowed to drift: a root chosen by one test and used through another
+-- is how the transport ends up pointed at a directory nothing can read.
 local function directoryUsable(path)
-    local probe = path .. "/probe.tmp"
-
-    local wrote = pcall(function()
-        local out = assert(io.open(probe, "wb"))
-        out:write("probe")
-        out:close()
-
-        local back = assert(io.open(probe, "rb"))
-        local content = back:read("*a")
-        back:close()
-
-        assert(content == "probe")
-    end)
-
-    if not wrote then
-        pcall(deleteFile, probe)
-        return false, "io.open cannot write a file there and read it back"
-    end
-
-    -- Writing is not enough. The mod finds its work with listFilesOfDirectory, which is an
-    -- engine call and does not go through the same path handling as io.open - so a
-    -- directory can accept every write the mod makes and still report itself empty when it
-    -- is listed. That failure is completely silent: requests arrive, nothing sees them,
-    -- nothing errors. Check the call the poll loop actually depends on.
-    local listed = false
-
-    pcall(function()
-        for _, entry in ipairs({listFilesOfDirectory(path)}) do
-            if string.match(tostring(entry), "([^/\\]+)$") == "probe.tmp" then
-                listed = true
-            end
-        end
-    end)
-
-    pcall(deleteFile, probe)
-
-    if not listed then
-        return false, "a file written there is not visible to listFilesOfDirectory"
-    end
-
-    return true
+    return Config.probeDirectory(path)
 end
 
 -- createDirectory is not documented as recursive, and the API's folder can sit several
@@ -555,13 +511,19 @@ function AutomationApiBridge.initialize()
     -- every path that was tried - the one that ought to have worked is the useful clue.
     if not Config.rootIsUsable() then
         for _, attempt in ipairs(Config.getRootAttempts()) do
-            console("  tried %s: refused", attempt.path)
+            console("  tried %s", attempt.path)
+            console("        %s", tostring(attempt.reason or "refused"))
         end
 
-        console("no usable transport directory. Every candidate above refused a "
-                .. "write-read round trip, which is the sandbox rejecting the path rather "
-                .. "than a permissions problem - the same error the log reports as "
-                .. "'filename is not secure'.")
+        console("no usable transport directory, so every request will fail. Reading and "
+                .. "writing go through io.open, which the sandbox can refuse by path; "
+                .. "finding requests goes through listFilesOfDirectory, which is an engine "
+                .. "call and can come back empty for a directory io.open is perfectly happy "
+                .. "with. The reasons above say which of the two gave way.")
+        console("if none of those paths can be fixed, set Config.rootOverride in "
+                .. "data/scripts/lib/automationapi/config.lua to an absolute path and "
+                .. "restart - the search cannot find the working directory on its own, "
+                .. "because os.getenv is nil inside the sandbox.")
         console("filesystem API: %s", filesystemApi())
     end
 

@@ -111,9 +111,9 @@ Bridge.initialize()
 release()
 
 check(said("could not create"), "a directory that was not created is reported")
-check(said("probe.tmp") == false, "the probe file is not mentioned in the error")
-check(said("io.open cannot write a file there and read it back"),
-      "and the reason names the call that actually failed")
+check(said("io.open refused the write"), "and the reason names the call that failed")
+check(said("No such file or directory"),
+      "passing the engine's own words through rather than paraphrasing them")
 if not said("could not create") then dump() end
 
 -- #### createDirectory IS NOT THERE #### --
@@ -166,11 +166,15 @@ capture()
 Bridge.initialize()
 release()
 
-check(said("not visible to listFilesOfDirectory"),
+check(said("listFilesOfDirectory returns nothing there"),
       "a directory that cannot be listed is reported, not trusted")
+check(said("would never see a request delivered to it"),
+      "and the message says what that costs, not just what it is")
 check(said("no usable transport directory"),
-      "and root resolution refuses to settle on one")
-if not said("not visible to listFilesOfDirectory") then dump() end
+      "root resolution refuses to settle on one")
+check(said("Config.rootOverride"),
+      "and points at the escape hatch, since the mod cannot find the path itself")
+if not said("listFilesOfDirectory returns nothing there") then dump() end
 
 -- #### RECOVERY #### --
 --

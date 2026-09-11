@@ -53,11 +53,24 @@ It prints the winner to the server console, and that line is what the bridge has
 pointed at:
 
 ```
-AutomationAPI: v0.1.7 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.1.8 ready, API v1, transport directory: moddata/AutomationAPI
 ```
 
 One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run
 from the same Avorion directory would share a transport directory.
+
+If every candidate fails - the mod says so on the console, with the reason for each - set
+`Config.rootOverride` in
+[`config.lua`](../data/scripts/lib/automationapi/config.lua) to an absolute path and
+restart:
+
+```lua
+Config.rootOverride = "/home/avorion/.avorion/moddata/AutomationAPI"
+```
+
+The mod cannot work that path out for itself, because `os.getenv` is nil inside the
+sandbox and `Server().folder` may be relative. An override is still probed like any other
+candidate, so a typo reports itself instead of failing silently.
 
 ## Request
 

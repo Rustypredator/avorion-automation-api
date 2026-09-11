@@ -6,13 +6,20 @@
 
 local Config = {}
 
-Config.version = "0.1.7"
+Config.version = "0.1.8"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
 Config.apiVersion = 1
 
 Config.folderName = "AutomationAPI"
+
+-- Absolute path to use as the transport directory, bypassing the search below. Leave nil
+-- unless the mod reports that it could not find a usable directory on its own; see the
+-- PATHS section at the bottom of this file.
+--
+--   Config.rootOverride = "/home/avorion/.avorion/moddata/AutomationAPI"
+Config.rootOverride = nil
 
 -- #### TRANSPORT #### --
 
@@ -117,6 +124,15 @@ local rootAttempts
 local function candidateRoots()
     local roots = {}
 
+    -- Set Config.rootOverride to an absolute path to skip the search entirely. The mod
+    -- cannot discover the server's working directory - os.getenv is nil inside the sandbox
+    -- - so on a server where every relative spelling fails, stating the absolute path is
+    -- the only thing left. It is still probed like any other candidate, so a wrong one
+    -- reports itself rather than breaking the mod silently.
+    if type(Config.rootOverride) == "string" and Config.rootOverride ~= "" then
+        roots[#roots + 1] = Config.rootOverride
+    end
+
     local ok, folder = pcall(function() return Server().folder end)
     if not ok or type(folder) ~= "string" then folder = "" end
 
@@ -151,48 +167,101 @@ local function candidateRoots()
     return roots
 end
 
--- A round trip rather than a bare open: the sandbox judges reads and writes separately,
--- and a directory the mod can write but not read back is no use to this protocol.
+-- Whether a directory is genuinely usable, and if not, exactly what about it is not.
 --
--- The listing matters just as much. The bridge finds its work with listFilesOfDirectory,
--- an engine call that does not share io.open's path handling, so a root can pass every
--- open the mod makes and still report itself empty when listed. Nothing errors in that
--- state - requests simply arrive and are never seen - which makes it the worst root to
--- settle on and the one most worth ruling out here.
-local function roundTrips(root)
-    pcall(createDirectory, root)
+-- Two calls have to work, and they are not the same code. io.open goes through the
+-- sandbox's filename check; listFilesOfDirectory is an engine call that does not. Either
+-- can work where the other does not, and the mod needs both: it reads and writes with the
+-- first and finds its work with the second. A directory that passes one and fails the
+-- other is the worst case to land on, because nothing errors - requests are delivered and
+-- never seen.
+--
+-- Returns true, or false and a reason written for whoever has to read the console. The
+-- reason matters as much as the verdict: "refused" is not a diagnosis, and the difference
+-- between the sandbox rejecting a path and a listing coming back empty is the difference
+-- between two completely unrelated fixes.
+function Config.probeDirectory(path)
+    local probe = path .. "/probe.tmp"
+    local failure
 
-    local probe = root .. "/probe.tmp"
+    local wrote = pcall(function()
+        local out, openErr = io.open(probe, "wb")
+        if not out then
+            failure = "io.open refused the write: " .. tostring(openErr or "no reason given")
+            error(failure, 0)
+        end
 
-    local ok = pcall(function()
-        local out = assert(io.open(probe, "wb"))
         out:write("probe")
         out:close()
 
-        local back = assert(io.open(probe, "rb"))
+        local back, readErr = io.open(probe, "rb")
+        if not back then
+            failure = "written, but io.open refused to read it back: "
+                      .. tostring(readErr or "no reason given")
+            error(failure, 0)
+        end
+
         local content = back:read("*a")
         back:close()
 
-        assert(content == "probe")
+        if content ~= "probe" then
+            failure = "read back " .. #tostring(content) .. " bytes, not the 5 written"
+            error(failure, 0)
+        end
     end)
 
-    if ok then
-        local listed = false
+    if not wrote then
+        pcall(deleteFile, probe)
+        return false, failure or "io.open failed there"
+    end
 
-        pcall(function()
-            for _, entry in ipairs({listFilesOfDirectory(root)}) do
-                if string.match(tostring(entry), "([^/\\]+)$") == "probe.tmp" then
-                    listed = true
-                end
-            end
-        end)
+    -- Collect the raw listing rather than just asking whether the probe is in it. When
+    -- this is the half that fails, what the call actually returned is the only clue to
+    -- why, so it goes in the message.
+    local entries = {}
 
-        ok = listed
+    local listOk = pcall(function()
+        for _, entry in ipairs({listFilesOfDirectory(path)}) do
+            entries[#entries + 1] = entry
+        end
+    end)
+
+    local listed = false
+    for _, entry in ipairs(entries) do
+        if string.match(tostring(entry), "([^/\\]+)$") == "probe.tmp" then listed = true end
     end
 
     pcall(deleteFile, probe)
 
-    return ok
+    if listed then return true end
+
+    if not listOk then
+        return false, "written and read back, but listFilesOfDirectory raised an error there"
+    end
+
+    if #entries == 0 then
+        return false, "written and read back, but listFilesOfDirectory returns nothing "
+                      .. "there - the mod would never see a request delivered to it"
+    end
+
+    return false, string.format(
+        "written and read back, but listFilesOfDirectory did not report it among %d "
+        .. "entries (first is a %s: %s)",
+        #entries, type(entries[1]), string.sub(tostring(entries[1]), 1, 60))
+end
+
+-- A candidate root: create it, then find out whether it is any use.
+local function roundTrips(root)
+    local created, createErr = pcall(createDirectory, root)
+
+    local ok, reason = Config.probeDirectory(root)
+    if ok then return true end
+
+    if not created then
+        return false, "createDirectory failed (" .. tostring(createErr) .. "); " .. reason
+    end
+
+    return false, reason
 end
 
 function Config.getRoot()
@@ -202,8 +271,8 @@ function Config.getRoot()
     rootAttempts = {}
 
     for _, root in ipairs(candidates) do
-        local ok = roundTrips(root)
-        rootAttempts[#rootAttempts + 1] = {path = root, ok = ok}
+        local ok, reason = roundTrips(root)
+        rootAttempts[#rootAttempts + 1] = {path = root, ok = ok, reason = reason}
 
         if ok then
             resolvedRoot = root
