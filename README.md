@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.1.5](https://img.shields.io/badge/version-0.1.5-8957e5)](modinfo.lua)
+[![version 0.1.6](https://img.shields.io/badge/version-0.1.6-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -74,7 +74,30 @@ For a dedicated server `modconfig.lua` lives in the galaxy folder, e.g.
 
 ### 2. Start the server and take a key
 
-Start it. The log should show `Found 1 mods` and then `AutomationAPI: v0.1.5 ready`.
+Start it. The server console should show `Found 1 mods` and then two lines from the mod:
+
+```
+AutomationAPI: v0.1.6 ready, API v1, transport directory: ./moddata/AutomationAPI
+AutomationAPI: transport directories ready: requests, responses, events, keys
+```
+
+The first is the path a bridge has to be pointed at. The second means the mod could create
+and write its directories; if it could not, it says which one and why instead, and repeats
+nothing until the answer changes.
+
+From then on it prints one throughput line a minute, and only when something happened:
+
+```
+AutomationAPI: [21:14:03] 12 requests, 12 responses, 0 failures in the last 60s
+```
+
+`failures` counts what went wrong at the mod's end - a request it could not read, a
+response it could not write, and any 5xx it produced itself. A 401 or a 404 is a normal
+answer and is not counted. Requests still waiting on background work are reported as
+`still in flight`; a number that only grows is the sign worth chasing. `Config.statsInterval`
+and `Config.statsWhenIdle` in
+[`config.lua`](data/scripts/lib/automationapi/config.lua) change the period, turn the line
+off, or make it a heartbeat that prints even when idle.
 
 In game, run `/apikey new` to get a key. It is shown once. To let non-admins run the
 command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in

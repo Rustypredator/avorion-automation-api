@@ -47,7 +47,7 @@ write-read-delete round trip and keeping the first that survives, falling back t
 server console, and that line is what the bridge has to be pointed at:
 
 ```
-AutomationAPI: v0.1.5 ready, API v1, transport directory: ./moddata/AutomationAPI
+AutomationAPI: v0.1.6 ready, API v1, transport directory: ./moddata/AutomationAPI
 ```
 
 One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run

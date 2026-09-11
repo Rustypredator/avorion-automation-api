@@ -42,6 +42,14 @@ local expiring = {}
 
 local sinceLastPoll = 0
 local sinceLastEnsure = 0
+local sinceLastStats = 0
+
+-- Throughput, reset every time it is reported. Deliberately coarse: "requests" is every
+-- file picked up, "responses" every file written back, and "failures" the subset that went
+-- wrong at this end - a request that could not be read, a response that could not be
+-- written, and any 5xx the mod produced itself. A 401 or a 404 is a normal answer to a
+-- bad question, so neither counts as a failure.
+local stats = {requests = 0, responses = 0, failures = 0}
 
 -- #### HELPERS #### --
 
@@ -185,6 +193,7 @@ local function writeResponse(requestId, status, body, errorText)
         -- the body held something the encoder choked on; still answer, so the caller
         -- gets a failure instead of a timeout
         logError("failed to encode response for %s: %s", tostring(requestId), tostring(err))
+        stats.failures = stats.failures + 1
 
         encoded = Json.encode(
         {
@@ -192,6 +201,10 @@ local function writeResponse(requestId, status, body, errorText)
             status = 500,
             body = {error = {code = "encoding_failed", message = tostring(err)}},
         })
+    elseif type(status) == "number" and status >= 500 then
+        -- 500 is a Lua error inside a handler and 504 a request that ran out of time.
+        -- Both are this end failing to answer, which a 404 is not.
+        stats.failures = stats.failures + 1
     end
 
     local path = dirs.responses .. "/" .. requestId .. ".json"
@@ -199,9 +212,11 @@ local function writeResponse(requestId, status, body, errorText)
     local ok, writeErr = writeFile(path, encoded)
     if not ok then
         logError("failed to write response %s: %s", path, tostring(writeErr))
+        stats.failures = stats.failures + 1
         return
     end
 
+    stats.responses = stats.responses + 1
     expiring[path] = Server().unpausedRuntime + Config.responseTtl
 end
 
@@ -301,6 +316,8 @@ local function processRequestFile(name)
     local requestId = string.gsub(name, "%.json$", "")
     local path = dirs.requests .. "/" .. name
 
+    stats.requests = stats.requests + 1
+
     local content, readErr = readFile(path)
 
     -- Delete first, always. A request that somehow kills the handler must not be
@@ -309,6 +326,7 @@ local function processRequestFile(name)
 
     if not content then
         logError("could not read request %s: %s", name, tostring(readErr))
+        stats.failures = stats.failures + 1
         badRequest(requestId, 400, "unreadable_request", tostring(readErr))
         return true
     end
@@ -361,6 +379,50 @@ local function poll()
             handled = handled + 1
         end
     end
+end
+
+-- #### THROUGHPUT #### --
+
+local function timestamp()
+    local ok, stamp = pcall(os.date, "%H:%M:%S")
+    if ok and type(stamp) == "string" then return stamp end
+
+    -- os.date is not documented as surviving the sandbox. Runtime seconds still order the
+    -- lines against each other and against the server log, which is most of the job.
+    local okRuntime, runtime = pcall(function() return Server().unpausedRuntime end)
+    if okRuntime and type(runtime) == "number" then
+        return string.format("%ds up", math.floor(runtime))
+    end
+
+    return "?"
+end
+
+local function reportStats()
+    local inFlight = 0
+    for _ in pairs(pending) do inFlight = inFlight + 1 end
+
+    local idle = stats.requests == 0 and stats.responses == 0 and stats.failures == 0
+
+    -- Nothing happened and nothing is waiting. Saying so once a minute, forever, would
+    -- bury the lines that matter.
+    if idle and inFlight == 0 and not Config.statsWhenIdle then return end
+
+    local line = string.format("[%s] %d requests, %d responses, %d failures in the last %ds",
+                               timestamp(), stats.requests, stats.responses, stats.failures,
+                               Config.statsInterval)
+
+    -- Requests that have neither answered nor timed out yet. Normally a handful of
+    -- in-flight mission previews; a number that only grows is the useful bad sign.
+    if inFlight > 0 then
+        line = line .. string.format(", %d still in flight", inFlight)
+    end
+
+    console("%s", line)
+    log("%s", line)
+
+    stats.requests = 0
+    stats.responses = 0
+    stats.failures = 0
 end
 
 -- #### SCRIPT ENTRY POINTS #### --
@@ -554,6 +616,12 @@ function AutomationApiBridge.update(timeStep)
         if sinceLastEnsure >= Config.ensureDirsInterval then
             sinceLastEnsure = 0
             ensureDirsAndReport()
+        end
+
+        sinceLastStats = sinceLastStats + elapsed
+        if Config.statsInterval > 0 and sinceLastStats >= Config.statsInterval then
+            sinceLastStats = 0
+            reportStats()
         end
 
         poll()

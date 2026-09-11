@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.1.5", "game": "2.5.13",
+  "api": 1, "mod": "0.1.6", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true}

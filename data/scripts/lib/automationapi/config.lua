@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.1.5"
+Config.version = "0.1.6"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -34,6 +34,16 @@ Config.responseTtl = 60
 -- How often the bridge re-creates its directories, in seconds. They can be removed while
 -- the server runs, and every request fails until they are back.
 Config.ensureDirsInterval = 30
+
+-- How often the bridge reports throughput to the server console, in seconds. One line per
+-- request would be unreadable on a busy server and useless on a quiet one; this is the
+-- coarse "is anything getting through" view. 0 turns it off.
+Config.statsInterval = 60
+
+-- Whether to print that line during an interval in which nothing happened at all. Off by
+-- default, so an idle server does not fill its console with zeroes. Turn it on to use the
+-- line as a heartbeat instead.
+Config.statsWhenIdle = false
 
 -- Largest request file we will read, in bytes.
 Config.maxRequestSize = 256 * 1024
