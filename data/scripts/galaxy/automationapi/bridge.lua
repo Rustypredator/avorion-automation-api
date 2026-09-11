@@ -310,6 +310,20 @@ function AutomationApiBridge.initialize()
     createDirectory(dirs.responses)
     createDirectory(dirs.events)
 
+    -- The sandbox can refuse io.open under every candidate root, and when it does the
+    -- only other sign is a pair of errors per request, forever. Say it once here, where
+    -- whoever is reading the startup log will actually see it.
+    if not Config.rootIsUsable() then
+        for _, attempt in ipairs(Config.getRootAttempts()) do
+            logError("cannot use %s: the sandbox refused a read-write round trip there",
+                     attempt.path)
+        end
+
+        logError("no usable moddata directory, so every request will fail with "
+                 .. "'filename is not secure'. Run the galaxy under the Avorion data "
+                 .. "directory, or make moddata/ under that directory writable.")
+    end
+
     router = Router.new()
     MetaHandler.register(router)
     ShipsHandler.register(router)

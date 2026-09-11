@@ -201,4 +201,32 @@ while (microtime(true) < $deadline) {
     reply($status, $payload->body ?? new stdClass());
 }
 
-fail(504, 'bridge_timeout', sprintf('No response within %ds.', (int) TIMEOUT));
+/**
+ * Nothing came back, and which half of the round trip is broken is the only useful thing
+ * to say here. The request file answers it: the mod deletes it the instant it picks it up,
+ * so one still sitting there means nothing is reading that directory at all.
+ *
+ * That case is otherwise completely silent. The directory check above passes whether or
+ * not the mod ever created it, because Docker makes an empty directory on the host for any
+ * bind mount whose source is missing - so a GALAXY_DIR pointing at the wrong galaxy looks
+ * like a healthy bridge right up to this line.
+ */
+clearstatcache(true, $final);
+
+if (file_exists($final)) {
+    // Take it back out. Nothing is reading the directory now, but a mod that is merely
+    // down would answer every abandoned request at once on its way back up, long after
+    // the callers stopped listening.
+    @unlink($final);
+
+    fail(504, 'mod_not_responding',
+        'The mod never picked this request up. Check that the game server is running with '
+        . 'the mod loaded, and that GALAXY_DIR points at the galaxy that server is actually '
+        . 'running.');
+}
+
+fail(504, 'bridge_timeout', sprintf(
+    'The mod took the request but wrote no response within %ds. Check the game server log '
+    . 'for AutomationAPI errors - a response the mod cannot write fails exactly like this, '
+    . 'so make sure the responses directory is writable by the account the server runs as.',
+    (int) TIMEOUT));
