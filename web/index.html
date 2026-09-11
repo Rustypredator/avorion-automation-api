@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avorion Automation Console</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">&#9679;</span>
+    <span class="brand-name">AUTOMATION CONSOLE</span>
+  </div>
+
+  <div class="conn">
+    <label class="field">
+      <span>API</span>
+      <input id="conn-url" type="text" spellcheck="false" placeholder="http://localhost:80">
+    </label>
+    <label class="field">
+      <span>Key</span>
+      <input id="conn-key" type="password" spellcheck="false" placeholder="avo_...">
+    </label>
+    <button id="conn-reveal" class="ghost" title="Show or hide the key">&#128065;</button>
+    <label class="check" title="Keep the key in this browser's local storage"><input id="conn-remember" type="checkbox" checked><span>remember</span></label>
+    <button id="conn-connect" class="primary">Connect</button>
+  </div>
+
+  <div id="conn-status" class="status">
+    <span class="dot off"></span><span class="status-text">not connected</span>
+  </div>
+
+  <div class="topbar-right">
+    <button id="poll-toggle" class="ghost" title="Pause or resume every background poll">&#10073;&#10073; pause</button>
+    <span id="queue-meter" class="meter" title="In-flight / queued API calls">0/0</span>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<nav id="tabs">
+  <button class="tab active" data-view="fleet">Fleet</button>
+  <button class="tab" data-view="map">Map</button>
+  <button class="tab" data-view="galaxy">Galaxy</button>
+</nav>
+
+<main>
+
+  <!-- ============================== FLEET ============================== -->
+  <section id="view-fleet" class="view active">
+    <aside id="fleet-list">
+      <div class="pane-head">
+        <div class="seg" id="filter-type" data-value="ship">
+          <button data-v="ship" class="on">Ships</button>
+          <button data-v="station">Stations</button>
+          <button data-v="all">All</button>
+        </div>
+        <div class="seg" id="filter-owner" data-value="player">
+          <button data-v="player" class="on">Mine</button>
+          <button data-v="alliance">Alliance</button>
+          <button data-v="all">Both</button>
+        </div>
+        <input id="fleet-search" type="search" placeholder="filter by name, status, sector">
+        <div class="pane-head-row">
+          <span id="fleet-count" class="muted">&mdash;</span>
+          <button id="fleet-refresh" class="ghost small">refresh</button>
+        </div>
+      </div>
+      <div id="fleet-rows" class="rows"></div>
+    </aside>
+
+    <section id="ship-pane">
+      <div id="ship-empty" class="empty">
+        <p>Select a craft.</p>
+        <p class="muted">Everything here reads the ship database, so it works while the sector is unloaded and while you are logged out. Writes need the owning player in game.</p>
+      </div>
+
+      <div id="ship-detail" class="hidden">
+        <div class="ship-head">
+          <div>
+            <h1 id="ship-name"></h1>
+            <div id="ship-sub" class="muted"></div>
+          </div>
+          <div id="ship-badges" class="badges"></div>
+          <button id="ship-refresh" class="ghost small">refresh</button>
+        </div>
+
+        <nav class="subtabs">
+          <button class="subtab active" data-sub="overview">Overview</button>
+          <button class="subtab" data-sub="mission">Mission</button>
+          <button class="subtab" data-sub="orders">Orders</button>
+          <button class="subtab" data-sub="travel">Travel</button>
+          <button class="subtab" data-sub="log">Log</button>
+          <button class="subtab" data-sub="raw">Raw</button>
+        </nav>
+
+        <div class="subview active" data-sub="overview"><div id="sv-overview"></div></div>
+        <div class="subview" data-sub="mission"><div id="sv-mission"></div></div>
+        <div class="subview" data-sub="orders"><div id="sv-orders"></div></div>
+        <div class="subview" data-sub="travel"><div id="sv-travel"></div></div>
+        <div class="subview" data-sub="log"><div id="sv-log" class="log-rows"></div></div>
+        <div class="subview" data-sub="raw"><pre id="sv-raw" class="json"></pre></div>
+      </div>
+    </section>
+  </section>
+
+  <!-- =============================== MAP =============================== -->
+  <section id="view-map" class="view">
+    <div id="map-wrap">
+      <canvas id="map-canvas"></canvas>
+      <div id="map-tip" class="map-tip hidden"></div>
+      <div id="map-legend" class="map-legend"></div>
+      <div class="map-toolbar">
+        <button id="map-load" class="primary small">Load known sectors</button>
+        <button id="map-fit" class="ghost small">Fit</button>
+        <label class="check"><input id="map-show-ships" type="checkbox" checked><span>craft</span></label>
+        <label class="check"><input id="map-show-belts" type="checkbox" checked><span>belts</span></label>
+        <label class="check"><input id="map-show-unvisited" type="checkbox" checked><span>unvisited</span></label>
+        <span id="map-status" class="muted"></span>
+      </div>
+    </div>
+
+    <aside id="map-side">
+      <div class="pane-head">
+        <input id="map-search-q" type="search" placeholder="station name, e.g. turret factory">
+        <div class="pane-head-row">
+          <label class="check" title="Run the galaxy generator over the visible box to find stations nobody has visited"><input id="map-search-predict" type="checkbox"><span>predict unvisited</span></label>
+          <button id="map-search-go" class="ghost small">search</button>
+        </div>
+      </div>
+      <div id="map-side-body"></div>
+    </aside>
+  </section>
+
+  <!-- ============================= GALAXY ============================== -->
+  <section id="view-galaxy" class="view">
+    <div id="galaxy-body" class="pad"></div>
+  </section>
+
+</main>
+
+<!-- ============================== LOG DOCK ============================== -->
+<section id="logdock">
+  <div class="dock-head">
+    <div class="seg" id="log-source" data-value="events">
+      <button data-v="events" class="on">Ship events</button>
+      <button data-v="traffic">API traffic</button>
+    </div>
+    <input id="log-filter" type="search" placeholder="filter">
+    <label class="check"><input id="log-idle-only" type="checkbox"><span>idle only</span></label>
+    <label class="check"><input id="log-follow" type="checkbox" checked><span>follow</span></label>
+    <span id="log-recording" class="muted"></span>
+    <span class="spacer"></span>
+    <button id="log-clear" class="ghost small">clear</button>
+    <button id="log-collapse" class="ghost small">&#9660;</button>
+  </div>
+  <div id="log-rows" class="log-rows"></div>
+</section>
+
+<div id="toasts"></div>
+
+<script src="api.js"></script>
+<script src="map.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

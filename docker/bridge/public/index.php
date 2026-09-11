@@ -51,6 +51,14 @@ function cors(): void
     header('Access-Control-Allow-Headers: Content-Type, X-API-Key, Authorization');
     header('Access-Control-Max-Age: 86400');
 
+    // Chrome blocks a page on a public - or file:// - origin from reaching a private
+    // address unless the preflight asks for it and gets this back, which is exactly the
+    // shape of someone opening the console off their disk against a bridge on their LAN
+    // or on localhost. It only ever grants what the origin check above already granted.
+    if (($_SERVER['HTTP_ACCESS_CONTROL_REQUEST_PRIVATE_NETWORK'] ?? '') === 'true') {
+        header('Access-Control-Allow-Private-Network: true');
+    }
+
     // A named origin means the answer varies by it, so caches have to be told.
     if ($origin !== '*') {
         header('Vary: Origin');

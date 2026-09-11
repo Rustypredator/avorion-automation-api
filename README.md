@@ -70,6 +70,31 @@ do sleep 0.1; done
 cat "$DIR/responses/$ID.json"; rm "$DIR/responses/$ID.json"
 ```
 
+## Web console
+
+`web/` is a browser console for the API - fleet overview, captain missions, orders,
+travel, a galaxy map and a live per-ship event log. It is plain HTML and JavaScript with
+no build step and no CDN, and all of its logic runs in the browser: it holds your key,
+talks to the API directly and stores nothing on a server.
+
+The Docker stack in `docker/` serves it from the API's own origin:
+
+```bash
+cd docker
+cp .env.example .env      # point GALAXY_DIR at your galaxy
+docker compose up -d --build
+```
+
+Then open `http://<your-api-host>/console/` and paste an API key. The address field is
+already filled in with the page's own origin, so there is nothing else to set.
+
+You can also just open `web/index.html` off disk, but then the page and the API are
+different origins and the browser has to be let through. The bridge sends the CORS
+headers for that by default (`CORS_ORIGIN` in `.env` narrows or disables them), which
+includes the one Chrome wants before a page off your disk may reach an address on your
+own network. A bridge built before those headers existed refuses the page with no usable
+error - rebuild it. Serving the console from `/console/` sidesteps the whole question.
+
 ## Endpoints
 
 Full reference in [docs/api.md](docs/api.md).

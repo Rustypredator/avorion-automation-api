@@ -27,11 +27,20 @@ services:
       # Defaults to plain HTTP on :80. A hostname here turns on automatic HTTPS.
       API_DOMAIN: "${API_DOMAIN:-:80}"
       GALAXY_DIR: /galaxy
+      # Which origins a browser page may call the API from. "*" is the default and is
+      # safe here - the key is a header, never a cookie, so a browser sends no
+      # credential of its own. Set an origin to narrow it, or "" to send no CORS
+      # headers at all (which also blocks the console unless it is loaded from
+      # /console/ on this same origin).
+      CORS_ORIGIN: "${CORS_ORIGIN:-*}"
 
     # Only the API's own two directories, so a bridge process that misbehaves cannot
     # touch saves or the globals file the API keys live in.
     volumes:
       - ./Caddyfile:/etc/frankenphp/Caddyfile:ro
+      # The web console, served by the same Caddy at /console/ so the page and the API
+      # share an origin and no CORS is involved. Remove this line to not host it.
+      - ../web:/app/console:ro
       - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/requests:/galaxy/moddata/AutomationAPI/requests
       - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/responses:/galaxy/moddata/AutomationAPI/responses
       - caddy_data:/data

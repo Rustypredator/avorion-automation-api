@@ -32,6 +32,15 @@
 		max_size 256KB
 	}
 
+	# The bundled web console, if docker-compose.yml mounts it. Serving it from the
+	# API's own origin is the point: the page then calls the API same-origin and CORS
+	# never enters into it. Drop the volume and this is a plain 404.
+	redir /console /console/ 308
+	handle_path /console/* {
+		root * /app/console
+		file_server
+	}
+
 	# Every path is handled by public/index.php - /ships/Ore%20Hound is a route, not a
 	# file - and the path reaches PHP still percent-encoded, which is what the mod wants.
 	php_server
