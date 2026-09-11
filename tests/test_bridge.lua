@@ -155,6 +155,29 @@ Bridge.update(Config.pollInterval)
 local after = #{listFilesOfDirectory(Config.getResponsesDir())}
 check(after == 0, "stale responses are deleted after the TTL")
 
+-- The transport directories can go away under a running server - a cleanup, or someone
+-- clearing moddata by hand - and every request fails until they are back. The bridge
+-- re-creates them on its own rather than waiting for a restart.
+os.execute("rm -rf '" .. Config.getRoot() .. "'")
+check(#{listFilesOfDirectory(Config.getRequestsDir())} == 0, "the directories are gone")
+
+Mock.advanceClock(Config.ensureDirsInterval + 1)
+Bridge.update(Config.ensureDirsInterval + 1)
+
+local restored = io.open(Config.getRequestsDir() .. "/probe.tmp", "wb")
+check(restored ~= nil, "the request directory is re-created without a restart")
+if restored then
+    restored:close()
+    deleteFile(Config.getRequestsDir() .. "/probe.tmp")
+end
+
+local reply = io.open(Config.getResponsesDir() .. "/probe.tmp", "wb")
+check(reply ~= nil, "and so is the response directory")
+if reply then
+    reply:close()
+    deleteFile(Config.getResponsesDir() .. "/probe.tmp")
+end
+
 check(#Mock.errors == 0, "no errors were logged during the run")
 if #Mock.errors > 0 then
     for _, e in ipairs(Mock.errors) do print("       > " .. e) end

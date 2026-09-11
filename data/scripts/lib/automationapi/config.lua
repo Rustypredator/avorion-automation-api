@@ -31,6 +31,10 @@ Config.requestTimeout = 20
 -- directory from growing without bound if the HTTP sidecar dies mid-flight.
 Config.responseTtl = 60
 
+-- How often the bridge re-creates its directories, in seconds. They can be removed while
+-- the server runs, and every request fails until they are back.
+Config.ensureDirsInterval = 30
+
 -- Largest request file we will read, in bytes.
 Config.maxRequestSize = 256 * 1024
 

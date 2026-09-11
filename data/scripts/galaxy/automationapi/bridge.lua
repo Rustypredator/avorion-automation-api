@@ -41,6 +41,7 @@ local pending = {}
 local expiring = {}
 
 local sinceLastPoll = 0
+local sinceLastEnsure = 0
 
 -- #### HELPERS #### --
 
@@ -50,6 +51,25 @@ end
 
 local function logError(format, ...)
     eprint("AutomationAPI: " .. format, ...)
+end
+
+-- printlog lands in the log file, which a dedicated server's console does not show. The
+-- one line saying whether the API came up, and which directory it settled on, is the line
+-- an operator needs to see, so it goes to the console instead.
+local function console(format, ...)
+    print("AutomationAPI: " .. string.format(format, ...))
+end
+
+-- createDirectory is not documented as recursive, and the API's folder can sit several
+-- levels below anything that exists - or be deleted underneath a running server, which is
+-- how this came up. Walk the chain and create each level in turn.
+local function ensureDirectory(path)
+    local built = string.sub(path, 1, 1) == "/" and "" or nil
+
+    for segment in string.gmatch(path, "[^/]+") do
+        built = built and (built .. "/" .. segment) or segment
+        pcall(createDirectory, built)
+    end
 end
 
 -- listFilesOfDirectory() isn't documented as returning names or full paths, so accept
@@ -294,25 +314,42 @@ end
 
 -- #### SCRIPT ENTRY POINTS #### --
 
+-- Every directory the API owns. Called on startup and again periodically, because these
+-- can be removed while the server runs - by a cleanup, or by hand - and the mod should
+-- come back on its own rather than failing every request until the next restart.
+local function ensureDirs()
+    ensureDirectory(dirs.root)
+    ensureDirectory(dirs.requests)
+    ensureDirectory(dirs.responses)
+    ensureDirectory(dirs.events)
+    ensureDirectory(dirs.keys)
+end
+
 function AutomationApiBridge.initialize()
     if onClient() then return end
 
-    local root = Config.getRoot()
     dirs =
     {
-        root = root,
+        root = Config.getRoot(),
         requests = Config.getRequestsDir(),
         responses = Config.getResponsesDir(),
         events = Config.getEventsDir(),
+        keys = Config.getKeysDir(),
     }
 
-    createDirectory(dirs.requests)
-    createDirectory(dirs.responses)
-    createDirectory(dirs.events)
+    ensureDirs()
+
+    router = Router.new()
+    MetaHandler.register(router)
+    ShipsHandler.register(router)
+    MissionsHandler.register(router)
+    MovementHandler.register(router)
+    MapHandler.register(router)
+
+    ready = true
 
     -- The sandbox can refuse io.open under every candidate root, and when it does the
-    -- only other sign is a pair of errors per request, forever. Say it once here, where
-    -- whoever is reading the startup log will actually see it.
+    -- only other sign is a pair of errors per request, forever. Say it once, here.
     if not Config.rootIsUsable() then
         for _, attempt in ipairs(Config.getRootAttempts()) do
             logError("cannot use %s: the sandbox refused a read-write round trip there",
@@ -324,14 +361,10 @@ function AutomationApiBridge.initialize()
                  .. "directory, or make moddata/ under that directory writable.")
     end
 
-    router = Router.new()
-    MetaHandler.register(router)
-    ShipsHandler.register(router)
-    MissionsHandler.register(router)
-    MovementHandler.register(router)
-    MapHandler.register(router)
-
-    ready = true
+    -- Both halves of the transport have to agree on this path, so print it whether or not
+    -- anything went wrong: it is what the HTTP bridge's galaxy directory has to point at.
+    console("v%s ready, API v%d, transport directory: %s", Config.version, Config.apiVersion,
+            dirs.root)
 
     log("v%s ready, API v%d, watching %s", Config.version, Config.apiVersion, dirs.requests)
 end
@@ -405,6 +438,12 @@ function AutomationApiBridge.update(timeStep)
     -- API down until restart, so nothing is allowed to escape.
     local ok, err = pcall(function()
         local now = Server().unpausedRuntime
+
+        sinceLastEnsure = sinceLastEnsure + elapsed
+        if sinceLastEnsure >= Config.ensureDirsInterval then
+            sinceLastEnsure = 0
+            ensureDirs()
+        end
 
         poll()
         Analysis.tick()
