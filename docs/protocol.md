@@ -11,18 +11,39 @@ serialization all live in the mod, so a bridge is roughly 150 lines in any langu
 
 ## Directories
 
-Everything lives under the galaxy folder, which is the only place the sandbox permits
-writes:
+Everything lives under one transport directory:
 
 ```
-<galaxy>/moddata/AutomationAPI/
+<root>/
   requests/    <id>.json   written by the client, deleted by the mod
   responses/   <id>.json   written by the mod, deleted by the client
   events/                  reserved
+  keys/                    one file per API key, written by /apikey new
 ```
 
-`<galaxy>` is the server's galaxy directory, e.g. `~/.avorion/galaxies/defaultgalaxy`.
-The mod creates all three on startup.
+The mod creates them on startup, and re-creates them every 30 seconds, so a directory
+removed under a running server comes back without a restart.
+
+**`<root>` is not a fixed path, and a bridge must not assume one.** The galaxy's own
+moddata folder is preferred - `~/.avorion/galaxies/defaultgalaxy/moddata/AutomationAPI` on
+an ordinary install - but it is not always reachable. `io.open` goes through a sandbox that
+refuses any filename it cannot match against an allowed absolute root, and a server that
+reaches its galaxy by a relative path (`galaxy/Avorion`, as hosting panels commonly do) has
+every open there refused with `filename is not secure`. The trap is that `createDirectory`,
+`listFilesOfDirectory` and `deleteFile` skip that check and keep working, so the mod lists
+request files it cannot read and writes responses that never appear.
+
+The mod therefore resolves the root at startup by trying each candidate with a real
+write-read-delete round trip and keeping the first that survives, falling back to
+`./moddata/AutomationAPI` under the Avorion data directory. It prints the winner to the
+server console, and that line is what the bridge has to be pointed at:
+
+```
+AutomationAPI: v0.1.4 ready, API v1, transport directory: ./moddata/AutomationAPI
+```
+
+One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run
+from the same Avorion directory would share a transport directory.
 
 ## Request
 
