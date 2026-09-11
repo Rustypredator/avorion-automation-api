@@ -60,16 +60,67 @@ local function console(format, ...)
     print("AutomationAPI: " .. string.format(format, ...))
 end
 
+-- Whether a directory is actually there and actually usable.
+--
+-- There is no stat() in the sandbox, and listFilesOfDirectory() answers the same empty
+-- list for a directory that is missing as for one that is merely empty. So ask the only
+-- question that matters to this protocol - can a file be written here and read back - by
+-- doing it. io.open cannot create a directory, so a probe that opens proves one exists.
+--
+-- The name fails the mod's own ^[A-Za-z0-9_-]+%.json$ request filter, so a probe left
+-- behind by a crash is never mistaken for a request.
+local function directoryUsable(path)
+    local probe = path .. "/probe.tmp"
+
+    local ok = pcall(function()
+        local out = assert(io.open(probe, "wb"))
+        out:write("probe")
+        out:close()
+
+        local back = assert(io.open(probe, "rb"))
+        local content = back:read("*a")
+        back:close()
+
+        assert(content == "probe")
+    end)
+
+    pcall(deleteFile, probe)
+
+    return ok
+end
+
 -- createDirectory is not documented as recursive, and the API's folder can sit several
 -- levels below anything that exists - or be deleted underneath a running server, which is
 -- how this came up. Walk the chain and create each level in turn.
+--
+-- Returns true, or false and a reason to put in front of an operator. Everything here is
+-- pcall'd and verified rather than trusted: createDirectory is an engine call that reports
+-- nothing useful, and on at least one server it is the io.open sandbox rather than the
+-- directory that is the real obstacle, which looks identical from the outside.
 local function ensureDirectory(path)
+    if directoryUsable(path) then return true end
+
+    if type(createDirectory) ~= "function" then
+        return false, "createDirectory is not available to this script"
+    end
+
     local built = string.sub(path, 1, 1) == "/" and "" or nil
+    local lastError
 
     for segment in string.gmatch(path, "[^/]+") do
         built = built and (built .. "/" .. segment) or segment
-        pcall(createDirectory, built)
+
+        local ok, err = pcall(createDirectory, built)
+        if not ok then lastError = tostring(err) end
     end
+
+    if directoryUsable(path) then return true end
+
+    if lastError then
+        return false, "createDirectory failed: " .. lastError
+    end
+
+    return false, "createDirectory reported success but nothing can be written there"
 end
 
 -- listFilesOfDirectory() isn't documented as returning names or full paths, so accept
@@ -317,12 +368,69 @@ end
 -- Every directory the API owns. Called on startup and again periodically, because these
 -- can be removed while the server runs - by a cleanup, or by hand - and the mod should
 -- come back on its own rather than failing every request until the next restart.
+--
+-- Returns a list of "<path>: <reason>" for the ones that could not be made.
 local function ensureDirs()
-    ensureDirectory(dirs.root)
-    ensureDirectory(dirs.requests)
-    ensureDirectory(dirs.responses)
-    ensureDirectory(dirs.events)
-    ensureDirectory(dirs.keys)
+    local failed = {}
+
+    -- Root first: the rest sit inside it, and a failure there explains every other one.
+    local order =
+    {
+        dirs.root,
+        dirs.requests,
+        dirs.responses,
+        dirs.events,
+        dirs.keys,
+    }
+
+    for _, path in ipairs(order) do
+        local ok, reason = ensureDirectory(path)
+        if not ok then
+            failed[#failed + 1] = path .. ": " .. tostring(reason)
+        end
+    end
+
+    return failed
+end
+
+-- What the sandbox actually handed this script. A mod that cannot create directories and
+-- a mod that cannot open files fail in exactly the same way from the outside - nothing
+-- appears - so say which one it is rather than leaving it to be guessed.
+local function filesystemApi()
+    return string.format("createDirectory=%s io.open=%s listFilesOfDirectory=%s deleteFile=%s",
+                         type(createDirectory), type(io.open), type(listFilesOfDirectory),
+                         type(deleteFile))
+end
+
+-- nil until the first run, then "ok" or "broken". Directory state is checked every 30
+-- seconds and the console is not a log file, so only speak when the answer changes.
+local dirState
+
+local function ensureDirsAndReport()
+    local failed = ensureDirs()
+
+    if #failed == 0 then
+        if dirState ~= "ok" then
+            console("transport directories ready: requests, responses, events, keys")
+        end
+
+        dirState = "ok"
+        return true
+    end
+
+    if dirState ~= "broken" then
+        for _, reason in ipairs(failed) do
+            console("could not create %s", reason)
+        end
+
+        console("the API cannot run without those directories - every request will fail. "
+                .. "Create them by hand, or check that the server account may write to %s.",
+                dirs.root)
+        console("filesystem API: %s", filesystemApi())
+    end
+
+    dirState = "broken"
+    return false
 end
 
 function AutomationApiBridge.initialize()
@@ -337,8 +445,6 @@ function AutomationApiBridge.initialize()
         keys = Config.getKeysDir(),
     }
 
-    ensureDirs()
-
     router = Router.new()
     MetaHandler.register(router)
     ShipsHandler.register(router)
@@ -348,23 +454,28 @@ function AutomationApiBridge.initialize()
 
     ready = true
 
-    -- The sandbox can refuse io.open under every candidate root, and when it does the
-    -- only other sign is a pair of errors per request, forever. Say it once, here.
-    if not Config.rootIsUsable() then
-        for _, attempt in ipairs(Config.getRootAttempts()) do
-            logError("cannot use %s: the sandbox refused a read-write round trip there",
-                     attempt.path)
-        end
-
-        logError("no usable moddata directory, so every request will fail with "
-                 .. "'filename is not secure'. Run the galaxy under the Avorion data "
-                 .. "directory, or make moddata/ under that directory writable.")
-    end
-
     -- Both halves of the transport have to agree on this path, so print it whether or not
     -- anything went wrong: it is what the HTTP bridge's galaxy directory has to point at.
     console("v%s ready, API v%d, transport directory: %s", Config.version, Config.apiVersion,
             dirs.root)
+
+    -- The sandbox can refuse io.open under every candidate root, and when it does the only
+    -- other sign is a pair of errors per request, forever. Say it once, here, and name
+    -- every path that was tried - the one that ought to have worked is the useful clue.
+    if not Config.rootIsUsable() then
+        for _, attempt in ipairs(Config.getRootAttempts()) do
+            console("  tried %s: refused", attempt.path)
+        end
+
+        console("no usable transport directory. Every candidate above refused a "
+                .. "write-read round trip, which is the sandbox rejecting the path rather "
+                .. "than a permissions problem - the same error the log reports as "
+                .. "'filename is not secure'.")
+        console("filesystem API: %s", filesystemApi())
+    end
+
+    -- Last, so that anything it has to say sits under the path it is talking about.
+    ensureDirsAndReport()
 
     log("v%s ready, API v%d, watching %s", Config.version, Config.apiVersion, dirs.requests)
 end
@@ -442,7 +553,7 @@ function AutomationApiBridge.update(timeStep)
         sinceLastEnsure = sinceLastEnsure + elapsed
         if sinceLastEnsure >= Config.ensureDirsInterval then
             sinceLastEnsure = 0
-            ensureDirs()
+            ensureDirsAndReport()
         end
 
         poll()

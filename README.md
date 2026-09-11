@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.1.4](https://img.shields.io/badge/version-0.1.4-8957e5)](modinfo.lua)
+[![version 0.1.5](https://img.shields.io/badge/version-0.1.5-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -74,7 +74,7 @@ For a dedicated server `modconfig.lua` lives in the galaxy folder, e.g.
 
 ### 2. Start the server and take a key
 
-Start it. The log should show `Found 1 mods` and then `AutomationAPI: v0.1.4 ready`.
+Start it. The log should show `Found 1 mods` and then `AutomationAPI: v0.1.5 ready`.
 
 In game, run `/apikey new` to get a key. It is shown once. To let non-admins run the
 command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in
