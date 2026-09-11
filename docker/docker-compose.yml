@@ -34,15 +34,28 @@ services:
       # /console/ on this same origin).
       CORS_ORIGIN: "${CORS_ORIGIN:-*}"
 
-    # Only the API's own two directories, so a bridge process that misbehaves cannot
-    # touch saves or the globals file the API keys live in.
+    # moddata only, so a bridge process that misbehaves still cannot reach saves or the
+    # globals file the API keys live in.
     volumes:
       - ./Caddyfile:/etc/frankenphp/Caddyfile:ro
       # The web console, served by the same Caddy at /console/ so the page and the API
       # share an origin and no CORS is involved. Remove this line to not host it.
       - ../web:/app/console:ro
-      - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/requests:/galaxy/moddata/AutomationAPI/requests
-      - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata/AutomationAPI/responses:/galaxy/moddata/AutomationAPI/responses
+      # The transport directory belongs to the mod, which creates it on startup and
+      # re-creates it every 30 seconds if something removes it. So mount the level above
+      # it, not the directories themselves.
+      #
+      # Mounting requests/ and responses/ directly looks tighter and breaks two ways. A
+      # bind mount binds an inode, so the moment the mod re-creates a directory the
+      # container is left holding the deleted one - it cannot even write to its own mount,
+      # and only a down/up recovers. And Docker creates a missing bind-mount source for
+      # you, as root, parent levels included: a GALAXY_DIR pointing at the wrong place
+      # quietly grows an empty transport directory instead of failing, owned by an account
+      # the bridge is probably not running as. moddata/ is the highest level the mod does
+      # not manage, so mounting it hands the mod back its own tree.
+      #
+      # Start the game server before this container, so these exist and belong to it.
+      - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata:/galaxy/moddata
       - caddy_data:/data
       - caddy_config:/config
 

@@ -119,9 +119,18 @@ The Docker stack in `docker/` serves it from the API's own origin:
 
 ```bash
 cd docker
-cp .env.example .env      # point GALAXY_DIR at your galaxy
+cp .env.example .env      # point GALAXY_DIR at the directory holding moddata/
 docker compose up -d --build
 ```
+
+Start the game server first. The mod creates the transport directory and owns it, and the
+server console says which one it picked - `GALAXY_DIR` is that path with
+`/moddata/AutomationAPI` taken off the end. Point it somewhere else and Docker will make
+the directory itself rather than failing, at which point nothing can write to it; the
+bridge answers `bridge_unavailable` or `transport_not_writable` and says so.
+
+`tools/e2e.sh` tests the whole deployment - mounts, ownership, round trip - without
+Avorion, by running the real mod code against a throwaway directory.
 
 Then open `http://<your-api-host>/console/` and paste an API key. The address field is
 already filled in with the page's own origin, so there is nothing else to set.

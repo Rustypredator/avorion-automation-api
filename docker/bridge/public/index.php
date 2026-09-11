@@ -93,8 +93,40 @@ if ($method !== 'GET' && $method !== 'POST') {
     fail(405, 'method_not_allowed', 'The API speaks GET and POST only.');
 }
 
-if (!is_dir($requestDir)) {
-    fail(503, 'bridge_unavailable', 'No request directory in the galaxy folder - is the mod loaded?');
+/*
+ * A bridge that cannot reach the transport directory fails every call, and it is nearly
+ * always one of two deployment mistakes that need opposite fixes. Separate them here,
+ * before anything else, rather than letting both surface as one write error later.
+ *
+ * Both come from the same Docker habit: it creates a missing bind-mount source itself -
+ * as root, parent levels included - so a GALAXY_DIR pointing at the wrong directory does
+ * not fail. It quietly manufactures an empty transport directory the game server has
+ * never heard of, owned by an account this process may not be running as.
+ *
+ * This runs before the key check on purpose. An operator debugging a fresh deployment
+ * should not have to hold a valid key to be told the mount is wrong, and the paths and
+ * uids below are the bridge's own container, not the caller's business.
+ */
+clearstatcache();
+
+if (!is_dir($requestDir) || !is_dir($responseDir)) {
+    fail(503, 'bridge_unavailable', sprintf(
+        'No transport directory at %s. The mod creates it on startup, so either the game '
+        . 'server is not running with this mod loaded, or GALAXY_DIR points somewhere the '
+        . 'mod is not writing. The mod prints the directory it settled on to the server '
+        . 'console as "AutomationAPI: ... transport directory: <path>"; GALAXY_DIR is the '
+        . 'host path of that directory with /moddata/AutomationAPI taken off the end.',
+        $root));
+}
+
+if (!is_writable($requestDir) || !is_writable($responseDir)) {
+    fail(503, 'transport_not_writable', sprintf(
+        '%s exists but this process (uid %d) cannot write to it - it belongs to uid %d. '
+        . 'Let the mod own these directories rather than Docker: start the game server '
+        . 'first so it creates them, and set BRIDGE_USER to the uid:gid that server runs '
+        . 'as. A directory Docker created to satisfy a missing mount belongs to root, and '
+        . 'nothing else can write to it.',
+        $requestDir, posix_geteuid(), (int) @fileowner($requestDir)));
 }
 
 // Take the key from a header rather than the URL so it stays out of access logs, and

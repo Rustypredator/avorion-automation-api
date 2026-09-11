@@ -24,6 +24,14 @@ Everything lives under one transport directory:
 The mod creates them on startup, and re-creates them every 30 seconds, so a directory
 removed under a running server comes back without a restart.
 
+**A bridge must not create them itself.** It would be guessing at a path the mod may not
+have chosen, and the directory would belong to the wrong account; an empty transport
+directory is the one reliable sign that a bridge is pointed at the wrong place, and a
+bridge that manufactures one destroys its own diagnostic. For the same reason, a bridge
+running in a container should mount the level *above* these directories rather than the
+directories themselves: re-creation gives them new inodes, and a bind mount holds the one
+it was given.
+
 **`<root>` is not a fixed path, and a bridge must not assume one.** The galaxy's own
 moddata folder is preferred - `~/.avorion/galaxies/defaultgalaxy/moddata/AutomationAPI` on
 an ordinary install - but it is not always reachable. `io.open` goes through a sandbox that
