@@ -72,7 +72,29 @@ mods = {
 For a dedicated server `modconfig.lua` lives in the galaxy folder, e.g.
 `~/.avorion/galaxies/defaultgalaxy/modconfig.lua`.
 
-### 2. Start the server and take a key
+### 2. Start the server with an absolute `--datapath`
+
+Not specific to this mod, but it breaks this one loudly: give the server an **absolute**
+`--datapath`, never a relative one.
+
+```
+# wrong
+./bin/AvorionServer --galaxy-name defaultgalaxy --datapath ./galaxies
+
+# right
+./bin/AvorionServer --galaxy-name defaultgalaxy --datapath /home/avorion/.avorion/galaxies
+```
+
+A relative datapath is resolved against the server process's working directory, so the
+galaxy folder - and with it `moddata/` - lands wherever the process happened to be started
+from. Start the server from a service file, a different shell or a container with another
+`WorkingDirectory` and the same command points at a different galaxy directory. Mods that
+read or write files under `moddata/` then write into a directory nobody else is looking at:
+here that means the bridge process watches one `requests/` folder while the mod polls
+another, so requests are never picked up and responses never appear, with no error on
+either side.
+
+### 3. Start the server and take a key
 
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
@@ -105,7 +127,7 @@ command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in
 
 The mod is `serverSideOnly`, so clients do not download it and do not need it installed.
 
-### 3. Run a bridge process
+### 4. Run a bridge process
 
 This part the Workshop cannot do for you. The mod has no socket of its own, so nothing
 answers HTTP until a bridge process is running beside the server - either the Docker stack
@@ -148,7 +170,8 @@ docker compose up -d --build
 
 Start the game server first. The mod creates the transport directory and owns it, and the
 server console says which one it picked - `GALAXY_DIR` is that path with
-`/moddata/AutomationAPI` taken off the end. Point it somewhere else and Docker will make
+`/moddata/AutomationAPI` taken off the end. If that is not the directory you expected, check
+the server's `--datapath` is [absolute](#2-start-the-server-with-an-absolute---datapath). Point it somewhere else and Docker will make
 the directory itself rather than failing, at which point nothing can write to it; the
 bridge answers `bridge_unavailable` or `transport_not_writable` and says so.
 
