@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.1.6"
+Config.version = "0.1.7"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -137,8 +137,12 @@ local function candidateRoots()
 
     -- moddata under the Avorion data directory, which is the one location the sandbox
     -- documents as writable regardless of where the galaxy itself is kept.
-    roots[#roots + 1] = "./moddata/" .. Config.folderName
+    --
+    -- Plain first, "./" second. They name the same directory and io.open accepts both, but
+    -- the engine's directory calls are not the same code and need not normalise a leading
+    -- "./" the way a libc path would. Prefer the spelling with nothing to normalise.
     roots[#roots + 1] = "moddata/" .. Config.folderName
+    roots[#roots + 1] = "./moddata/" .. Config.folderName
 
     if cwd then
         roots[#roots + 1] = cwd .. "/moddata/" .. Config.folderName
@@ -149,6 +153,12 @@ end
 
 -- A round trip rather than a bare open: the sandbox judges reads and writes separately,
 -- and a directory the mod can write but not read back is no use to this protocol.
+--
+-- The listing matters just as much. The bridge finds its work with listFilesOfDirectory,
+-- an engine call that does not share io.open's path handling, so a root can pass every
+-- open the mod makes and still report itself empty when listed. Nothing errors in that
+-- state - requests simply arrive and are never seen - which makes it the worst root to
+-- settle on and the one most worth ruling out here.
 local function roundTrips(root)
     pcall(createDirectory, root)
 
@@ -165,6 +175,20 @@ local function roundTrips(root)
 
         assert(content == "probe")
     end)
+
+    if ok then
+        local listed = false
+
+        pcall(function()
+            for _, entry in ipairs({listFilesOfDirectory(root)}) do
+                if string.match(tostring(entry), "([^/\\]+)$") == "probe.tmp" then
+                    listed = true
+                end
+            end
+        end)
+
+        ok = listed
+    end
 
     pcall(deleteFile, probe)
 

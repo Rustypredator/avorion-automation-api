@@ -41,13 +41,19 @@ every open there refused with `filename is not secure`. The trap is that `create
 `listFilesOfDirectory` and `deleteFile` skip that check and keep working, so the mod lists
 request files it cannot read and writes responses that never appear.
 
-The mod therefore resolves the root at startup by trying each candidate with a real
-write-read-delete round trip and keeping the first that survives, falling back to
-`./moddata/AutomationAPI` under the Avorion data directory. It prints the winner to the
-server console, and that line is what the bridge has to be pointed at:
+The mod therefore resolves the root at startup by trying each candidate for real and
+keeping the first that survives, falling back to `moddata/AutomationAPI` under the Avorion
+data directory. Surviving means two things, not one: a write-read-delete round trip
+through `io.open`, **and** the written file being visible to `listFilesOfDirectory`. The
+second is not implied by the first - the bridge finds its work by listing, and a directory
+that accepts every write while listing itself as empty delivers requests that nothing ever
+reads, with no error at either end.
+
+It prints the winner to the server console, and that line is what the bridge has to be
+pointed at:
 
 ```
-AutomationAPI: v0.1.6 ready, API v1, transport directory: ./moddata/AutomationAPI
+AutomationAPI: v0.1.7 ready, API v1, transport directory: moddata/AutomationAPI
 ```
 
 One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run

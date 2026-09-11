@@ -80,7 +80,7 @@ end
 local function directoryUsable(path)
     local probe = path .. "/probe.tmp"
 
-    local ok = pcall(function()
+    local wrote = pcall(function()
         local out = assert(io.open(probe, "wb"))
         out:write("probe")
         out:close()
@@ -92,9 +92,33 @@ local function directoryUsable(path)
         assert(content == "probe")
     end)
 
+    if not wrote then
+        pcall(deleteFile, probe)
+        return false, "io.open cannot write a file there and read it back"
+    end
+
+    -- Writing is not enough. The mod finds its work with listFilesOfDirectory, which is an
+    -- engine call and does not go through the same path handling as io.open - so a
+    -- directory can accept every write the mod makes and still report itself empty when it
+    -- is listed. That failure is completely silent: requests arrive, nothing sees them,
+    -- nothing errors. Check the call the poll loop actually depends on.
+    local listed = false
+
+    pcall(function()
+        for _, entry in ipairs({listFilesOfDirectory(path)}) do
+            if string.match(tostring(entry), "([^/\\]+)$") == "probe.tmp" then
+                listed = true
+            end
+        end
+    end)
+
     pcall(deleteFile, probe)
 
-    return ok
+    if not listed then
+        return false, "a file written there is not visible to listFilesOfDirectory"
+    end
+
+    return true
 end
 
 -- createDirectory is not documented as recursive, and the API's folder can sit several
@@ -106,7 +130,8 @@ end
 -- nothing useful, and on at least one server it is the io.open sandbox rather than the
 -- directory that is the real obstacle, which looks identical from the outside.
 local function ensureDirectory(path)
-    if directoryUsable(path) then return true end
+    local usable, whyNot = directoryUsable(path)
+    if usable then return true end
 
     if type(createDirectory) ~= "function" then
         return false, "createDirectory is not available to this script"
@@ -122,13 +147,17 @@ local function ensureDirectory(path)
         if not ok then lastError = tostring(err) end
     end
 
-    if directoryUsable(path) then return true end
+    local usableNow, stillWhyNot = directoryUsable(path)
+    if usableNow then return true end
 
     if lastError then
         return false, "createDirectory failed: " .. lastError
     end
 
-    return false, "createDirectory reported success but nothing can be written there"
+    -- The directory may well exist now. Report what is actually wrong with it rather than
+    -- blaming creation, which is the part that most likely worked.
+    return false, stillWhyNot or whyNot
+        or "createDirectory reported success but nothing can be written there"
 end
 
 -- listFilesOfDirectory() isn't documented as returning names or full paths, so accept

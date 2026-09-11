@@ -112,8 +112,8 @@ release()
 
 check(said("could not create"), "a directory that was not created is reported")
 check(said("probe.tmp") == false, "the probe file is not mentioned in the error")
-check(said("createDirectory reported success but nothing can be written there"),
-      "and the reason distinguishes it from an outright failure")
+check(said("io.open cannot write a file there and read it back"),
+      "and the reason names the call that actually failed")
 if not said("could not create") then dump() end
 
 -- #### createDirectory IS NOT THERE #### --
@@ -149,6 +149,28 @@ release()
 check(said("filename is not secure"), "the engine's own error text reaches the console")
 check(said("every request will fail"), "and the consequence is spelled out")
 if not said("filename is not secure") then dump() end
+
+-- #### THE DIRECTORY LISTS AS EMPTY #### --
+--
+-- Every write works and every read works, so the mod happily settles there - and then the
+-- poll loop, which finds its work by listing rather than opening, never sees a thing. No
+-- error is raised at either end: requests are delivered and silently ignored forever.
+
+realPrint("\nfiles are written but the directory lists as empty")
+
+local Bridge, Config = reload()
+_G.listFilesOfDirectory = function() return end
+wipe(Config.getRoot())
+
+capture()
+Bridge.initialize()
+release()
+
+check(said("not visible to listFilesOfDirectory"),
+      "a directory that cannot be listed is reported, not trusted")
+check(said("no usable transport directory"),
+      "and root resolution refuses to settle on one")
+if not said("not visible to listFilesOfDirectory") then dump() end
 
 -- #### RECOVERY #### --
 --
