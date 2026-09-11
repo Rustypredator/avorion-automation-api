@@ -1,8 +1,27 @@
-# avorion-automation-api
+<div align="center">
 
-A server-side Avorion mod that exposes your ships, captain missions and map knowledge as a
-JSON API, so an external program can plan and dispatch mining, trading and salvage missions
-instead of you clicking through the galaxy map.
+<img src="logo.svg" alt="Automation API" width="300">
+
+# Automation API
+
+**An Avorion server mod that turns your fleet into a JSON API.**
+
+Read your ships, captain missions and map knowledge over HTTP, so an external program can
+plan and dispatch mining, trading and salvage runs instead of you clicking through the
+galaxy map.
+
+[![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
+[![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
+[![version 0.1.1](https://img.shields.io/badge/version-0.1.1-8957e5)](modinfo.lua)
+[![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
+[![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
+[![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
+
+[**Workshop**](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928) · [**API reference**](docs/api.md) · [**Protocol**](docs/protocol.md) · [**Bridge guide**](docs/external.md) · [**Web console**](#web-console)
+
+</div>
+
+---
 
 - read your fleet, including craft in unloaded sectors and while you are offline
 - preview a captain mission with the game's own yield and risk prediction, then start it
@@ -30,26 +49,45 @@ guide to writing it, with a complete reference implementation.
 
 ## Install
 
-1. Clone this repo anywhere.
-2. Point the galaxy's `modconfig.lua` at it **by path** (not by id - the game resolves mods
-   by folder path):
+### 1. Get the mod into the galaxy
 
-   ```lua
-   mods = {
-       {path = "/absolute/path/to/avorion-automation-api"}
-   }
-   achievementsEnabled = false
-   ```
+**From the Workshop.** Put the Workshop ID in the galaxy's `modconfig.lua` and the server
+downloads and updates the mod itself:
 
-   For a dedicated server that is `<galaxy>/modconfig.lua`, e.g.
-   `~/.avorion/galaxies/defaultgalaxy/modconfig.lua`.
-3. Start the server. The log should show `Found 1 mods` and then
-   `AutomationAPI: v0.1.0 ready`.
-4. In game, run `/apikey new` to get a key. It is shown once. To let non-admins run the
-   command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in
-   `<galaxy>/admin.xml`.
+```lua
+mods = {
+    {workshopid = "3799355928"}
+}
+```
+
+**From this repo.** Clone it anywhere and point at the folder **by path** - a local copy
+has no Workshop ID to resolve:
+
+```lua
+mods = {
+    {path = "/absolute/path/to/avorion-automation-api"}
+}
+```
+
+For a dedicated server `modconfig.lua` lives in the galaxy folder, e.g.
+`~/.avorion/galaxies/defaultgalaxy/modconfig.lua`.
+
+### 2. Start the server and take a key
+
+Start it. The log should show `Found 1 mods` and then `AutomationAPI: v0.1.0 ready`.
+
+In game, run `/apikey new` to get a key. It is shown once. To let non-admins run the
+command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in
+`<galaxy>/admin.xml`.
 
 The mod is `serverSideOnly`, so clients do not download it and do not need it installed.
+
+### 3. Run a bridge process
+
+This part the Workshop cannot do for you. The mod has no socket of its own, so nothing
+answers HTTP until a bridge process is running beside the server - either the Docker stack
+in [`docker/`](docker/) or your own, per [docs/external.md](docs/external.md). Until then
+the API is reachable only over the file transport shown below.
 
 ## First request
 
@@ -188,3 +226,11 @@ the bridge process bound to localhost.
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
+
+---
+
+<div align="center">
+
+<sub>Built for <a href="https://www.avorion.net/">Avorion</a> 2.5+ · <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928">Steam Workshop</a> · <a href="https://github.com/Rustypredator/avorion-automation-api/issues">Issues</a></sub>
+
+</div>
