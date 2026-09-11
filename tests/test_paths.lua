@@ -6,6 +6,9 @@
 -- request files it could not read and wrote responses that never appeared. The galaxy
 -- folder is an allowed location; the relative spelling of it is what the check rejects.
 --
+-- There are two places the transport directory can be and the mod tries both, in order,
+-- and nothing else. The last section here is what holds it to that.
+--
 -- See the PATHS section of data/scripts/lib/automationapi/config.lua.
 
 package.path = "data/scripts/lib/?.lua;tests/?.lua;" .. package.path
@@ -20,9 +23,11 @@ local function check(cond, msg)
     end
 end
 
--- The sandbox trusts absolute paths under the working directory and nothing else, which
--- is the shape of the real one: a galaxy reached by a relative path is refused even
--- though the same directory reached absolutely is fine.
+-- The sandbox's filename check, in the shape the real one has: a relative path is resolved
+-- against the Avorion data directory and only "moddata/" under it is trusted, while an
+-- absolute path is trusted if it sits under the same tree. So the same galaxy directory is
+-- refused spelled relatively and accepted spelled absolutely, and relative "moddata/" works
+-- wherever the galaxy is. Here the working directory stands in for the data directory.
 local pipe = assert(io.popen("pwd"))
 local cwd = pipe:read("*l")
 pipe:close()
@@ -30,10 +35,13 @@ pipe:close()
 local galaxy = "tests/.sandbox-galaxy"
 local realOpen = io.open
 
+local function secure(path)
+    if string.sub(path, 1, 1) == "/" then return string.sub(path, 1, #cwd) == cwd end
+    return string.sub(path, 1, 8) == "moddata/"
+end
+
 io.open = function(path, mode)
-    if string.sub(path, 1, 1) ~= "/" or string.sub(path, 1, #cwd) ~= cwd then
-        return nil, "filename is not secure"
-    end
+    if not secure(path) then return nil, "filename is not secure" end
     return realOpen(path, mode)
 end
 
@@ -46,7 +54,6 @@ _G.deleteFile = function(file) os.remove(file) return 0 end
 -- while io.open there keeps working - which is the silent shape of the failure: requests
 -- arrive, the mod never sees them, and nothing anywhere reports an error.
 local listBlind
-local listFullPaths
 
 _G.listFilesOfDirectory = function(dir)
     if listBlind and string.find(dir, listBlind, 1, true) then return end
@@ -55,17 +62,7 @@ _G.listFilesOfDirectory = function(dir)
     if not ls then return end
 
     local names = {}
-    for line in ls:lines() do
-        -- The call is not documented as returning names rather than paths, and real
-        -- servers differ. Where it returns paths, it is the only absolute path this
-        -- script can obtain at all.
-        if listFullPaths then
-            local base = string.sub(dir, 1, 1) == "/" and dir or (cwd .. "/" .. dir)
-            names[#names + 1] = base .. "/" .. line
-        else
-            names[#names + 1] = line
-        end
-    end
+    for line in ls:lines() do names[#names + 1] = dir .. "/" .. line end
     ls:close()
 
     return table.unpack(names)
@@ -80,17 +77,17 @@ local function freshConfig()
     return require("automationapi.config")
 end
 
+-- Probing creates directories, and two of the candidates land beside the working
+-- directory. Never remove one that was already there.
 local hadModdata = os.execute("test -d '" .. cwd .. "/moddata'")
+local hadGalaxy = os.execute("test -d '" .. cwd .. "/galaxy'")
 
 local function cleanup()
     io.open = realOpen
     os.execute("rm -rf '" .. cwd .. "/" .. galaxy .. "'")
 
-    -- The last-resort candidate is moddata/ beside the working directory, so a run can
-    -- create one. Never remove a directory that was already there.
-    if not hadModdata then
-        os.execute("rm -rf '" .. cwd .. "/moddata'")
-    end
+    if not hadModdata then os.execute("rm -rf '" .. cwd .. "/moddata'") end
+    if not hadGalaxy then os.execute("rm -rf '" .. cwd .. "/galaxy'") end
 end
 
 -- #### THE HOSTED SERVER #### --
@@ -101,10 +98,12 @@ local Config = freshConfig()
 local root = Config.getRoot()
 
 check(Config.rootIsUsable(), "a refused galaxy path does not leave the mod without a root")
-check(root == cwd .. "/" .. galaxy .. "/moddata/AutomationAPI",
-      "the galaxy folder is kept, spelled absolutely, rather than moved elsewhere")
+check(root == "moddata/AutomationAPI",
+      "it falls back to moddata under the Avorion data directory")
 check(Config.getRootAttempts()[1].ok == false,
-      "the relative spelling is recorded as the candidate that failed")
+      "the galaxy path is recorded as the candidate that failed")
+check(#Config.getRootAttempts() == 2,
+      "and there are only ever two places to try - no invented spellings in between")
 
 -- Readable as well as writable: a root the mod can only write to is no use to a protocol
 -- that has to read requests back out of it.
@@ -163,62 +162,30 @@ end
 
 listBlind = nil
 
--- #### NOTHING WORKS AT ALL #### --
+-- #### NOTHING IS INVENTED #### --
 
--- The fallback has to stay the galaxy folder: unchanged behaviour, so a false negative
--- here cannot break an install, and initialize() reports it instead.
+-- The mod used to try harder than this: a "./" spelling of moddata, the working directory
+-- from os.getenv, the galaxy path absolutised from whatever listFilesOfDirectory returned.
+-- All three were tried against a real hosted server and all three were dead - os.getenv is
+-- nil in the sandbox, and the engine returns listings under the relative prefix it was
+-- given, so there is no absolute path in them to recover. What they produced was a failure
+-- report full of near-identical paths that obscured the two that matter.
+
 io.open = function() return nil, "filename is not secure" end
 serverFolder = "galaxy/Avorion"
 
-local Config3 = freshConfig()
+local ConfigN = freshConfig()
+ConfigN.getRoot()
 
-check(Config3.getRoot() == "galaxy/Avorion/moddata/AutomationAPI",
-      "with every candidate refused it falls back to the galaxy folder")
-check(Config3.rootIsUsable() == false, "and reports the root as unusable")
+local tried = {}
+for _, attempt in ipairs(ConfigN.getRootAttempts()) do tried[#tried + 1] = attempt.path end
 
--- #### THE HOSTED SERVER, WITHOUT os.getenv #### --
-
--- The live case this was all for. io.open resolves against the Avorion data directory and
--- refuses everything outside it; the engine's calls resolve against the server's own
--- working directory, where galaxy/ lives. No relative spelling satisfies both. os.getenv
--- is nil in the real sandbox, so the mod cannot absolutise the path itself - but if the
--- engine returns full paths, it is handing over an absolute one for free.
-
-io.open = function(path, mode)
-    if string.sub(path, 1, 1) ~= "/" or string.sub(path, 1, #cwd) ~= cwd then
-        return nil, "filename is not secure"
-    end
-    return realOpen(path, mode)
-end
-
-serverFolder = galaxy
-listFullPaths = true
-os.execute("mkdir -p '" .. cwd .. "/" .. galaxy .. "/sectors' 2>/dev/null")
-
-local realGetenv = os.getenv
-os.getenv = function(name)
-    if name == "PWD" then return nil end
-    return realGetenv(name)
-end
-
-local Config7 = freshConfig()
-
-check(Config7.getRoot() == cwd .. "/" .. galaxy .. "/moddata/AutomationAPI",
-      "the absolute galaxy path is recovered from the engine's own listing")
-check(Config7.rootIsUsable(), "and it is a root that both calls accept")
-check(Config7.getRootAttempts()[1].ok == false,
-      "the relative spelling is still tried first, and still fails")
-
--- Bare filenames are just as legal an answer, and then there is nothing to recover.
-listFullPaths = false
-
-local Config8 = freshConfig()
-
-check(Config8.getRoot() ~= cwd .. "/" .. galaxy .. "/moddata/AutomationAPI",
-      "a listing of bare filenames yields no absolute path, and none is invented")
-
-os.getenv = realGetenv
-listFullPaths = nil
+check(#tried == 2, "a total failure reports exactly two attempts")
+check(tried[1] == "galaxy/Avorion/moddata/AutomationAPI" and tried[2] == "moddata/AutomationAPI",
+      "the galaxy folder and moddata, in that order, and nothing else")
+check(ConfigN.getRoot() == "galaxy/Avorion/moddata/AutomationAPI",
+      "the galaxy folder is still what the paths are built from, so nothing malforms")
+check(ConfigN.rootIsUsable() == false, "and the root is reported as unusable")
 
 -- #### THE OPERATOR SAYS WHERE #### --
 
@@ -227,9 +194,7 @@ listFullPaths = nil
 -- only thing left is to be told.
 
 io.open = function(path, mode)
-    if string.sub(path, 1, 1) ~= "/" or string.sub(path, 1, #cwd) ~= cwd then
-        return nil, "filename is not secure"
-    end
+    if not secure(path) then return nil, "filename is not secure" end
     return realOpen(path, mode)
 end
 

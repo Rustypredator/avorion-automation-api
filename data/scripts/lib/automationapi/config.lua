@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.1.9"
+Config.version = "0.1.10"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -14,9 +14,9 @@ Config.apiVersion = 1
 
 Config.folderName = "AutomationAPI"
 
--- Absolute path to use as the transport directory, bypassing the search below. Leave nil
--- unless the mod reports that it could not find a usable directory on its own; see the
--- PATHS section at the bottom of this file.
+-- Absolute path to use as the transport directory, bypassing the two places below. Leave
+-- nil unless the mod reports that neither of them works; see the PATHS section at the
+-- bottom of this file.
 --
 --   Config.rootOverride = "/home/avorion/.avorion/moddata/AutomationAPI"
 Config.rootOverride = nil
@@ -102,52 +102,35 @@ Config.playerKeysValue = "automationapi_keys"
 
 -- Where the transport directory lives.
 --
--- The galaxy's own moddata folder is the right answer, and on an ordinary install it is
--- the one this resolves to. It is not always reachable. io.open goes through a sandbox
--- that refuses any path it does not consider secure, and it only trusts what sits under
--- the Avorion data directory (~/.avorion, %AppData%/Avorion). A hosted server usually
--- keeps its galaxy somewhere else entirely - Server().folder then comes back as something
--- like "galaxy/Avorion", relative to a working directory of its own - and there every
--- open fails with "filename is not secure".
+-- There are exactly two places it can be, and the mod tries them in order rather than
+-- inventing spellings of them:
 --
--- That failure is a bad one to diagnose, because createDirectory, listFilesOfDirectory
--- and deleteFile are engine calls that do not go through the same check and keep working.
--- The mod therefore sees request files it cannot read, writes responses that never
--- appear, and cannot delete either - so every request is retried on every poll, forever.
+--   1. the galaxy's own moddata folder, Server().folder .. "/moddata/AutomationAPI"
+--   2. moddata/AutomationAPI under the Avorion data directory
 --
--- Guessing the layout is not worth it: try each candidate once and keep the first that
--- survives a real write-read-delete round trip through io.open.
+-- The first is the right answer and the one an ordinary install resolves to, because there
+-- Server().folder is absolute and every call accepts it. A hosted server usually keeps its
+-- galaxy outside the Avorion data directory and reaches it by a relative path - "galaxy/
+-- Avorion" is the common shape - and there io.open refuses every open under it with
+-- "filename is not secure", because the sandbox trusts only what sits under the data
+-- directory. That is what the second place is for.
+--
+-- Nothing else is worth trying. Absolutising a relative galaxy path needs the working
+-- directory, and the sandbox nils os.getenv; deriving it from a listing needs the engine to
+-- hand back full paths, and it hands back the relative prefix it was given. Both were tried
+-- against a real hosted server and neither produced anything. A guess that cannot be
+-- checked is not a candidate, it is noise in the failure report - so when both places fail,
+-- the mod says so and asks for Config.rootOverride instead of widening the search.
+--
+-- Each place is tried for real and the first that survives is kept. Surviving means two
+-- things, not one: a write-read-back through io.open, and the written file being visible to
+-- listFilesOfDirectory. The second is not implied by the first. io.open goes through the
+-- sandbox's filename check and the engine's directory calls do not, so they can disagree
+-- about which tree a relative path names - and a directory that accepts every write while
+-- listing itself as empty swallows requests in silence, which is the worst way to fail.
 
 local resolvedRoot
 local rootAttempts
-
--- The absolute spelling of a relative directory, recovered from a listing of it.
---
--- Returns nil when the listing is empty, raises, or comes back as bare filenames - all of
--- which are ordinary answers, not errors. The caller simply has one candidate fewer.
-local function absoluteGalaxy(folder)
-    if folder == "" or string.sub(folder, 1, 1) == "/" then return nil end
-
-    local entries = {}
-
-    pcall(function()
-        for _, entry in ipairs({listFilesOfDirectory(folder)}) do
-            entries[#entries + 1] = tostring(entry)
-        end
-    end)
-
-    for _, entry in ipairs(entries) do
-        if string.sub(entry, 1, 1) == "/" then
-            -- "/srv/host/galaxy/Avorion/server.ini" with folder "galaxy/Avorion" gives
-            -- "/srv/host/galaxy/Avorion". Match on the folder itself rather than trimming
-            -- a filename, so an entry naming a subdirectory works the same way.
-            local at = string.find(entry, folder, 1, true)
-            if at then return string.sub(entry, 1, at + #folder - 1) end
-        end
-    end
-
-    return nil
-end
 
 -- What a listing of this path actually looks like, for a console that has to explain why
 -- the directory it needs is unreachable.
@@ -175,11 +158,11 @@ end
 local function candidateRoots()
     local roots = {}
 
-    -- Set Config.rootOverride to an absolute path to skip the search entirely. The mod
-    -- cannot discover the server's working directory - os.getenv is nil inside the sandbox
-    -- - so on a server where every relative spelling fails, stating the absolute path is
-    -- the only thing left. It is still probed like any other candidate, so a wrong one
-    -- reports itself rather than breaking the mod silently.
+    -- An absolute path stated by hand, tried ahead of both places. The mod cannot work one
+    -- out for itself - os.getenv is nil inside the sandbox and Server().folder may be
+    -- relative - so on a server where neither place works, stating it is the only thing
+    -- left. It is still probed like any other candidate, so a wrong one reports itself
+    -- rather than breaking the mod silently.
     if type(Config.rootOverride) == "string" and Config.rootOverride ~= "" then
         roots[#roots + 1] = Config.rootOverride
     end
@@ -191,47 +174,11 @@ local function candidateRoots()
         roots[#roots + 1] = folder .. "/moddata/" .. Config.folderName
     end
 
-    -- The galaxy folder, spelled absolutely, asked of the engine rather than guessed.
-    --
-    -- This is the one that matters on a hosted server. io.open resolves relative paths
-    -- against the Avorion data directory and refuses everything outside it; the engine's
-    -- directory calls resolve against the server's own working directory, where galaxy/
-    -- lives. No relative spelling can satisfy both, because the two are describing
-    -- different trees - but an absolute path has nothing left to resolve, and both accept
-    -- it. The galaxy folder is an allowed root; only the relative spelling of it is
-    -- refused.
-    --
-    -- listFilesOfDirectory is not documented as returning names or full paths. Where it
-    -- returns full paths it is handing over the single thing the sandbox will not give
-    -- this script: an absolute path it can trust. Take it.
-    local absolute = absoluteGalaxy(folder)
-    if absolute then
-        roots[#roots + 1] = absolute .. "/moddata/" .. Config.folderName
-    end
-
-    -- The working directory, if the sandbox left os.getenv alone. Worth having because
-    -- the galaxy folder IS an allowed root - it is a relative spelling of it that the
-    -- check refuses - so absolutising it keeps the documented layout rather than moving
-    -- the transport directory somewhere else entirely.
-    local cwdOk, cwd = pcall(function() return os.getenv("PWD") end)
-    if not cwdOk or type(cwd) ~= "string" or cwd == "" then cwd = nil end
-
-    if cwd and folder ~= "" and string.sub(folder, 1, 1) ~= "/" then
-        roots[#roots + 1] = cwd .. "/" .. folder .. "/moddata/" .. Config.folderName
-    end
-
     -- moddata under the Avorion data directory, which is the one location the sandbox
-    -- documents as writable regardless of where the galaxy itself is kept.
-    --
-    -- Plain first, "./" second. They name the same directory and io.open accepts both, but
-    -- the engine's directory calls are not the same code and need not normalise a leading
-    -- "./" the way a libc path would. Prefer the spelling with nothing to normalise.
+    -- documents as writable regardless of where the galaxy itself is kept. Per install
+    -- rather than per galaxy, so two galaxies run from one Avorion directory would share a
+    -- transport directory - a real limitation, and still better than not running.
     roots[#roots + 1] = "moddata/" .. Config.folderName
-    roots[#roots + 1] = "./moddata/" .. Config.folderName
-
-    if cwd then
-        roots[#roots + 1] = cwd .. "/moddata/" .. Config.folderName
-    end
 
     return roots
 end
@@ -349,10 +296,10 @@ function Config.getRoot()
         end
     end
 
-    -- Nothing round-tripped. Fall back to the galaxy folder, which is exactly what this
-    -- did before there was a choice: the paths stay well formed, the mod behaves as it
-    -- always has, and initialize() reports why every call is about to fail.
-    resolvedRoot = candidates[1] or ("./moddata/" .. Config.folderName)
+    -- Neither place round-tripped. Keep the first anyway: the paths stay well formed, so
+    -- every call fails the same way it would have, and initialize() reports why rather
+    -- than leaving the mod to misbehave quietly.
+    resolvedRoot = candidates[1] or ("moddata/" .. Config.folderName)
 
     return resolvedRoot
 end

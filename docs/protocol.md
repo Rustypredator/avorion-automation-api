@@ -32,45 +32,55 @@ running in a container should mount the level *above* these directories rather t
 directories themselves: re-creation gives them new inodes, and a bind mount holds the one
 it was given.
 
-**`<root>` is not a fixed path, and a bridge must not assume one.** The galaxy's own
-moddata folder is preferred - `~/.avorion/galaxies/defaultgalaxy/moddata/AutomationAPI` on
-an ordinary install - but it is not always reachable. `io.open` goes through a sandbox that
-refuses any filename it cannot match against an allowed absolute root, and a server that
-reaches its galaxy by a relative path (`galaxy/Avorion`, as hosting panels commonly do) has
-every open there refused with `filename is not secure`. The trap is that `createDirectory`,
-`listFilesOfDirectory` and `deleteFile` skip that check and keep working, so the mod lists
-request files it cannot read and writes responses that never appear.
+**`<root>` is not a fixed path, and a bridge must not assume one.** There are two places
+it can be, and the mod tries them in that order:
 
-The mod therefore resolves the root at startup by trying each candidate for real and
-keeping the first that survives, falling back to `moddata/AutomationAPI` under the Avorion
-data directory. Surviving means two things, not one: a write-read-delete round trip
-through `io.open`, **and** the written file being visible to `listFilesOfDirectory`. The
-second is not implied by the first - the bridge finds its work by listing, and a directory
-that accepts every write while listing itself as empty delivers requests that nothing ever
-reads, with no error at either end.
+1. the galaxy's own moddata folder - `~/.avorion/galaxies/defaultgalaxy/moddata/AutomationAPI`
+   on an ordinary install
+2. `moddata/AutomationAPI` under the Avorion data directory
 
-It prints the winner to the server console, and that line is what the bridge has to be
+The first is the right answer and the one an ordinary install uses. It is not always
+reachable. `io.open` goes through a sandbox that refuses any filename it cannot match
+against an allowed absolute root, and a server that reaches its galaxy by a relative path
+(`galaxy/Avorion`, as hosting panels commonly do) has every open there refused with
+`filename is not secure`. The trap is that `createDirectory`, `listFilesOfDirectory` and
+`deleteFile` skip that check and keep working, so the mod lists request files it cannot
+read and writes responses that never appear. The second place exists for that server: the
+data directory is trusted whatever the galaxy path looks like.
+
+Each is tried for real and the first that survives is kept. Surviving means two things, not
+one: a write-read-delete round trip through `io.open`, **and** the written file being
+visible to `listFilesOfDirectory`. The second is not implied by the first - the mod finds
+its work by listing, and a directory that accepts every write while listing itself as empty
+delivers requests that nothing ever reads, with no error at either end.
+
+Nothing else is tried, deliberately. Absolutising a relative galaxy path needs the working
+directory and `os.getenv` is nil inside the sandbox; deriving it from a listing needs the
+engine to return full paths, and it returns the relative prefix it was given. Both were
+tried against a real hosted server and neither produced a usable path, so both are gone. A
+guess that cannot be checked only pads the failure report.
+
+The mod prints the winner to the server console, and that line is what the bridge has to be
 pointed at:
 
 ```
-AutomationAPI: v0.1.9 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.1.10 ready, API v1, transport directory: moddata/AutomationAPI
 ```
 
-One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run
-from the same Avorion directory would share a transport directory.
+One caveat to the second place: it is per install rather than per galaxy, so two galaxies
+run from the same Avorion directory would share a transport directory.
 
-If every candidate fails - the mod says so on the console, with the reason for each - set
+If neither works - the mod says so on the console, with the reason for each - set
 `Config.rootOverride` in
-[`config.lua`](../data/scripts/lib/automationapi/config.lua) to an absolute path and
-restart:
+[`config.lua`](../data/scripts/lib/automationapi/config.lua) to the absolute path of one of
+them and restart:
 
 ```lua
 Config.rootOverride = "/home/avorion/.avorion/moddata/AutomationAPI"
 ```
 
-The mod cannot work that path out for itself, because `os.getenv` is nil inside the
-sandbox and `Server().folder` may be relative. An override is still probed like any other
-candidate, so a typo reports itself instead of failing silently.
+The mod cannot work that path out for itself, for the reasons above. An override is still
+probed like any other candidate, so a typo reports itself instead of failing silently.
 
 ## Request
 

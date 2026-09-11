@@ -520,18 +520,20 @@ function AutomationApiBridge.initialize()
                 .. "finding requests goes through listFilesOfDirectory, which is an engine "
                 .. "call and can come back empty for a directory io.open is perfectly happy "
                 .. "with. The reasons above say which of the two gave way.")
-        -- Whether the engine hands back full paths decides whether the mod can work the
-        -- absolute galaxy path out for itself. If this shows bare filenames, it cannot,
-        -- and an override is the only way through.
+        -- What the engine makes of the galaxy folder, which is the one directory on a
+        -- hosted server that is known to exist. It says whether listFilesOfDirectory works
+        -- at all here, and in what shape it returns entries.
         local folderOk, folder = pcall(function() return Server().folder end)
         if folderOk and type(folder) == "string" and folder ~= "" then
             console("listing %s gives %s", folder, Config.describeListing(folder))
         end
 
-        console("if none of those paths can be fixed, set Config.rootOverride in "
-                .. "data/scripts/lib/automationapi/config.lua to an absolute path and "
-                .. "restart - the search cannot find the working directory on its own, "
-                .. "because os.getenv is nil inside the sandbox.")
+        console("those are the only two places the transport directory can be, and the mod "
+                .. "cannot work out an absolute spelling of either: os.getenv is nil inside "
+                .. "the sandbox, and the engine returns listings under the relative prefix "
+                .. "it was given. Set Config.rootOverride in "
+                .. "data/scripts/lib/automationapi/config.lua to the absolute path of one "
+                .. "of them and restart.")
         console("filesystem API: %s", filesystemApi())
     end
 
