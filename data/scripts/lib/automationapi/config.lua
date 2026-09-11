@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.1.8"
+Config.version = "0.1.9"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -121,6 +121,57 @@ Config.playerKeysValue = "automationapi_keys"
 local resolvedRoot
 local rootAttempts
 
+-- The absolute spelling of a relative directory, recovered from a listing of it.
+--
+-- Returns nil when the listing is empty, raises, or comes back as bare filenames - all of
+-- which are ordinary answers, not errors. The caller simply has one candidate fewer.
+local function absoluteGalaxy(folder)
+    if folder == "" or string.sub(folder, 1, 1) == "/" then return nil end
+
+    local entries = {}
+
+    pcall(function()
+        for _, entry in ipairs({listFilesOfDirectory(folder)}) do
+            entries[#entries + 1] = tostring(entry)
+        end
+    end)
+
+    for _, entry in ipairs(entries) do
+        if string.sub(entry, 1, 1) == "/" then
+            -- "/srv/host/galaxy/Avorion/server.ini" with folder "galaxy/Avorion" gives
+            -- "/srv/host/galaxy/Avorion". Match on the folder itself rather than trimming
+            -- a filename, so an entry naming a subdirectory works the same way.
+            local at = string.find(entry, folder, 1, true)
+            if at then return string.sub(entry, 1, at + #folder - 1) end
+        end
+    end
+
+    return nil
+end
+
+-- What a listing of this path actually looks like, for a console that has to explain why
+-- the directory it needs is unreachable.
+function Config.describeListing(path)
+    local entries = {}
+
+    local ok = pcall(function()
+        for _, entry in ipairs({listFilesOfDirectory(path)}) do
+            entries[#entries + 1] = entry
+        end
+    end)
+
+    if not ok then return "listFilesOfDirectory raised an error" end
+    if #entries == 0 then return "no entries" end
+
+    local sample = {}
+    for i = 1, math.min(3, #entries) do
+        sample[i] = string.format("%s %s", type(entries[i]),
+                                  string.sub(tostring(entries[i]), 1, 70))
+    end
+
+    return string.format("%d entries: %s", #entries, table.concat(sample, ", "))
+end
+
 local function candidateRoots()
     local roots = {}
 
@@ -138,6 +189,24 @@ local function candidateRoots()
 
     if folder ~= "" then
         roots[#roots + 1] = folder .. "/moddata/" .. Config.folderName
+    end
+
+    -- The galaxy folder, spelled absolutely, asked of the engine rather than guessed.
+    --
+    -- This is the one that matters on a hosted server. io.open resolves relative paths
+    -- against the Avorion data directory and refuses everything outside it; the engine's
+    -- directory calls resolve against the server's own working directory, where galaxy/
+    -- lives. No relative spelling can satisfy both, because the two are describing
+    -- different trees - but an absolute path has nothing left to resolve, and both accept
+    -- it. The galaxy folder is an allowed root; only the relative spelling of it is
+    -- refused.
+    --
+    -- listFilesOfDirectory is not documented as returning names or full paths. Where it
+    -- returns full paths it is handing over the single thing the sandbox will not give
+    -- this script: an absolute path it can trust. Take it.
+    local absolute = absoluteGalaxy(folder)
+    if absolute then
+        roots[#roots + 1] = absolute .. "/moddata/" .. Config.folderName
     end
 
     -- The working directory, if the sandbox left os.getenv alone. Worth having because

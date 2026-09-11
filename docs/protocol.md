@@ -53,7 +53,7 @@ It prints the winner to the server console, and that line is what the bridge has
 pointed at:
 
 ```
-AutomationAPI: v0.1.8 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.1.9 ready, API v1, transport directory: moddata/AutomationAPI
 ```
 
 One caveat to that fallback: it is per install rather than per galaxy, so two galaxies run

@@ -46,6 +46,7 @@ _G.deleteFile = function(file) os.remove(file) return 0 end
 -- while io.open there keeps working - which is the silent shape of the failure: requests
 -- arrive, the mod never sees them, and nothing anywhere reports an error.
 local listBlind
+local listFullPaths
 
 _G.listFilesOfDirectory = function(dir)
     if listBlind and string.find(dir, listBlind, 1, true) then return end
@@ -54,7 +55,17 @@ _G.listFilesOfDirectory = function(dir)
     if not ls then return end
 
     local names = {}
-    for line in ls:lines() do names[#names + 1] = line end
+    for line in ls:lines() do
+        -- The call is not documented as returning names rather than paths, and real
+        -- servers differ. Where it returns paths, it is the only absolute path this
+        -- script can obtain at all.
+        if listFullPaths then
+            local base = string.sub(dir, 1, 1) == "/" and dir or (cwd .. "/" .. dir)
+            names[#names + 1] = base .. "/" .. line
+        else
+            names[#names + 1] = line
+        end
+    end
     ls:close()
 
     return table.unpack(names)
@@ -164,6 +175,50 @@ local Config3 = freshConfig()
 check(Config3.getRoot() == "galaxy/Avorion/moddata/AutomationAPI",
       "with every candidate refused it falls back to the galaxy folder")
 check(Config3.rootIsUsable() == false, "and reports the root as unusable")
+
+-- #### THE HOSTED SERVER, WITHOUT os.getenv #### --
+
+-- The live case this was all for. io.open resolves against the Avorion data directory and
+-- refuses everything outside it; the engine's calls resolve against the server's own
+-- working directory, where galaxy/ lives. No relative spelling satisfies both. os.getenv
+-- is nil in the real sandbox, so the mod cannot absolutise the path itself - but if the
+-- engine returns full paths, it is handing over an absolute one for free.
+
+io.open = function(path, mode)
+    if string.sub(path, 1, 1) ~= "/" or string.sub(path, 1, #cwd) ~= cwd then
+        return nil, "filename is not secure"
+    end
+    return realOpen(path, mode)
+end
+
+serverFolder = galaxy
+listFullPaths = true
+os.execute("mkdir -p '" .. cwd .. "/" .. galaxy .. "/sectors' 2>/dev/null")
+
+local realGetenv = os.getenv
+os.getenv = function(name)
+    if name == "PWD" then return nil end
+    return realGetenv(name)
+end
+
+local Config7 = freshConfig()
+
+check(Config7.getRoot() == cwd .. "/" .. galaxy .. "/moddata/AutomationAPI",
+      "the absolute galaxy path is recovered from the engine's own listing")
+check(Config7.rootIsUsable(), "and it is a root that both calls accept")
+check(Config7.getRootAttempts()[1].ok == false,
+      "the relative spelling is still tried first, and still fails")
+
+-- Bare filenames are just as legal an answer, and then there is nothing to recover.
+listFullPaths = false
+
+local Config8 = freshConfig()
+
+check(Config8.getRoot() ~= cwd .. "/" .. galaxy .. "/moddata/AutomationAPI",
+      "a listing of bare filenames yields no absolute path, and none is invented")
+
+os.getenv = realGetenv
+listFullPaths = nil
 
 -- #### THE OPERATOR SAYS WHERE #### --
 
