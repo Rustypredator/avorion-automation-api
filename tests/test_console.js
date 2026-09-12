@@ -38,6 +38,9 @@ function check(cond, message) {
 
 const refinery = {
     name: 'Rusty Refinery', type: 'Station',
+    // What the game itself calls the craft: the production's title template already
+    // resolved, size suffix and all. See stationLabel().
+    title: { template: '${good} Refinery ${size}', text: 'Oil Refinery II', args: {} },
     owner: { kind: 'player', index: 1, name: 'Rusty' },
     position: { x: 12, y: -4 },
     // What the game answers for any station, and what the console keys the tab strip off.
@@ -51,14 +54,16 @@ const refinery = {
         kind: 'factory',
         scripts: ['factory.lua'],
         production: {
-            factory: '${good} Refinery ${size}', style: 'Factory', mine: false,
+            factory: '${good} Refinery ${size}', title: 'Oil Refinery',
+            style: 'Factory', mine: false,
             ingredients: [
                 { name: 'Energy Cell', amount: 5, price: 61, size: 1, value: 305, stock: 1200 },
                 { name: 'Raw Oil', amount: 10, price: 66, size: 2, value: 660, stock: 40 }
             ],
             results: [{ name: 'Oil', amount: 5, price: 320, size: 2, value: 1600, stock: 900 }],
-            garbage: [], slots: 3, running: [{ progress: 0.25 }, { progress: 0.8 }], active: 2,
-            inputValue: 965, outputValue: 1600, margin: 635
+            garbage: [{ name: 'Scrap Metal', amount: 1, price: 8, size: 1, value: 8, stock: 0 }],
+            slots: 3, running: [{ progress: 0.25 }, { progress: 0.8 }], active: 2,
+            inputValue: 965, outputValue: 1608, margin: 643, shuttleVolume: 20
         },
         goods: {
             buys: [
@@ -217,6 +222,7 @@ const ready = window.document.readyState === 'loading'
     check(!tab('mission').hidden, 'a ship keeps its Mission tab');
     check(!tab('travel').hidden, 'and its Travel tab');
     check(tab('economy').hidden, 'and is offered no Economy tab');
+    check(tab('production').hidden, 'nor a Production tab');
 
     console.log('\nsubtabs for a station');
 
@@ -226,6 +232,7 @@ const ready = window.document.readyState === 'loading'
     check(tab('mission').hidden, 'a NotAShip craft is offered no Mission tab');
     check(tab('travel').hidden, 'nor a Travel tab');
     check(!tab('economy').hidden, 'and gains an Economy tab instead');
+    check(!tab('production').hidden, 'and a Production tab with it');
 
     console.log('\nthe economy tab');
 
@@ -236,9 +243,17 @@ const ready = window.document.readyState === 'loading'
     const text = economy.textContent;
 
     check(/Books/.test(text), 'the books card renders');
-    check(/Production/.test(text), 'and the production card');
-    check(/Energy Cell/.test(text), 'with the chain ingredients');
-    check(/Oil/.test(text), 'and what the line produces');
+
+    /* Every station running factory.lua reports kind "factory", which named none of them -
+       a Solar Power Plant read the same as a Book Factory. The heading uses the resolved
+       factory title instead. */
+    check(/Oil Refinery II/.test(text),
+          'the books card names the station the way the game does, not by its script');
+
+    // The chain moved to its own tab: the Economy tab is this station's money and goods.
+    check(!/Scrap Metal/.test(text), 'and carries no part of the production chain');
+    check(economy.querySelector('svg.chain-graph') === null, 'nor the chain graph');
+
     check(economy.querySelectorAll('table tbody tr').length === 3,
           'the goods table has a row per traded good');
     check(/Over time/.test(text), 'the history card renders');
@@ -249,13 +264,36 @@ const ready = window.document.readyState === 'loading'
     check(/title="16,200"/.test(economy.innerHTML), 'exact in its tooltip');
     check($('#economy-window') !== null, 'the window picker is there');
 
+    console.log('\nthe production tab');
+
+    tab('production').click();
+    await settle(400);
+
+    const chain = $('#sv-production');
+    const graph = chain.querySelector('svg.chain-graph');
+
+    check(graph !== null, 'the chain is drawn as a node graph');
+    check(chain.querySelectorAll('.pnode').length === 4,
+          'a node per ingredient, result and waste good');
+    check(chain.querySelectorAll('.pwire').length === 4, 'and a wire per node to the hub');
+    check(chain.querySelectorAll('.pwire[marker-end]').length === 4,
+          'every wire carries an arrowhead');
+    check(chain.querySelector('.phub') !== null, 'with the line itself in the middle');
+
+    const drawn = chain.textContent;
+    check(/Energy Cell/.test(drawn), 'the ingredients are named');
+    check(/Scrap Metal/.test(drawn), 'the waste too');
+    check(/Oil Refinery II/.test(drawn), 'the card is headed with the station name');
+    check(/Oil Refinery/.test(drawn), 'and the hub carries the factory title');
+    check(/Per cycle/.test(drawn), 'the per-cycle figures sit beside the graph');
+
     console.log('\nleaving the station');
 
     $('[data-ship="Ore Hound"]').click();
     await settle(400);
 
     check($('.subview.active').dataset.sub === 'overview',
-          'selecting a ship with Economy open falls back to Overview');
+          'selecting a ship with Production open falls back to Overview');
 
     console.log('\nthe ship log');
 

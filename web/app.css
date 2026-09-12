@@ -346,17 +346,6 @@ td.num + td, th.num + th { padding-left: 12px; }
 
 /* ------------------------------- economy -------------------------------- */
 
-/* A production line, read left to right: what goes in, what comes out, what is left
-   over. Wraps rather than scrolls, because a long chain is a tall card and a scrollable
-   one hides the half nobody thought to drag to. */
-.chain { display: flex; align-items: baseline; gap: 5px; flex-wrap: wrap; margin-bottom: 7px; }
-.chain-head { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-mute); min-width: 30px; }
-
-/* A label, not a control - .chip next to it is clickable and carries a pointer cursor. */
-.gchip { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--bg-3); color: var(--text-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.gchip.good { color: var(--good); border-color: #2a5a44; background: #12261e; }
-.gchip.warn { color: var(--warn); border-color: #5c4c1e; background: #262013; }
-
 /* Text tones, for a figure whose sign is the point. The .bar rules above are for the
    meter fill and cannot be reused on a number. */
 .good { color: var(--good); }
@@ -377,6 +366,45 @@ td.fillcell .bar { margin: 0; }
 
 /* The window picker sits under the card heading rather than beside it. */
 #economy-window { margin-bottom: 8px; }
+
+/* --------------------------- production graph ---------------------------- */
+
+/* Three columns of nodes wired to one hub, drawn at a fixed size inside .scroll-x - see
+   chainGraph() for why it is not scaled to the pane. Everything below styles SVG, so the
+   properties are fill/stroke rather than color/background. */
+.chain-graph { display: block; margin: 2px 0 4px; }
+
+.pnode rect { fill: var(--bg-3); stroke: var(--line-2); }
+.pnode.opt rect { stroke-dasharray: 3 2.5; }
+.pnode.good rect { fill: #12261e; stroke: #2a5a44; }
+.pnode.warn rect { fill: #262013; stroke: #5c4c1e; }
+.pnode.none rect { fill: none; stroke: var(--line); stroke-dasharray: 3 3; }
+
+.phub rect { fill: var(--bg-4); stroke: var(--accent-2); stroke-width: 1.4; }
+
+.pn-name { fill: var(--text); font-size: 11.5px; }
+.ph-name { fill: var(--accent); font-size: 12px; font-weight: 600; }
+.pn-sub { fill: var(--text-mute); font-size: 10px; font-variant-numeric: tabular-nums; }
+.pn-tag { fill: var(--text-mute); font-size: 9px; text-anchor: end;
+          text-transform: uppercase; letter-spacing: .06em; }
+
+.pwire { fill: none; stroke: var(--line-2); stroke-width: 1.3; }
+.pwire.good { stroke: #2a5a44; }
+.pwire.warn { stroke: #5c4c1e; }
+.pwire.opt { stroke-dasharray: 3 2.5; }
+
+marker#pa-in path, marker#pa-opt path { fill: var(--line-2); }
+marker#pa-good path { fill: #2a5a44; }
+marker#pa-warn path { fill: #5c4c1e; }
+
+.chain-legend { display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+                margin-top: 4px; }
+.chain-legend .lg { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+                    margin-right: 5px; vertical-align: -1px;
+                    background: var(--bg-3); border: 1px solid var(--line-2); }
+.chain-legend .lg.opt { border-style: dashed; }
+.chain-legend .lg.good { background: #12261e; border-color: #2a5a44; }
+.chain-legend .lg.warn { background: #262013; border-color: #5c4c1e; }
 
 /* ------------------------------- popovers -------------------------------- */
 

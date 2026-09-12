@@ -692,7 +692,9 @@
     loop('station', EVERY.detail, function () {
       // Gated on the tab being open: a station's books only move when the game saves,
       // so reading them for a tab nobody is looking at is transport traffic for nothing.
-      if (S.selected && S.sub === 'economy') { return loadStation(true); }
+      if (S.selected && (S.sub === 'economy' || S.sub === 'production')) {
+        return loadStation(true);
+      }
     });
     loop('history', EVERY.history, function () {
       // Cheap when nothing draws it: loadHistory returns without a call in that case.
@@ -752,6 +754,7 @@
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
     if (name === 'economy') { renderEconomy(); loadStationHistory(S.selected); }
+    if (name === 'production') { renderProduction(); }
     if (name === 'raw') { renderRaw(); }
   }
 
@@ -771,7 +774,7 @@
   // empty for a station - the game refuses both outright - and the station books the
   // Economy tab reads exist on nothing else.
   var SHIP_ONLY = { mission: true, travel: true };
-  var STATION_ONLY = { economy: true };
+  var STATION_ONLY = { economy: true, production: true };
 
   function syncSubtabs() {
     var station = isStation(S.detail || S.byName[S.selected]);
@@ -994,6 +997,7 @@
     $('#sv-overview').innerHTML = '<p class="muted">loading…</p>';
     $('#sv-cargo').innerHTML = '<p class="muted">loading…</p>';
     $('#sv-loadout').innerHTML = '<p class="muted">loading…</p>';
+    $('#sv-production').innerHTML = '<p class="muted">loading…</p>';
 
     // Before the detail call, off the listing row - so the tab strip does not offer
     // Mission and Travel for a station for the second it takes to come back.
@@ -2491,6 +2495,7 @@
         if (S.selected !== name) { return; }
         S.station = body;
         renderEconomy();
+        renderProduction();
       })
       .catch(function (error) {
         if (error.code === 'cancelled' || S.selected !== name) { return; }
@@ -2498,6 +2503,7 @@
         // no trading manager, and is a state of the page rather than a failure.
         S.station = { error: error };
         renderEconomy();
+        renderProduction();
       });
   }
 
@@ -2556,6 +2562,24 @@
     return '<span class="' + tone + '">' + (value > 0 ? '+' : '') + credits(value) + '</span>';
   }
 
+  /* A Solar Power Plant, an Ore Mine and a Book Factory all run factory.lua, so `kind`
+     names none of them - every one of them read as "factory".
+
+     Three sources, best first. The craft's own title is the game's, size suffix and all
+     ("Solar Power Plant S"), and is there for every station whether or not it produces
+     anything. `production.title` is the mod resolving the production's title template
+     itself, which is what a station reached through the listing has before its detail
+     lands. `kind` is the last resort it used to be. */
+  function stationLabel(station, economy) {
+    var title = station && station.title && station.title.text;
+    if (title) { return title; }
+
+    var production = economy.production;
+    if (production && production.title) { return production.title; }
+
+    return economy.kind || 'station';
+  }
+
   function renderEconomy() {
     var node = $('#sv-economy');
     if (!node) { return; }
@@ -2579,7 +2603,6 @@
     // and does nothing to a card that is not in a .cards container.
     node.innerHTML = '<div class="cards">'
       + economyHeadCard(station, economy)
-      + productionCard(economy.production, economy.secured)
       + goodsTable(economy.goods, name)
       + economyHistory(name)
       + '</div>';
@@ -2604,7 +2627,7 @@
       ? '<span class="badge warn">sector loaded</span> ' + explain('books-loaded', 'warn')
       : '<span class="badge">sector unloaded</span> ' + explain('books-unloaded');
 
-    return '<div class="card"><h3>Books &mdash; ' + esc(economy.kind || 'station') + ' '
+    return '<div class="card"><h3>Books &mdash; ' + esc(stationLabel(station, economy)) + ' '
       + explain('books-lifetime') + '</h3>'
       + kv([
         ['earned', credits(earnings.fromGoods)],
@@ -2618,52 +2641,6 @@
       ])
       + (flags.length ? '<div class="mute2">' + esc(flags.join(' · ')) + '</div>' : '')
       + '<div class="row tight" style="margin-top:6px">' + freshness + '</div>'
-      + '</div>';
-  }
-
-  function productionCard(production, secured) {
-    if (!production) {
-      return '<div class="card"><h3>Production</h3><div class="mute2">'
-        + (secured === false
-            ? 'Not written to the ship database yet ' + explain('production-unsecured')
-            : 'No production line. This station trades rather than makes.')
-        + '</div></div>';
-    }
-
-    var side = function (title, items, tone) {
-      if (!items || !items.length) {
-        return '<div class="mute2">' + title + ': none</div>';
-      }
-
-      return '<div class="chain"><span class="chain-head">' + title + '</span>'
-        + items.map(function (item) {
-            return '<span class="gchip ' + tone + '" title="'
-              + esc(numText(item.stock) + ' in the bay · ' + numText(item.price)
-                    + ' ¢ each') + '">'
-              + num(item.amount) + '&times; ' + esc(item.name || '?')
-              + (item.optional ? ' <span class="dim">opt</span>' : '')
-              + '</span>';
-          }).join('')
-        + '</div>';
-    };
-
-    var cycles = (production.running || []).map(function (cycle) {
-      return bar(cycle.progress, 'info');
-    }).join('');
-
-    return '<div class="card"><h3>Production &mdash; ' + esc(production.style || 'line')
-      + ' ' + explain('production-values') + '</h3>'
-      + side('in', production.ingredients, '')
-      + side('out', production.results, 'good')
-      + (production.garbage && production.garbage.length
-          ? side('waste', production.garbage, 'warn') : '')
-      + kv([
-        ['cycles', num(production.active) + ' of ' + num(production.slots) + ' slots'],
-        ['input value', credits(production.inputValue)],
-        ['output value', credits(production.outputValue)],
-        ['margin a cycle', '<b>' + signedCredits(production.margin) + '</b>']
-      ])
-      + cycles
       + '</div>';
   }
 
@@ -2800,6 +2777,210 @@
       + '<div class="mute2 spark-axis"><span>' + esc(first.toLocaleString()) + '</span>'
       + '<span>per ' + esc(bucket || 'hour') + ', peak ' + numText(peak) + ' ¢</span>'
       + '<span>' + esc(last.toLocaleString()) + '</span></div>';
+  }
+
+  /* ============================== PRODUCTION ============================== */
+
+  /* Its own tab rather than a card under the books. A chain is the one thing on a station
+     that is a shape rather than a figure, and reading it as three wrapped rows of chips
+     lost the shape entirely - which good feeds which, and how many of the inputs are
+     optional. The Economy tab is now the station's own money and goods and nothing else.
+
+     Drawn as inline SVG at a fixed size inside a .scroll-x rather than scaled to the
+     pane: a seven-ingredient chain squeezed to phone width is a picture of a chain
+     rather than a readable one, and this has to survive an innerHTML rewrite on every
+     poll, which rules out a canvas. */
+
+  function renderProduction() {
+    var node = $('#sv-production');
+    if (!node) { return; }
+
+    var name = S.selected;
+    if (!name) { node.innerHTML = ''; return; }
+
+    var station = S.station;
+    if (!station) { node.innerHTML = '<p class="muted">loading…</p>'; return; }
+
+    if (station.error) {
+      node.innerHTML = station.error.code === 'not_a_station'
+        ? '<div class="empty muted">No production line. ' + explain('no-books') + '</div>'
+        : errorBox('Could not read the station', station.error);
+      return;
+    }
+
+    var economy = station.economy || {};
+    var production = economy.production;
+
+    if (!production) {
+      node.innerHTML = '<div class="empty muted">'
+        + (economy.secured === false
+            ? 'Not written to the ship database yet ' + explain('production-unsecured')
+            : 'No production line. This station trades rather than makes.')
+        + '</div>';
+      return;
+    }
+
+    node.innerHTML = '<div class="cards">'
+      + '<div class="card wide"><h3>' + esc(stationLabel(station, economy))
+        + '</h3><div class="scroll-x">' + chainGraph(production) + '</div>'
+        + chainLegend(production) + '</div>'
+      + chainFiguresCard(production)
+      + '</div>';
+  }
+
+  /* The page is monospace throughout, so a node's text budget is arithmetic rather than a
+     guess: 0.6em a character over the node's width less its padding. The widths below are
+     picked so the longest vanilla good name - "Computation Mainframe", 21 characters, 24
+     with its amount in front - fits without an ellipsis. Anything longer is clipped and
+     keeps the full name in the node's own tooltip. */
+  function clip(text, max) {
+    text = String(text == null ? '' : text);
+    return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  }
+
+  function chainGraph(production) {
+    var ins = (production.ingredients || []).map(function (item) {
+      return { item: item, tone: item.optional ? 'opt' : 'in', side: 'in' };
+    });
+
+    var outs = (production.results || []).map(function (item) {
+      return { item: item, tone: 'good', side: 'out' };
+    }).concat((production.garbage || []).map(function (item) {
+      return { item: item, tone: 'warn', side: 'out' };
+    }));
+
+    var NW = 196, NH = 46, GAP = 12, HUB_H = 74, PAD = 12, SPAN = 74;
+    var hubX = NW + SPAN;
+    var outX = hubX + NW + SPAN;
+    var width = outX + NW;
+
+    var stackHeight = function (n) { return n ? n * NH + (n - 1) * GAP : NH; };
+    var body = Math.max(stackHeight(ins.length), stackHeight(outs.length), HUB_H);
+    var height = body + PAD * 2;
+    var mid = height / 2;
+
+    var place = function (list) {
+      var top = mid - stackHeight(list.length) / 2;
+      return list.map(function (entry, index) {
+        entry.y = top + index * (NH + GAP);
+        entry.cy = entry.y + NH / 2;
+        return entry;
+      });
+    };
+
+    place(ins);
+    place(outs);
+
+    /* One marker per tone, because a marker inherits nothing from the path that uses it -
+       its fill has to be set on the marker itself. */
+    var markers = ['in', 'opt', 'good', 'warn'].map(function (tone) {
+      return '<marker id="pa-' + tone + '" class="' + tone + '" viewBox="0 0 8 8"'
+        + ' refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">'
+        + '<path d="M0 0 L8 4 L0 8 z"/></marker>';
+    }).join('');
+
+    var wire = function (x1, y1, x2, y2, tone) {
+      var bend = SPAN * 0.55;
+      return '<path class="pwire ' + tone + '" marker-end="url(#pa-' + tone + ')" d="M'
+        + x1.toFixed(1) + ' ' + y1.toFixed(1)
+        + ' C' + (x1 + bend).toFixed(1) + ' ' + y1.toFixed(1)
+        + ' ' + (x2 - bend).toFixed(1) + ' ' + y2.toFixed(1)
+        + ' ' + x2.toFixed(1) + ' ' + y2.toFixed(1) + '"/>';
+    };
+
+    var wires = ins.map(function (entry) {
+      return wire(NW, entry.cy, hubX - 3, mid, entry.tone);
+    }).concat(outs.map(function (entry) {
+      return wire(hubX + NW, mid, outX - 3, entry.cy, entry.tone);
+    })).join('');
+
+    var node = function (x, entry) {
+      var item = entry.item;
+      var head = numText(item.amount) + '× ' + (item.name || '?');
+      var foot = numText(item.price) + ' ¢ · ' + numText(item.stock) + ' in bay';
+
+      return '<g class="pnode ' + entry.tone + '" transform="translate(' + x.toFixed(1)
+        + ' ' + entry.y.toFixed(1) + ')">'
+        + '<title>' + esc(head + (item.optional ? ' (optional)' : '') + ' — ' + foot)
+        + '</title>'
+        + '<rect width="' + NW + '" height="' + NH + '" rx="4"/>'
+        // An optional node spends four of the name's characters on its own "opt" tag.
+        + '<text class="pn-name" x="10" y="19">'
+          + esc(clip(head, item.optional ? 21 : 25)) + '</text>'
+        + '<text class="pn-sub" x="10" y="34">' + esc(clip(foot, 29)) + '</text>'
+        + (item.optional
+            ? '<text class="pn-tag" x="' + (NW - 10) + '" y="19">opt</text>' : '')
+        + '</g>';
+    };
+
+    var nodes = ins.map(function (entry) { return node(0, entry); })
+      .concat(outs.map(function (entry) { return node(outX, entry); })).join('');
+
+    /* A mine, a gas collector and a solar power plant take nothing in. Saying so in the
+       column is clearer than an empty third of the picture. */
+    if (!ins.length) {
+      nodes += '<g class="pnode none" transform="translate(0 ' + (mid - NH / 2).toFixed(1)
+        + ')"><rect width="' + NW + '" height="' + NH + '" rx="4"/>'
+        + '<text class="pn-sub" x="10" y="27">takes nothing in</text></g>';
+    }
+
+    var hub = '<g class="phub" transform="translate(' + hubX + ' '
+      + (mid - HUB_H / 2).toFixed(1) + ')">'
+      + '<rect width="' + NW + '" height="' + HUB_H + '" rx="5"/>'
+      // The hub's name is a size larger and bold, so it buys fewer characters than a node.
+      + '<text class="ph-name" x="10" y="21">'
+        + esc(clip(production.title || production.style || 'production line', 23))
+        + '</text>'
+      + '<text class="pn-sub" x="10" y="38">' + esc(numText(production.active) + ' of '
+        + numText(production.slots) + ' cycles running') + '</text>'
+      + '<text class="pn-sub" x="10" y="54">'
+        + esc((production.margin > 0 ? '+' : '') + numText(production.margin)
+              + ' ¢ a cycle') + '</text>'
+      + '</g>';
+
+    return '<svg class="chain-graph" width="' + width + '" height="' + height.toFixed(0)
+      + '" viewBox="0 0 ' + width + ' ' + height.toFixed(0) + '" role="img"'
+      + ' aria-label="production chain">'
+      + '<defs>' + markers + '</defs>' + wires + nodes + hub + '</svg>';
+  }
+
+  function chainLegend(production) {
+    var bits = ['<span class="lg in"></span>ingredient'];
+
+    if ((production.ingredients || []).some(function (i) { return i.optional; })) {
+      bits.push('<span class="lg opt"></span>optional');
+    }
+
+    bits.push('<span class="lg good"></span>result');
+
+    if ((production.garbage || []).length) {
+      bits.push('<span class="lg warn"></span>waste');
+    }
+
+    return '<div class="chain-legend mute2">' + bits.join('') + '</div>';
+  }
+
+  /* The figures the graph cannot carry. Base prices out of the goods index rather than
+     what the station will actually get for the result, which is a sale at basePrice and
+     then supply and demand - so this says whether a chain is worth running, not what it
+     earned. That is the Economy tab. */
+  function chainFiguresCard(production) {
+    var cycles = (production.running || []).map(function (cycle) {
+      return bar(cycle.progress, 'info');
+    }).join('');
+
+    return '<div class="card"><h3>Per cycle '
+      + explain('production-values') + '</h3>'
+      + kv([
+        ['cycles', num(production.active) + ' of ' + num(production.slots) + ' slots'],
+        ['input value', credits(production.inputValue)],
+        ['output value', credits(production.outputValue)],
+        ['margin a cycle', '<b>' + signedCredits(production.margin) + '</b>'],
+        ['shuttle volume', production.shuttleVolume != null
+          ? num(production.shuttleVolume) : '—']
+      ])
+      + cycles
+      + '</div>';
   }
 
   /* ================================ HISTORY ================================ */

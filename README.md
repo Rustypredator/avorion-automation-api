@@ -169,11 +169,17 @@ part of their manifest on the row. Holds are not in the listing endpoint, so tha
 the search reads `/ships/{name}` once per craft, at background priority behind anything you
 are doing and cached for two minutes - it happens only once you have typed something.
 
-Select a station and the **Economy** tab shows its production chain, every good it trades
-with its stock against the cap the station itself works to, and what it has earned - with
-the bridge's own series underneath, turning that lifetime total into credits an hour and a
-bar per hour or day. Mission and Travel are not offered for a station: the game refuses
-both outright.
+Select a station and the **Economy** tab shows what it has earned and every good it trades,
+with its stock against the cap the station itself works to - and the bridge's own series
+underneath, turning that lifetime total into credits an hour and a bar per hour or day. The
+**Production** tab beside it draws the line itself as a node graph: ingredients on the left,
+the factory in the middle, results and waste on the right, one arrow each. Mission and
+Travel are not offered for a station: the game refuses both outright.
+
+The heading on both is the station's real identity rather than its script. Every factory in
+the game - a Solar Power Plant, an Iron Mine, a Book Factory - runs the same `factory.lua`
+and reports the same `kind`, so the mod resolves the production's own title template against
+the good the line makes and reports that as `production.title`.
 
 The map can also draw where a fleet has actually been - a heatmap of time spent per sector
 and a per-craft travel track - out of the history the bridge keeps. See

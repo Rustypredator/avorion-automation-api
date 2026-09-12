@@ -404,8 +404,8 @@ and neither is a defence platform or anything else with no trading manager; use
       "economy": {
         "kind": "factory",
         "scripts": ["factory.lua"],
-        "production": {"factory": "${good} Refinery ${size}", "style": "Factory",
-                       "slots": 3, "active": 2, "margin": 635},
+        "production": {"factory": "${good} Refinery ${size}", "title": "Oil Refinery",
+                       "style": "Factory", "slots": 3, "active": 2, "margin": 635},
         "earnings": {"fromGoods": 4000000, "spentOnGoods": 1500000,
                      "fromTax": 25000, "net": 2525000},
         "stock": {"Oil": 900, "Raw Oil": 40, "Energy Cell": 1200},
@@ -444,7 +444,8 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
     "kind": "factory",
     "scripts": ["factory.lua"],
     "production": {
-      "factory": "${good} Refinery ${size}", "style": "Factory", "mine": false,
+      "factory": "${good} Refinery ${size}", "title": "Oil Refinery",
+      "style": "Factory", "mine": false,
       "ingredients": [
         {"name": "Energy Cell", "amount": 5, "optional": null, "price": 61, "size": 1,
          "value": 305, "stock": 1200},
@@ -484,6 +485,12 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
   `seller`, `equipmentdock`, `shipyard`, `resourcedepot`, `turretfactory`, and so on. A
   station that runs several - a shipyard also runs a repair dock and a consumer - is named
   after the one that defines it, and `scripts` lists them all.
+- `kind` does **not** identify a factory. A Solar Power Plant, an Iron Mine, a Gas
+  Collector and a Book Factory all run `factory.lua` and all report `factory`. What tells
+  them apart is `production.title`: the production's own `factory` template resolved
+  against the good the line makes, which is the name the game puts on the hull, minus the
+  roman-numeral size suffix - the factory's size is not in the secured data. Use it rather
+  than `kind` anywhere a station is being named to a human.
 - `price` on a good is the goods index's base value; `basePrice` is that times the
   station's own price factor, which is what the game's own trade UI shows as the base.
   **Neither is what a trade will actually settle at.** The real price also carries a
@@ -910,6 +917,7 @@ is what turns a lifetime total into "what did this place make this week".
     {
       "ship": "Rusty Refinery", "owner": "player", "x": 12, "y": -4,
       "kind": "factory", "produces": ["Oil"], "factory": "${good} Refinery ${size}",
+      "factoryTitle": "Oil Refinery",
       "samples": 280, "first": 1757630100, "last": 1757716300, "observed": 84000,
       "earned": 410000, "spent": 90000, "tax": 4000, "net": 324000,
       "perHour": {"earned": 17571.43, "spent": 3857.14, "net": 13885.71}

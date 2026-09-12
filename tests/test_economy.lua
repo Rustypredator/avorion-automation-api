@@ -181,6 +181,8 @@ check(status == 200, "returns 200")
 local production = refinery.economy.production
 check(production ~= nil, "reports a production line")
 check(production.style == "Factory", "carries the factory style")
+check(production.title == "Oil Refinery",
+      "the factory template is resolved against the good the line makes")
 check(#production.ingredients == 2, "two ingredients")
 check(#production.results == 1, "one result")
 check(production.slots == 3, "reports the production slot count")

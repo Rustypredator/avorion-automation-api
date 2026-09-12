@@ -522,6 +522,10 @@ final class History
         if ($production !== null) {
             $facts['production'] = [
                 'factory' => (string) ($production->factory ?? ''),
+                // The template above resolved against the good the line makes. `kind` is
+                // "factory" for a Solar Power Plant and a Book Factory alike, so this is
+                // the only field in a sample that names which one the row was measuring.
+                'title' => (string) ($production->title ?? ''),
                 'style' => (string) ($production->style ?? ''),
                 'slots' => (int) ($production->slots ?? 0),
                 'active' => (int) ($production->active ?? 0),
@@ -995,6 +999,7 @@ final class History
             'kind' => (string) ($facts['kind'] ?? ''),
             'produces' => $facts['production']['results'] ?? [],
             'factory' => $facts['production']['factory'] ?? '',
+            'factoryTitle' => $facts['production']['title'] ?? '',
             'samples' => (int) $row['samples'],
             'first' => (int) $row['first_at'],
             'last' => (int) $row['last_at'],

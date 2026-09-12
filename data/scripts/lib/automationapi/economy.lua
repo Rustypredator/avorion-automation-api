@@ -233,6 +233,38 @@ local function valueOf(side)
     return total
 end
 
+-- The game builds a factory's station title out of the production's own template and the
+-- good the line makes: "${good} Mine ${size}" over Ore is an Ore Mine, and the same
+-- factory.lua over Energy Cell is a Solar Power Plant. `kind` is the script and cannot
+-- tell those two apart, which is what made every one of them read as "factory".
+--
+-- This is formatFactoryName() from data/scripts/lib/productions.lua, minus the size
+-- suffix: the factory's size is not in the secured data, so it is dropped rather than
+-- guessed at.
+local function factoryTitle(production, results)
+    local template = Serialize.string(production.factory)
+    if not template then return nil end
+
+    local first = results[1]
+    local reference = first and goods and goods[first.name or ""] or nil
+
+    -- What the game falls back to when the result good is not in the index, which is
+    -- what a good from another mod looks like from here.
+    if not reference then return "Factory" end
+
+    local good = Serialize.string(reference.name) or ""
+    local plural = Serialize.string(reference.plural) or good
+
+    local filled = string.gsub(template, "%${(%w+)}", function(key)
+        if key == "good" or key == "prefix" then return good end
+        if key == "plural" then return plural end
+
+        return ""
+    end)
+
+    return (string.gsub(filled, "^%s*(.-)%s*$", "%1"))
+end
+
 local function productionOf(values, stock)
     local production = values.production
     if type(production) ~= "table" then return nil end
@@ -254,8 +286,10 @@ local function productionOf(values, stock)
 
     return
     {
-        -- The template the game builds the station's title from, e.g. "${good} Mine ${size}".
+        -- The template the game builds the station's title from, e.g. "${good} Mine ${size}",
+        -- and that template resolved against the good this line makes.
         factory = Serialize.string(production.factory),
+        title = factoryTitle(production, results),
         style = Serialize.string(production.factoryStyle),
         mine = production.mine == true,
         ingredients = ingredients,

@@ -334,6 +334,7 @@ function stations(array $rows): stdClass
                 'kind' => $row['kind'] ?? 'factory',
                 'production' => (object) [
                     'factory' => '${good} Refinery ${size}',
+                    'title' => 'Oil Refinery',
                     'style' => 'Factory',
                     'slots' => 3,
                     'active' => 1,
@@ -390,7 +391,9 @@ function sample(PDO $pdo, int $keyId, string $ship, int $ago, array $row): void
         ':a' => $row['tax'] ?? 0,
         ':st' => json_encode($row['stock'] ?? []),
         ':d' => json_encode(['kind' => 'factory',
-                             'production' => ['factory' => 'Oil Refinery', 'results' => ['Oil']]]),
+                             'production' => ['factory' => '${good} Refinery ${size}',
+                                              'title' => 'Oil Refinery',
+                                              'results' => ['Oil']]]),
     ]);
 }
 
@@ -426,6 +429,8 @@ check($refinery['observed'] === 3600, 'observed time is the span the samples act
 check($refinery['perHour']['earned'] === 4000.0, 'the rate is per observed hour');
 check($refinery['kind'] === 'factory', 'the station description travels with the sample');
 check($refinery['produces'] === ['Oil'], 'including what it produces');
+check($refinery['factoryTitle'] === 'Oil Refinery',
+      'and the resolved factory name, which `kind` cannot give');
 
 check($summary['totals']['earned'] === 4400, 'the totals add both stations up');
 check($summary['totals']['stations'] === 2, 'and count them');
