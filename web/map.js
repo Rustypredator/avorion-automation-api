@@ -17,9 +17,11 @@
     ships: [],         // GET /ships
     route: null,       // GET /galaxy/route
     hits: [],          // GET /map/search
+    heat: null,        // GET /history/heatmap
+    tracks: [],        // GET /history/visits, grouped per craft
     selected: null,    // {x, y}
 
-    show: { ships: true, belts: true, unvisited: true },
+    show: { ships: true, belts: true, unvisited: true, heat: false, tracks: false },
 
     scale: 1,
     originX: 0,
@@ -87,8 +89,22 @@
       }
 
       window.addEventListener('resize', Map2.resize);
+
+      /* A canvas has a backing store measured in pixels and a CSS box that is measured in
+         whatever the layout says. Only redrawing on window resize meant every other thing
+         that changes the box - switching tabs, the log drawer, a banner appearing - left
+         the two disagreeing, and the browser resolves that by stretching the old pixels.
+         Watching the element itself covers all of them, window resize included. */
+      if (typeof ResizeObserver === 'function') {
+        new ResizeObserver(function () { Map2.resize(); }).observe(canvas);
+      }
+
       Map2.resize();
     },
+
+    /* Skips the redraw when nothing actually changed: a ResizeObserver fires on any
+       layout pass, and rebuilding the backing store throws away the drawn frame. */
+    resized: { w: 0, h: 0, dpr: 0 },
 
     resize: function () {
       var c = Map2.canvas;
@@ -96,6 +112,11 @@
       var dpr = window.devicePixelRatio || 1;
       var w = c.clientWidth, h = c.clientHeight;
       if (!w || !h) { return; }
+
+      var was = Map2.resized;
+      if (was.w === w && was.h === h && was.dpr === dpr) { return; }
+      Map2.resized = { w: w, h: h, dpr: dpr };
+
       c.width = Math.round(w * dpr);
       c.height = Math.round(h * dpr);
       Map2.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -148,6 +169,35 @@
     setShips: function (list) { Map2.ships = list || []; Map2.draw(); },
     setRoute: function (route) { Map2.route = route; Map2.draw(); },
     setHits: function (list) { Map2.hits = list || []; Map2.draw(); },
+
+    setHeat: function (heat) {
+      Map2.heat = heat || null;
+      Map2.heatIndex = {};
+      var cells = (heat && heat.cells) || [];
+      for (var i = 0; i < cells.length; i++) {
+        Map2.heatIndex[cells[i].x + ',' + cells[i].y] = cells[i];
+      }
+      Map2.draw();
+    },
+
+    /* Visits arrive as one flat list, oldest first. One polyline per craft is what a
+       track actually is, so they are grouped here rather than at the call site. */
+    setTracks: function (visits) {
+      var byShip = {};
+      var order = [];
+
+      for (var i = 0; i < (visits || []).length; i++) {
+        var v = visits[i];
+        if (!byShip[v.s]) { byShip[v.s] = []; order.push(v.s); }
+        byShip[v.s].push(v);
+      }
+
+      Map2.tracks = order.map(function (name) {
+        return { ship: name, points: byShip[name] };
+      });
+
+      Map2.draw();
+    },
 
     sectorAt: function (x, y) {
       return (Map2.index && Map2.index[x + ',' + y]) || null;
@@ -223,6 +273,14 @@
         html += '<hr>';
       }
       html += '<b>' + x + ':' + y + '</b>';
+
+      var cell = Map2.show.heat && Map2.heatIndex ? Map2.heatIndex[x + ',' + y] : null;
+      if (cell) {
+        html += '<div class="mute2">' + cell.visits + ' visit'
+             + (cell.visits === 1 ? '' : 's')
+             + ' &middot; ' + humanDuration(cell.seconds) + ' observed</div>';
+      }
+
       if (sector) {
         if (sector.name) { html += ' ' + esc(sector.name); }
         html += '<div class="mute2">'
@@ -261,7 +319,9 @@
       ctx.fillRect(0, 0, s.w, s.h);
 
       drawRings(ctx);
+      if (Map2.show.heat) { drawHeat(ctx); }
       drawSectors(ctx);
+      if (Map2.show.tracks) { drawTracks(ctx); }
       drawHits(ctx);
       drawRoute(ctx);
       if (Map2.show.ships) { drawShips(ctx); }
@@ -367,6 +427,92 @@
         ctx.fillStyle = 'rgba(125,140,163,.8)';
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(sec.name, p.x + r + 3, p.y + 3);
+      }
+    }
+  }
+
+  /* --------------------------------- history ------------------------------- */
+
+  /* Where the fleet actually spends its time.
+   *
+   * Weighted by observed seconds when there are any, and by visit count when there are
+   * not - a track recorded in short bursts can hold real visits and almost no measured
+   * dwell, and a map that renders as blank in that case is worse than one that answers a
+   * slightly different question. Which of the two is in use is stated in the legend.
+   */
+  function drawHeat(ctx) {
+    var heat = Map2.heat;
+    if (!heat || !heat.cells || !heat.cells.length) { return; }
+
+    var bySeconds = heat.maxSeconds > 0;
+    var peak = bySeconds ? heat.maxSeconds : heat.maxVisits;
+    if (!peak) { return; }
+
+    // A sector box at this zoom, never small enough to disappear against the sector dots
+    // it sits under.
+    var size = Math.max(5, Map2.scale * 1.1);
+    var view = Map2.size();
+
+    for (var i = 0; i < heat.cells.length; i++) {
+      var cell = heat.cells[i];
+      var p = Map2.toScreen(cell.x, cell.y);
+      if (p.x < -size || p.y < -size || p.x > view.w + size || p.y > view.h + size) { continue; }
+
+      // Square-rooted: one sector a fleet parks in otherwise carries the whole ramp and
+      // everywhere it merely passed through reads as empty.
+      var weight = Math.sqrt((bySeconds ? cell.seconds : cell.visits) / peak);
+
+      ctx.fillStyle = heatColor(weight);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, size * (0.45 + 0.35 * weight), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawTracks(ctx) {
+    // The craft marker already carries the name when it is drawn, and two labels on the
+    // same point at two different colours is just noise.
+    var labels = Map2.scale > 2.5 && !Map2.show.ships;
+
+    for (var t = 0; t < Map2.tracks.length; t++) {
+      var track = Map2.tracks[t];
+      var points = track.points;
+      if (!points.length) { continue; }
+
+      var color = trackColor(track.ship);
+
+      ctx.strokeStyle = color.replace('ALPHA', '0.75');
+      ctx.lineWidth = 1.3;
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+
+      for (var i = 0; i < points.length; i++) {
+        var p = Map2.toScreen(points[i].x, points[i].y);
+        if (i === 0) { ctx.moveTo(p.x, p.y); } else { ctx.lineTo(p.x, p.y); }
+      }
+      ctx.stroke();
+
+      // Every stop on the way, and a ring on the newest so the direction of travel is
+      // readable without arrowheads cluttering a dense track.
+      ctx.fillStyle = color.replace('ALPHA', '0.9');
+      for (var j = 0; j < points.length; j++) {
+        var q = Map2.toScreen(points[j].x, points[j].y);
+        ctx.beginPath();
+        ctx.arc(q.x, q.y, 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      var last = Map2.toScreen(points[points.length - 1].x, points[points.length - 1].y);
+      ctx.strokeStyle = color.replace('ALPHA', '0.95');
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (labels) {
+        ctx.fillStyle = color.replace('ALPHA', '0.85');
+        ctx.font = '10px ui-monospace, monospace';
+        ctx.fillText(track.ship, last.x + 7, last.y - 5);
       }
     }
   }
@@ -483,6 +629,30 @@
     return 'hsla(' + hue.toFixed(0) + ',62%,62%,' + alpha + ')';
   }
 
+  /* Cyan through amber to red, matching the legend's CSS gradient. */
+  function heatColor(t) {
+    var hue = 190 - 190 * clamp(t, 0, 1);
+    return 'hsla(' + hue.toFixed(0) + ',80%,55%,' + (0.14 + 0.5 * t).toFixed(3) + ')';
+  }
+
+  /* Stable per craft name, so a track keeps its colour across reloads. ALPHA is filled in
+     by the caller, which needs the same hue at several opacities. */
+  function trackColor(name) {
+    var hash = 0;
+    for (var i = 0; i < name.length; i++) {
+      hash = (hash * 31 + name.charCodeAt(i)) % 360;
+    }
+    return 'hsla(' + hash + ',70%,62%,ALPHA)';
+  }
+
+  function humanDuration(seconds) {
+    if (!seconds) { return '0s'; }
+    if (seconds < 90) { return Math.round(seconds) + 's'; }
+    if (seconds < 5400) { return Math.round(seconds / 60) + 'm'; }
+    if (seconds < 172800) { return (seconds / 3600).toFixed(1) + 'h'; }
+    return (seconds / 86400).toFixed(1) + 'd';
+  }
+
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
   function esc(value) {
@@ -491,5 +661,7 @@
   }
 
   Map2.factionColor = factionColor;
+  Map2.trackColor = trackColor;
+  Map2.humanDuration = humanDuration;
   global.GalaxyMap = Map2;
 }(window));

@@ -58,6 +58,14 @@ call() {
         "http://127.0.0.1:$PORT/ping"
 }
 
+# Any path, unlike call() which is pinned to /ping so it can run without a key.
+get() {
+    curl -s -m 40 -o "$WORK/body" -w '%{http_code}' -H "X-API-Key: $1" \
+        "http://127.0.0.1:$PORT$2"
+}
+
+json() { python3 -c "$1" "$WORK/body" 2>/dev/null; }
+
 code() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("error",{}).get("code",""))' "$WORK/body" 2>/dev/null; }
 
 wipe() { docker run --rm -v "$GALAXY:/g" alpine rm -rf /g/moddata >/dev/null 2>&1; }
@@ -115,6 +123,46 @@ check "$(grep -q '"api":1' "$WORK/body" && echo 0 || echo 1)" "the response is t
 
 status="$(call bogus)"
 check "$([ "$status" = "401" ] && echo 0 || echo 1)" "an unknown key is rejected by the mod, not the bridge" "got $status"
+
+# #### The bridge's own history #### --
+#
+# Answered by the bridge rather than forwarded, and written as a side effect of relaying
+# the two calls it is built from. Both halves are worth pinning here: the store is the one
+# piece of logic on this side of the transport, so nothing on the mod side tests it.
+
+echo
+echo "history"
+
+status="$(get "$KEY" /history/summary)"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "a key with no history reads an empty summary" "got $status: $(head -c 200 "$WORK/body")"
+check "$(json 'import json,sys;s=json.load(open(sys.argv[1]));sys.exit(0 if s["ships"]==[] else 1)' && echo 0 || echo 1)" \
+    "with no craft in it"
+
+status="$(get "$KEY" /ships)"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "GET /ships round-trips" "got $status: $(head -c 200 "$WORK/body")"
+
+status="$(get "$KEY" /history/summary)"
+names="$(json 'import json,sys;print(",".join(sorted(s["name"] for s in json.load(open(sys.argv[1]))["ships"])))')"
+check "$([ "$names" = "Ore Hound,Tug" ] && echo 0 || echo 1)" \
+    "relaying that answer recorded both craft" "got '$names'"
+
+status="$(get "$KEY" /history/heatmap)"
+cells="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["cells"]))')"
+check "$([ "$cells" = "2" ] && echo 0 || echo 1)" "the heatmap holds one cell per occupied sector" "got $cells"
+
+# A second identical poll must not double-count a fleet that has not moved.
+get "$KEY" /ships >/dev/null
+get "$KEY" /history/heatmap >/dev/null
+visits="$(json 'import json,sys;print(sum(c["visits"] for c in json.load(open(sys.argv[1]))["cells"]))')"
+check "$([ "$visits" = "2" ] && echo 0 || echo 1)" "polling a parked fleet again adds no visits" "got $visits"
+
+status="$(get bogus /history/summary)"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "an unknown key reads its own empty history" "got $status"
+check "$(json 'import json,sys;s=json.load(open(sys.argv[1]));sys.exit(0 if s["ships"]==[] else 1)' && echo 0 || echo 1)" \
+    "and sees nothing of anyone else's"
+
+status="$(get "$KEY" /history/nonsense)"
+check "$([ "$status" = "404" ] && echo 0 || echo 1)" "an unknown history route is a 404 from the bridge" "got $status"
 
 # #### Self-healing #### --
 #

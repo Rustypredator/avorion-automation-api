@@ -64,7 +64,7 @@ The mod prints the winner to the server console, and that line is what the bridg
 pointed at:
 
 ```
-AutomationAPI: v0.1.10 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.2.0 ready, API v1, transport directory: moddata/AutomationAPI
 ```
 
 One caveat to the second place: it is per install rather than per galaxy, so two galaxies

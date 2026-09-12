@@ -170,6 +170,51 @@ local status, body = call("GET", "/ships/Ore Hound/events")
 check(status == 200, "the log is still readable with the owner offline")
 check(body.recording == false,
       "but says so, since the callbacks live on the player's own scripts")
+check(body.watchers == 0, "and counts nobody watching")
+
+print("\nalliance craft are watched by whichever member is online")
+
+-- The caller (1) is offline throughout this block. Alliance craft publish their
+-- callbacks on the Alliance object, so a second member being logged in is enough to keep
+-- the log running - and reporting otherwise sent people looking for a bug in a fleet that
+-- was recording perfectly well.
+Mock.addPlayer(2, "Crewmate")
+local alliance = Mock.addAlliance(100, "Test Alliance", 1, nil, {1, 2})
+Mock.addShip(100, "Alliance Hauler", {x = 8, y = 8})
+
+Mock.setOffline(2)
+local status, body = call("GET", "/ships/Alliance Hauler/events", nil, {owner = "alliance"})
+check(status == 200, "an alliance craft's log reads back")
+check(body.recording == false, "nobody online, so nothing is being recorded")
+
+Mock.setOnline(2)
+local status, body = call("GET", "/ships/Alliance Hauler/events", nil, {owner = "alliance"})
+check(body.recording == true,
+      "another member online is enough, even though the key's owner is not")
+check(body.watchers == 1, "and exactly one agent is watching")
+
+Mock.setOnline(1)
+local status, body = call("GET", "/ships/Alliance Hauler/events", nil, {owner = "alliance"})
+check(body.watchers == 2, "both members online means two agents watching")
+
+-- The caller's own craft are a different question: those callbacks live on their Player.
+Mock.setOffline(1)
+local status, body = call("GET", "/ships/Ore Hound/events")
+check(body.recording == false,
+      "a member being online does not record the caller's personal craft")
+
+-- What the alliance agent actually pushes, keyed by the alliance index rather than any
+-- member's, which is what makes one log serve every member.
+check(Bridge.pushShipEvent(100, "Alliance Hauler", "status", {text = "Patrolling"}) == true,
+      "an alliance event is recorded against the alliance")
+local status, body = call("GET", "/ships/Alliance Hauler/events", nil, {owner = "alliance"})
+check(#body.events == 1 and body.events[1].text == "Patrolling",
+      "and reads back off the alliance's log")
+
+-- Two members online both register on the same Alliance object, so the same change is
+-- forwarded twice. The duplicate has to die here or every alliance log doubles.
+check(Bridge.pushShipEvent(100, "Alliance Hauler", "status", {text = "Patrolling"}) == false,
+      "a second member forwarding the same change is collapsed, not recorded twice")
 
 print("")
 if failures == 0 then

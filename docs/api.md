@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.1.10", "game": "2.5.13",
+  "api": 1, "mod": "0.2.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true}
@@ -344,7 +344,7 @@ records them as they fire. Nothing here is polled.
 
 ```json
 {
-  "ship": "Ore Hound", "cursor": 16, "recording": true, "dropped": 0,
+  "ship": "Ore Hound", "cursor": 16, "recording": true, "watchers": 1, "dropped": 0,
   "events": [
     {"seq": 13, "at": 7421, "kind": "order", "chain": [{"name": "Aggressive", "action": 5}],
      "activeIndex": 0, "finished": false, "idle": false, "sector": {"x": -316, "y": 319}},
@@ -360,13 +360,19 @@ records them as they fire. Nothing here is polled.
   match on the untranslated string.
 - Consecutive duplicates are dropped. The engine republishes unchanged status text whenever
   the AI re-evaluates, which would otherwise bury the real transitions.
-- `recording` is false when the owner is logged out. **Player scripts do not run for a
-  logged-out player, so a quiet log then means nobody was watching, not that nothing
-  happened.**
+- `recording` is false when no player agent is in a position to see the callbacks fire.
+  **Player scripts do not run for a logged-out player, so a quiet log then means nobody was
+  watching, not that nothing happened.** `watchers` is how many agents are watching, which
+  is the same question asked more precisely.
+- **Alliance craft are not tied to the key holder.** Their callbacks are raised on the
+  Alliance object, and every online member's agent registers against it, so an alliance
+  fleet keeps recording while any one member is in game - whether or not that member owns
+  this key. Only personal craft go quiet when the key's own player logs out.
 - The log is in memory, capped at 200 events per ship, and empty after a server restart. It
-  is a recent-activity feed, not an audit trail.
+  is a recent-activity feed, not an audit trail. If you want one that survives both, the
+  bridge keeps a copy - see [Bridge-local endpoints](#bridge-local-endpoints).
 
-Reads work offline; only the recording needs the owner online.
+Reads work offline; only the recording needs some agent online.
 
 ## GET /galaxy/route
 
@@ -556,3 +562,120 @@ It is capped at 10000 sectors per request and is deliberately spread across serv
 rather than run in one, so it takes a few seconds of wall clock and does not stall the
 server. Sectors are ruled out by a cheap seed hash first, and only the ~3% holding regular
 content cost a full generator run.
+
+# Bridge-local endpoints
+
+Everything above is the mod's. `/history/*` is not: it is answered by the HTTP bridge in
+`docker/bridge/`, out of its own store, and never reaches the game server.
+
+## Why it is not part of the mod
+
+The mod's event log is a ring buffer in server memory - 200 entries per ship, gone at the
+next restart. That is the right shape for "what is this ship doing now" and no use for
+"where has this fleet been this month". Making it durable on the mod side means writing a
+growing file from a galaxy script on the server's own tick, which is a bad trade: a month
+of travel data paid for in frame time on a running game server.
+
+So the bridge keeps the copy instead. It already relays every call, and two of them carry
+everything the store needs, so recording costs one file append on requests that were
+happening anyway and nothing at all on the game side.
+
+## What it records, and when
+
+| from | what |
+|---|---|
+| `GET /ships` | each craft's sector, as a **visit** - opened when it arrives, closed when it moves on |
+| `GET /ships/{name}/events` | the mod's own order and status events, kept past the 200 and past a restart |
+
+Positions come from the ship database, which the mod reads **with every player logged out**,
+so the travel record keeps filling whether or not anything is online to fly.
+
+**Nothing here polls.** History accumulates while something is calling the API - the
+console with a tab open, a cron job, your own client - and a gap in it is a gap in who was
+looking, not a gap in what happened. Dwell is therefore reported as *observed* seconds:
+time nobody was watching counts as zero rather than being guessed at.
+
+Event timestamps are reconstructed rather than stamped on arrival. The mod tags each event
+with the server's uptime in seconds, which dates nothing on its own but spaces events
+exactly, so the newest in a batch is anchored to the clock and the rest walk back by their
+own offsets. A caller collecting an afternoon's backlog in one call gets an afternoon's
+timeline, not one crowded second.
+
+## Storage and privacy
+
+The store is keyed by a SHA-256 of the API key and never holds the key itself. That has two
+consequences worth stating:
+
+- An unknown key reads an **empty** history rather than anyone else's, which is why these
+  routes need no key check of their own.
+- Nothing is ever written except off the back of a call the mod itself answered 2xx, which
+  is the real authentication. A caller who cannot get a 200 out of the mod cannot make the
+  store exist.
+
+It lives in the `history` Docker volume. `HISTORY_DIR=""` turns the whole thing off and
+every route below answers `404 history_disabled`; `HISTORY_DAYS` (default 30) sets how far
+back it goes.
+
+## GET /history/summary
+
+What is on disk, per craft.
+
+```json
+{
+  "ships": [
+    {"name": "Ore Hound", "visits": 41, "events": 190, "sectors": 12,
+     "first": 1757630000, "last": 1757719400}
+  ],
+  "bytes": 68120, "retentionDays": 30, "recording": true
+}
+```
+
+## GET /history/visits
+
+Every sector a craft was seen to occupy, oldest first. The visit in progress is included
+and flagged `"open": true`, so "where is it now" is part of the same answer.
+
+| query | notes |
+|---|---|
+| `ship` | one craft by name; omit for the whole fleet |
+| `owner` | `player` or `alliance` |
+| `from`, `to` | Unix seconds |
+| `limit` | newest N (default 2000, max 20000) |
+
+```json
+{"visits": [{"t": 1757630000, "e": 1757630600, "s": "Ore Hound", "x": 12, "y": -5, "o": "player"}]}
+```
+
+`t` is when the craft was first seen there and `e` when it was last seen there, so `e - t`
+is observed dwell.
+
+## GET /history/heatmap
+
+The same visits collapsed onto the sector grid. Takes the same query parameters.
+
+```json
+{
+  "cells": [{"x": 12, "y": -5, "visits": 3, "seconds": 5400}],
+  "maxVisits": 3, "maxSeconds": 5400,
+  "ships": ["Ore Hound"], "from": 1757630000, "to": 1757719400
+}
+```
+
+`maxVisits` and `maxSeconds` are there to scale a colour ramp without a second pass. When
+`maxSeconds` is 0 - a fleet recorded only in short bursts - weight by `visits` instead.
+
+## GET /history/events
+
+The persisted event log. Same query parameters as `/history/visits`; each row is the mod's
+own event object wrapped in `t` (Unix seconds), `s` (craft), `q` (the mod's sequence
+number) and `o` (owner kind).
+
+Sequence numbers restart with the server, so `q` does not identify an event on its own.
+
+## POST /history/clear
+
+Drops everything stored for this key, or one craft's share of it with `?ship=`.
+
+```json
+{"cleared": true, "ship": "Ore Hound", "removed": 231}
+```

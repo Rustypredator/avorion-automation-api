@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.1.10](https://img.shields.io/badge/version-0.1.10-8957e5)](modinfo.lua)
+[![version 0.2.0](https://img.shields.io/badge/version-0.2.0-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -99,7 +99,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.1.10 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.2.0 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -155,10 +155,14 @@ cat "$DIR/responses/$ID.json"; rm "$DIR/responses/$ID.json"
 
 ## Web console
 
-`web/` is a browser console for the API - fleet overview, captain missions, orders,
-travel, a galaxy map and a live per-ship event log. It is plain HTML and JavaScript with
-no build step and no CDN, and all of its logic runs in the browser: it holds your key,
-talks to the API directly and stores nothing on a server.
+`web/` is a browser console for the API - fleet overview, cargo, loadout, captain
+missions, orders, travel, a galaxy map and a live per-ship event log. It is plain HTML and
+JavaScript with no build step and no CDN, and all of its logic runs in the browser: it
+holds your key, talks to the API directly and stores nothing on a server.
+
+The map can also draw where a fleet has actually been - a heatmap of time spent per sector
+and a per-craft travel track - out of the history the bridge keeps. See
+[Fleet history](#fleet-history).
 
 The Docker stack in `docker/` serves it from the API's own origin:
 
@@ -175,8 +179,8 @@ the server's `--datapath` is [absolute](#2-start-the-server-with-an-absolute---d
 the directory itself rather than failing, at which point nothing can write to it; the
 bridge answers `bridge_unavailable` or `transport_not_writable` and says so.
 
-`tools/e2e.sh` tests the whole deployment - mounts, ownership, round trip - without
-Avorion, by running the real mod code against a throwaway directory.
+`tools/e2e.sh` tests the whole deployment - mounts, ownership, round trip, history -
+without Avorion, by running the real mod code against a throwaway directory.
 
 Then open `http://<your-api-host>/console/` and paste an API key. The address field is
 already filled in with the page's own origin, so there is nothing else to set.
@@ -187,6 +191,42 @@ headers for that by default (`CORS_ORIGIN` in `.env` narrows or disables them), 
 includes the one Chrome wants before a page off your disk may reach an address on your
 own network. A bridge built before those headers existed refuses the page with no usable
 error - rebuild it. Serving the console from `/console/` sidesteps the whole question.
+
+## Fleet history
+
+The mod's event log is a ring buffer in server memory: 200 entries per ship, gone at the
+next restart. That is the right shape for *what is this ship doing now* and no use for
+*where has this fleet been this month* - and making it durable on the mod side would mean
+writing a growing file from a galaxy script on the game server's own tick, which is a month
+of travel data paid for in frame time.
+
+So the bridge keeps the copy. It relays every call already, and two of them carry
+everything the store needs:
+
+| from | what it records |
+|---|---|
+| `GET /ships` | each craft's sector, as a visit - opened on arrival, closed when it moves on |
+| `GET /ships/{name}/events` | the mod's own events, past the 200 and past a restart |
+
+Positions come from the ship database, which reads fine **with every player logged out**, so
+the travel record keeps filling whether or not anyone is flying.
+
+Read it at `/history/summary`, `/history/visits`, `/history/heatmap` and `/history/events` -
+full reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
+last two on the map.
+
+Two things to know about it:
+
+- **Nothing polls.** History accumulates while something is calling the API. A gap in it is
+  a gap in who was looking, not a gap in what happened, which is why dwell is reported as
+  *observed* seconds rather than guessed at.
+- **It is keyed by a hash of your API key and never stores the key.** An unknown key reads
+  an empty history rather than anyone else's, and nothing is written except off the back of
+  a call the mod itself answered - so a caller who cannot get a 200 out of the mod cannot
+  make the store exist.
+
+It lives in the `history` Docker volume. `HISTORY_DIR=""` turns it off entirely;
+`HISTORY_DAYS` (default 30) sets how far back it keeps.
 
 ## Endpoints
 
@@ -208,16 +248,25 @@ Full reference in [docs/api.md](docs/api.md).
 | `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and the game's own pathfinder |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
+| `GET /history/*` | where the fleet has been - served by the bridge, not the mod |
 
 ## What needs the owner online
 
 Every read works with nobody logged in, because the bridge runs on the Galaxy.
 
 Writes do not. Starting, recalling and collecting missions, travel and in-sector orders all
-answer `409 owner_offline` when the owning player is not in game, and the ship event feed
-records nothing then either. That is a vanilla limitation rather than a shortcut here:
-mission state lives in a player script, and captain missions do not tick for offline players
-in the base game.
+answer `409 owner_offline` when the owning player is not in game. That is a vanilla
+limitation rather than a shortcut here: mission state lives in a player script, and captain
+missions do not tick for offline players in the base game.
+
+The **event feed** is a player script too, but the question it asks is narrower than "is the
+key holder online". Alliance craft raise their callbacks on the Alliance object and every
+online member's agent registers against them, so an alliance fleet keeps recording while any
+one member is in game - whoever that is. Only personal craft go quiet when their own owner
+logs out. `recording` and `watchers` on the event feed say which case you are in.
+
+Ship *positions* need nobody at all: they come from the ship database, which is why the
+bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 
 ## Documentation
 
@@ -256,6 +305,14 @@ The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
 for t in bridge ships missions movement map shipevents; do lua5.4 tests/test_$t.lua; done
+```
+
+The bridge's history store is PHP and is tested the same way, against a throwaway
+directory:
+
+```bash
+docker run --rm -v "$PWD:/w" -w /w dunglas/frankenphp:1-php8.3-alpine \
+    php tests/test_history.php
 ```
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather

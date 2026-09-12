@@ -788,18 +788,31 @@ function M.addPlayer(index, name)
     return p
 end
 
-function M.addAlliance(index, name, memberIndex, privileges)
+-- `members` is every player index in the alliance; `memberIndex` is the one whose
+-- privileges are modelled and whose Player object gets an .alliance back-reference.
+-- They differ whenever a test needs a second member who is not the API caller, which is
+-- the case the recording check exists for.
+function M.addAlliance(index, name, memberIndex, privileges, members)
     local a = {index = index, name = name, isAlliance = true}
+    local roster = members or {memberIndex}
+
     function a:hasPrivilege(playerIndex, privilege)
         if playerIndex ~= memberIndex then return false end
         return privileges == nil or privileges[privilege] == true
     end
+
+    function a:getMembers()
+        return table.unpack(roster)
+    end
+
     addCraftApi(a)
     M.alliances[index] = a
 
-    if players[memberIndex] then
-        players[memberIndex].alliance = a
-        players[memberIndex].allianceIndex = index
+    for _, who in ipairs(roster) do
+        if players[who] then
+            players[who].alliance = a
+            players[who].allianceIndex = index
+        end
     end
 
     return a

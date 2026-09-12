@@ -67,18 +67,44 @@ function Ships.register(router)
         return detail
     end)
 
-    -- Events are captured by the owning player's agent script. Player scripts do not run
-    -- for a logged-out player, so a caller has to be able to tell "nothing happened" from
-    -- "nobody was watching".
-    local function isRecording(ctx, owner)
-        -- An alliance's craft are watched by the agent of whichever member is logged in,
-        -- so the question is about a player either way.
-        local index = owner.index
-        if owner.kind == "alliance" then index = ctx.playerIndex end
+    -- How many player agents are currently watching this craft.
+    --
+    -- Events are captured by a player agent script, and player scripts do not run for a
+    -- logged-out player, so a caller has to be able to tell "nothing happened" from
+    -- "nobody was watching". That is one question for a player's own craft and a
+    -- different one for an alliance's.
+    --
+    -- Alliance craft publish their ShipInfo callbacks on the *Alliance* object, not on
+    -- any member's Player, and every member's agent registers against it. So they are
+    -- watched while any one member is online - whoever that is, and whether or not it is
+    -- the player this API key belongs to. Asking only about the caller, which is what
+    -- this used to do, reported a fleet as unwatched while a fellow member was flying
+    -- next to it and the events were being recorded perfectly well.
+    local function onlineCount(indices)
+        local count = 0
 
-        local ok, online = pcall(function() return Server():isOnline(index) end)
+        for _, index in ipairs(indices) do
+            local ok, online = pcall(function() return Server():isOnline(index) end)
+            if ok and online == true then count = count + 1 end
+        end
 
-        return ok and online == true
+        return count
+    end
+
+    local function watchersFor(ctx, owner)
+        if owner.kind ~= "alliance" then return onlineCount({owner.index}) end
+
+        local members
+        local ok = pcall(function() members = {owner.faction:getMembers()} end)
+
+        -- getMembers is the documented call and the only thing standing between this and
+        -- a wrong answer, so if it gives nothing back, fall back to the old question -
+        -- the caller alone - rather than reporting a confident zero.
+        if not ok or type(members) ~= "table" or #members == 0 then
+            return onlineCount({ctx.playerIndex})
+        end
+
+        return onlineCount(members)
     end
 
     -- What the ship has actually been doing, as the game reported it.
@@ -112,6 +138,7 @@ function Ships.register(router)
         end
 
         local events, dropped = ShipEvents.read(owner.index, params.name, since, limit)
+        local watchers = watchersFor(ctx, owner)
 
         return
         {
@@ -122,10 +149,14 @@ function Ships.register(router)
             cursor = ShipEvents.cursor(),
             -- older events existed but did not fit; page back with a lower `since`
             dropped = dropped,
-            -- The callbacks are registered by the owner's player script, which the game
-            -- only runs while they are logged in. False here means the log is stale, not
+            -- The callbacks are registered by a player agent, which the game only runs
+            -- while that player is logged in. False here means the log is stale, not
             -- that the ship is idle.
-            recording = isRecording(ctx, owner),
+            recording = watchers > 0,
+            -- How many agents are in a position to record. For an alliance this counts
+            -- every member online, not just the caller, which is what makes an alliance
+            -- fleet keep its log while its owner is away.
+            watchers = watchers,
         }
     end)
 

@@ -27,14 +27,24 @@ html, body {
   margin: 0;
 }
 
+/* A column, with <main> taking whatever is left.
+ *
+ * This was a grid of five named rows, which quietly mis-assigned every one of them: the
+ * banner is display:none until something needs saying, so only four items were ever
+ * placed and each fell one row short - <main> landing on an `auto` row that sized to its
+ * content while the log dock got the 1fr and the leftover height. A flex column has no
+ * rows to fall out of step with, so an element appearing or disappearing cannot shift
+ * what anything else is.
+ */
 body {
   background: var(--bg);
   color: var(--text);
   font: 13px/1.45 var(--mono);
-  display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
+body > * { flex: none; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
 h1, h2, h3 { margin: 0; font-weight: 600; }
@@ -127,7 +137,7 @@ input[type=range] { accent-color: var(--accent); width: 100%; }
 .tab:hover { background: transparent; color: var(--text); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 
-main { overflow: hidden; min-height: 0; }
+main { flex: 1 1 auto; overflow: hidden; min-height: 0; }
 .view { display: none; height: 100%; overflow: hidden; }
 .view.active { display: grid; }
 
@@ -239,18 +249,41 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .map-legend { position: absolute; bottom: 10px; left: 10px; background: rgba(11,14,19,.86); border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px; font-size: 11px; color: var(--text-dim); }
 .map-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 .map-tip { position: absolute; pointer-events: none; background: rgba(17,22,31,.96); border: 1px solid var(--line-2); border-radius: 4px; padding: 6px 9px; font-size: 11.5px; max-width: 260px; z-index: 5; }
-#map-side { border-left: 1px solid var(--line); background: var(--bg-2); display: grid; grid-template-rows: auto 1fr; min-height: 0; }
+/* search, history, results - the last of which is the one that scrolls. */
+#map-side { border-left: 1px solid var(--line); background: var(--bg-2); display: grid; grid-template-rows: auto auto 1fr; min-height: 0; }
 #map-side-body { overflow: auto; min-height: 0; padding: 11px; }
 .hit { padding: 6px 8px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .hit:hover { background: var(--bg-3); }
 
 /* -------------------------------- log dock ------------------------------ */
 
-#logdock { border-top: 1px solid var(--line); background: var(--bg-2); display: grid; grid-template-rows: auto var(--dock); min-height: 0; }
-#logdock.collapsed { grid-template-rows: auto 0; }
-#logdock.collapsed #log-rows { display: none; }
-.dock-head { display: flex; align-items: center; gap: 9px; padding: 5px 10px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+/* The drawer opens *over* the view rather than shoving it upwards.
+ *
+ * It used to be a second grid row, so opening it took height away from <main> - which is
+ * fine for a list that reflows and wrong for the map, whose canvas has a fixed backing
+ * store and simply stretched to fill whatever box it was given. Only the head sits in the
+ * grid now, and the rows hang above it, so the layout is the same height open or shut and
+ * nothing behind it is ever resized.
+ */
+#logdock { position: relative; z-index: 40; border-top: 1px solid var(--line); background: var(--bg-2); }
+.dock-head { display: flex; align-items: center; gap: 9px; padding: 5px 10px; flex-wrap: wrap; }
 .dock-head input[type=search] { width: 190px; }
+#log-recording:not(:empty) {
+  font-size: 11px; padding: 2px 7px; border-radius: 3px;
+  border: 1px solid var(--line-2); background: var(--bg-3);
+}
+
+#log-rows {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  height: var(--dock);
+  background: var(--bg-2);
+  border-top: 1px solid var(--line);
+  box-shadow: 0 -12px 28px rgba(0, 0, 0, .5);
+}
+#logdock.collapsed #log-rows { display: none; }
 
 .log-rows { overflow: auto; min-height: 0; font-size: 12px; }
 .log-line { display: grid; grid-template-columns: 66px 130px 74px 1fr; gap: 10px; padding: 2px 10px; border-bottom: 1px solid rgba(35,45,61,.45); }
@@ -265,9 +298,24 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .log-line .dim { color: var(--text-mute); }
 .log-line .active { color: var(--accent); }
 
+/* ------------------------------- history -------------------------------- */
+
+.heat-scale { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
+.heat-scale i {
+  display: block; flex: 1; height: 6px; border-radius: 3px;
+  background: linear-gradient(90deg, rgba(53,200,224,.15), rgba(224,179,65,.75), rgba(224,92,92,.95));
+}
+
+/* A header row inside a subview: a title on the left, its controls on the right. */
+.subhead { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 10px; }
+.subhead h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); }
+
+/* Tables wide enough to need it scroll inside their card rather than stretching it. */
+.scroll-x { overflow-x: auto; }
+
 /* -------------------------------- toasts -------------------------------- */
 
-#toasts { position: fixed; right: 14px; bottom: calc(var(--dock) + 54px); display: flex; flex-direction: column; gap: 7px; z-index: 50; max-width: 380px; }
+#toasts { position: fixed; right: 14px; bottom: 48px; display: flex; flex-direction: column; gap: 7px; z-index: 50; max-width: 380px; }
 .toast { background: var(--bg-3); border: 1px solid var(--line-2); border-left-width: 3px; border-radius: 4px; padding: 8px 11px; font-size: 12px; box-shadow: 0 5px 18px rgba(0,0,0,.5); }
 .toast.good { border-left-color: var(--good); }
 .toast.bad  { border-left-color: var(--bad); }

@@ -33,6 +33,10 @@ services:
       # headers at all (which also blocks the console unless it is loaded from
       # /console/ on this same origin).
       CORS_ORIGIN: "${CORS_ORIGIN:-*}"
+      # The bridge's own history store - see bridge/src/history.php. Set HISTORY_DIR to
+      # "" to keep no history at all.
+      HISTORY_DIR: "${HISTORY_DIR:-/history}"
+      HISTORY_DAYS: "${HISTORY_DAYS:-30}"
 
     # moddata only, so a bridge process that misbehaves still cannot reach saves or the
     # globals file the API keys live in.
@@ -56,6 +60,11 @@ services:
       #
       # Start the game server before this container, so these exist and belong to it.
       - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata:/galaxy/moddata
+      # Where the bridge keeps its durable copy of ship movement and events. A named
+      # volume rather than a path under the galaxy: that tree belongs to the mod, which
+      # re-creates its own directories on a timer, and this data outlives any one galaxy
+      # restart. Delete the volume to throw the history away.
+      - history:/history
       - caddy_data:/data
       - caddy_config:/config
 
@@ -87,12 +96,14 @@ services:
   init:
     image: dunglas/frankenphp:1-php8.3-alpine
     user: root
-    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config"]
+    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config", "/history"]
     restart: "no"
     volumes:
       - caddy_data:/data
       - caddy_config:/config
+      - history:/history
 
 volumes:
   caddy_data:
   caddy_config:
+  history:

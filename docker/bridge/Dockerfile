@@ -9,3 +9,8 @@ RUN apk add --no-cache libcap \
 
 COPY php.ini /usr/local/etc/php/conf.d/bridge.ini
 COPY public/ /app/public/
+
+# Outside the web root on purpose. Caddy's php_server executes any .php file it can find
+# under /app/public, so a library that only makes sense when index.php includes it does
+# not belong there.
+COPY src/ /app/src/

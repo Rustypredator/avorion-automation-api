@@ -89,6 +89,8 @@
 
         <nav class="subtabs">
           <button class="subtab active" data-sub="overview">Overview</button>
+          <button class="subtab" data-sub="cargo">Cargo</button>
+          <button class="subtab" data-sub="loadout">Loadout</button>
           <button class="subtab" data-sub="mission">Mission</button>
           <button class="subtab" data-sub="orders">Orders</button>
           <button class="subtab" data-sub="travel">Travel</button>
@@ -97,6 +99,8 @@
         </nav>
 
         <div class="subview active" data-sub="overview"><div id="sv-overview"></div></div>
+        <div class="subview" data-sub="cargo"><div id="sv-cargo"></div></div>
+        <div class="subview" data-sub="loadout"><div id="sv-loadout"></div></div>
         <div class="subview" data-sub="mission"><div id="sv-mission"></div></div>
         <div class="subview" data-sub="orders"><div id="sv-orders"></div></div>
         <div class="subview" data-sub="travel"><div id="sv-travel"></div></div>
@@ -118,6 +122,8 @@
         <label class="check"><input id="map-show-ships" type="checkbox" checked><span>craft</span></label>
         <label class="check"><input id="map-show-belts" type="checkbox" checked><span>belts</span></label>
         <label class="check"><input id="map-show-unvisited" type="checkbox" checked><span>unvisited</span></label>
+        <label class="check" title="Where this fleet has spent its time, from the bridge's own history"><input id="map-show-heat" type="checkbox"><span>heatmap</span></label>
+        <label class="check" title="The path each craft has been seen to take"><input id="map-show-tracks" type="checkbox"><span>tracks</span></label>
         <span id="map-status" class="muted"></span>
       </div>
     </div>
@@ -130,6 +136,24 @@
           <button id="map-search-go" class="ghost small">search</button>
         </div>
       </div>
+      <div id="map-history" class="pane-head">
+        <div class="pane-head-row">
+          <span class="muted">Fleet history</span>
+          <span id="history-status" class="mute2"></span>
+        </div>
+        <div class="seg" id="history-window" data-value="86400">
+          <button data-v="3600">1h</button>
+          <button data-v="86400" class="on">24h</button>
+          <button data-v="604800">7d</button>
+          <button data-v="0">all</button>
+        </div>
+        <div class="pane-head-row">
+          <label class="check" title="Show only the craft selected on the Fleet tab"><input id="history-mine" type="checkbox"><span>selected craft only</span></label>
+          <button id="history-refresh" class="ghost small">reload</button>
+        </div>
+        <div id="history-legend" class="mute2"></div>
+      </div>
+
       <div id="map-side-body"></div>
     </aside>
   </section>
@@ -154,7 +178,7 @@
     <span id="log-recording" class="muted"></span>
     <span class="spacer"></span>
     <button id="log-clear" class="ghost small">clear</button>
-    <button id="log-collapse" class="ghost small">&#9660;</button>
+    <button id="log-collapse" class="ghost small" title="Open or close the log drawer">&#9650;</button>
   </div>
   <div id="log-rows" class="log-rows"></div>
 </section>

@@ -323,9 +323,15 @@ loop:
 
 - Sequence numbers are **global, not per ship**, so one cursor works across a whole fleet.
 - `idle` is the field to watch for "this ship is free and can be given work".
-- `recording: false` means the owner is logged out, so a quiet log proves nothing.
+- `recording: false` means no player agent is in a position to see the callbacks fire, so a
+  quiet log proves nothing. For a personal craft that is its owner being logged out. For an
+  **alliance** craft it takes every member being out: the callbacks are raised on the
+  Alliance object and every online member's agent registers against them, so an alliance
+  fleet keeps recording while any one member is in game.
 - The log is in memory, capped at 200 events per ship, and empty after a server restart. It
-  is a recent-activity feed, not an audit trail - persist anything you need to keep.
+  is a recent-activity feed, not an audit trail - persist anything you need to keep. The
+  bundled bridge already does, out of the answers it relays; see *Bridge-local endpoints*
+  in [docs/api.md](api.md) for the shape, or lift the approach into your own bridge.
 
 ### Do not poll harder than the mod moves
 

@@ -21,10 +21,26 @@ const TIMEOUT = 30.0;
 // Waiting on a file is not CPU time, but do not let the runtime cut a call short.
 set_time_limit(120);
 
+require __DIR__ . '/../src/history.php';
+
 $galaxy = rtrim(getenv('GALAXY_DIR') ?: '/galaxy', '/');
 $root = $galaxy . '/moddata/AutomationAPI';
 $requestDir = $root . '/requests';
 $responseDir = $root . '/responses';
+
+/*
+ * Where the bridge keeps its own durable copy of what it has relayed - see src/history.php
+ * for why it exists and what it can and cannot know. Deliberately NOT under the galaxy
+ * mount: that tree belongs to the mod, which re-creates its own directories and would be
+ * within its rights to clean up anything else it finds there.
+ *
+ * Set HISTORY_DIR to an empty string to keep no history at all; nothing else changes.
+ */
+$historyDir = getenv('HISTORY_DIR');
+if ($historyDir === false) {
+    $historyDir = '/history';
+}
+$historyDir = rtrim($historyDir, '/');
 
 /**
  * Cross-origin access, so a browser page - the bundled console, or anything else - can
@@ -77,6 +93,35 @@ function reply(int $status, mixed $body): never
 function fail(int $status, string $code, string $message): never
 {
     reply($status, ['error' => ['code' => $code, 'message' => $message]]);
+}
+
+/**
+ * Folds one relayed answer into the history store, if it is one of the two the store is
+ * built from: the fleet listing, which carries every craft's position and keeps working
+ * with everyone logged out, and a ship's event feed.
+ *
+ * Wrapped whole in a try/catch. A history that cannot be written is a lost overlay; a
+ * history that takes the API call down with it is an outage. The caller's answer has
+ * already been decided by the time this runs and must reach them either way.
+ */
+function record(History $history, string $path, stdClass $answer): void
+{
+    try {
+        if ($path === '/ships') {
+            $history->recordShips($answer);
+            return;
+        }
+
+        // /ships/<name>/events, with the name still percent-encoded.
+        if (preg_match('#^/ships/([^/]+)/events$#', $path, $found) === 1) {
+            $ship = $answer->ship ?? rawurldecode($found[1]);
+            if (is_string($ship) && $ship !== '') {
+                $history->recordEvents($ship, $answer);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('AutomationAPI bridge: history write failed: ' . $e->getMessage());
+    }
 }
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -157,6 +202,65 @@ if (is_string($rawQuery) && $rawQuery !== '') {
     $query = array_filter($query, 'is_string');
 }
 
+/*
+ * /history is the bridge's own, and is answered here rather than forwarded.
+ *
+ * Everything else in this file is deliberately dumb - the mod owns routing, auth and
+ * serialization, and this process only moves bytes. The history is the one exception, and
+ * it is one because it cannot live on the other side: the mod's log is a ring buffer in
+ * server memory, and growing a file on the game's own tick to fix that would be paying for
+ * a month of travel data with server frame time. So the copy lives here, built out of
+ * answers the bridge was relaying anyway.
+ *
+ * No key check happens first, and none is needed. The store is addressed by a hash of the
+ * key, so an unknown key reads an empty history rather than anyone else's, and nothing is
+ * ever written except off the back of a call the mod itself answered.
+ */
+if (str_starts_with($path, '/history')) {
+    if ($historyDir === '') {
+        fail(404, 'history_disabled',
+            'This bridge keeps no history: HISTORY_DIR is set empty. Unset it to turn the '
+            . 'store back on, or read the mod\'s own in-memory log at '
+            . '/ships/{name}/events instead.');
+    }
+
+    $history = new History($historyDir, $key);
+    $what = rawurldecode(substr($path, strlen('/history')));
+
+    $filter = [
+        'ship' => (string) ($query['ship'] ?? ''),
+        'owner' => (string) ($query['owner'] ?? ''),
+        'from' => (int) ($query['from'] ?? 0),
+        'to' => (int) ($query['to'] ?? 0),
+        'limit' => max(0, min(20000, (int) ($query['limit'] ?? 2000))),
+    ];
+
+    if ($method === 'GET' && ($what === '' || $what === '/' || $what === '/summary')) {
+        reply(200, $history->summary());
+    }
+
+    if ($method === 'GET' && $what === '/visits') {
+        reply(200, ['visits' => $history->visits($filter)]);
+    }
+
+    if ($method === 'GET' && $what === '/heatmap') {
+        reply(200, $history->heatmap($filter));
+    }
+
+    if ($method === 'GET' && $what === '/events') {
+        reply(200, ['events' => $history->events($filter)]);
+    }
+
+    if ($method === 'POST' && $what === '/clear') {
+        reply(200, $history->clear($filter['ship'] !== '' ? $filter['ship'] : null));
+    }
+
+    fail(404, 'no_such_route', sprintf(
+        'The bridge serves GET /history/summary, /history/visits, /history/heatmap and '
+        . '/history/events, and POST /history/clear. It does not serve %s %s.',
+        $method, $what === '' ? '/history' : '/history' . $what));
+}
+
 // Caddy caps the body as well, but that cap simply makes the read come up short, so
 // the size has to be caught here to produce an honest error. The whole envelope has to
 // stay under the mod's 256 KB file limit, so leave room for the key, path and query.
@@ -230,7 +334,17 @@ while (microtime(true) < $deadline) {
     @unlink($responseFile);
 
     $status = isset($payload->status) && is_int($payload->status) ? $payload->status : 500;
-    reply($status, $payload->body ?? new stdClass());
+    $answer = $payload->body ?? new stdClass();
+
+    // Keep a durable copy of the two answers worth keeping, on the way past. A successful
+    // reply is also proof the mod recognised this key, which is the only authentication
+    // the store gets - and the reason nothing is written before this line.
+    if ($historyDir !== '' && $method === 'GET' && $status >= 200 && $status < 300
+        && $answer instanceof stdClass) {
+        record(new History($historyDir, $key), $path, $answer);
+    }
+
+    reply($status, $answer);
 }
 
 /**

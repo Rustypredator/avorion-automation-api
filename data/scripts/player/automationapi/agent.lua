@@ -25,6 +25,12 @@ local ORDERCHAIN_SCRIPT = "data/scripts/entity/orderchain.lua"
 local POLL_INTERVAL = 0.25
 local sinceLastPoll = 0
 
+-- How often the agent re-reads which alliance the player belongs to, in seconds. Cheap
+-- - one field read - but there is no callback for joining or leaving one, so it is a
+-- poll or nothing.
+local ALLIANCE_RECHECK_INTERVAL = 30
+local sinceAllianceCheck = 0
+
 -- startCommand refuses until Simulation holds an analysis it ran itself, and offers no
 -- way to learn when one lands, so it is retried until it takes.
 local START_FIRST_DELAY = 1.0
@@ -311,19 +317,39 @@ function AutomationApiAgent.onAllianceShipStatusMessageUpdated(name, status, arg
     forward(alliance.index, name, "status", Serialize.message(status, args) or {})
 end
 
+-- Which alliance this agent currently holds callbacks on, so joining or leaving one
+-- mid-session is noticed. nil means none.
+local watchedAlliance
+
+-- Alliance craft publish on the Alliance object, not on any member's Player, so every
+-- online member's agent registers here and any one of them is enough to keep an alliance
+-- fleet's log running. Duplicate pushes from two members are collapsed by ShipEvents,
+-- which drops an event identical to the one before it.
+--
+-- Membership is re-checked rather than read once at attach: a player who joins an
+-- alliance an hour into a session would otherwise record nothing for it until relog, and
+-- they are usually the one who then asks why the fleet looks idle.
+local function syncAllianceCallbacks()
+    local alliance = Player().alliance
+    local index = alliance and alliance.index or nil
+
+    if index == watchedAlliance then return end
+
+    watchedAlliance = index
+    if not alliance then return end
+
+    alliance:registerCallback("onShipOrderInfoUpdated", "onAllianceShipOrderInfoUpdated")
+    alliance:registerCallback("onShipStatusMessageUpdated",
+                              "onAllianceShipStatusMessageUpdated")
+end
+
 local function registerEventCallbacks()
     local player = Player()
 
     player:registerCallback("onShipOrderInfoUpdated", "onPlayerShipOrderInfoUpdated")
     player:registerCallback("onShipStatusMessageUpdated", "onPlayerShipStatusMessageUpdated")
 
-    -- Alliance craft publish on the alliance object, not on any member's.
-    local alliance = player.alliance
-    if alliance then
-        alliance:registerCallback("onShipOrderInfoUpdated", "onAllianceShipOrderInfoUpdated")
-        alliance:registerCallback("onShipStatusMessageUpdated",
-                                  "onAllianceShipStatusMessageUpdated")
-    end
+    syncAllianceCallbacks()
 end
 
 function AutomationApiAgent.initialize()
@@ -338,6 +364,16 @@ function AutomationApiAgent.update(timeStep)
     if sinceLastPoll < POLL_INTERVAL then return end
     local elapsed = sinceLastPoll
     sinceLastPoll = 0
+
+    sinceAllianceCheck = sinceAllianceCheck + elapsed
+    if sinceAllianceCheck >= ALLIANCE_RECHECK_INTERVAL then
+        sinceAllianceCheck = 0
+
+        local synced, syncErr = pcall(syncAllianceCallbacks)
+        if not synced then
+            logError("alliance callbacks not registered: %s", tostring(syncErr))
+        end
+    end
 
     local ok, err = pcall(function()
         local results = {}

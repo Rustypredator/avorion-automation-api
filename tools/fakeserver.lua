@@ -25,6 +25,80 @@ dofile("data/scripts/galaxy/automationapi/bridge.lua")
 local Bridge = AutomationApiBridge
 
 Mock.addPlayer(1, os.getenv("MOCK_PLAYER") or "TestPilot")
+
+-- A fleet, so /ships answers with something. The bridge's history store is fed by that
+-- answer, and a player with an empty fleet exercises none of it.
+--
+-- One craft is fully kitted out - captain, crew, cargo, turrets, subsystems, fighters -
+-- because the console's detail tabs are all conditional on those being present, and an
+-- empty fleet renders every one of them as an empty state that proves nothing.
+local crew = {}
+function crew:getMaxSize() return 220 end
+function crew:getNumMembers() return 180 end
+function crew:getWorkForce() return {[{value = 0}] = 3.5} end
+function crew:getNumMembersByProfession()
+    return {[{value = 0}] = 8, [{value = 5}] = 120, [{value = 3}] = 52}
+end
+
+local function good(name, price, size, flags)
+    local g = {name = name, plural = name, price = price, size = size}
+    for key, value in pairs(flags or {}) do g[key] = value end
+    return g
+end
+
+Mock.addShip(1, "Ore Hound",
+{
+    x = 5, y = 5, statusText = "Idle",
+    captain = {name = "Vex", nickName = "The Patient", displayName = "Vex the Patient",
+               level = 12, tier = 2, experience = 5400, experiencePercentage = 0.62,
+               salary = 2400, primaryClass = 4, secondaryClass = 6,
+               getPerks = function() return 1, 5, 9 end},
+    crew = crew, crewOk = true,
+    cargo =
+    {
+        [good("Iron Ore", 10, 1)] = 2400,
+        [good("Titanium Ore", 24, 1)] = 860,
+        [good("Scrap Metal", 6, 2)] = 410,
+        [good("Military Rations", 90, 1, {illegal = true})] = 60,
+        [good("Explosive Charge", 320, 3, {dangerous = true})] = 18,
+        [good("Stolen Goods", 140, 1, {stolen = true, suspicious = true})] = 7,
+    },
+    cargoCapacity = 6000, cargoFree = 1100,
+    range = 9.5, canPassRifts = false, cooldown = 14,
+    shields = 42000, shieldPct = 0.72, hp = 138000, hpPct = 0.91,
+    -- Deliberately short, so the new energy bar has an over-budget case to draw.
+    energyRequired = 5200, energyProduced = 4100,
+    usableError = 5,
+    turretDps = 4200, fighterDps = 1600,
+    turrets =
+    {
+        [{weaponName = "R-Mining Laser", category = WeaponCategory.Mining,
+          rarity = {name = "Exotic"}, material = {name = "Xanion"}, armed = false,
+          dps = 0, reach = 1.4, slots = 1,
+          stoneRawEfficiency = 0, stoneRefinedEfficiency = 0.42,
+          metalRawEfficiency = 0, metalRefinedEfficiency = 0.61}] = 4,
+        [{weaponName = "Railgun", category = WeaponCategory.Armed,
+          rarity = {name = "Rare"}, material = {name = "Trinium"}, armed = true,
+          dps = 1050, reach = 2.1, slots = 2}] = 4,
+    },
+    systems =
+    {
+        [{script = "data/scripts/systems/miningsystem.lua", name = "Mining System",
+          rarity = {name = "Exotic"}}] = 1,
+        [{script = "data/scripts/systems/cargoextension.lua", name = "Cargo Extension",
+          rarity = {name = "Rare"}}] = 2,
+    },
+    hangar =
+    {
+        {name = "Alpha", getFighters = function() return 1, 2, 3, 4 end},
+        {name = "Bravo", getFighters = function() return 1, 2 end},
+    },
+    blocks = 4820, planValue = 12500000, reconstructionValue = 940000, icon = "mining",
+})
+
+Mock.addShip(1, "Tug", {x = -3, y = 12, statusText = "Idle"})
+Mock.addShip(1, "Home Base", {type = EntityType.Station, x = 0, y = 0})
+
 Bridge.initialize()
 
 local key = Auth.createKey(1, "fakeserver")
@@ -39,9 +113,36 @@ io.stdout:flush()
 -- expire in real time rather than never.
 local step = Config.pollInterval
 
+-- One craft wanders, so anything watching movement - the bridge's history store, the
+-- console's tracks and heatmap - has something other than a parked fleet to show. A fleet
+-- that never moves exercises the dedupe path and nothing else.
+local WANDER_EVERY = tonumber(os.getenv("MOCK_WANDER") or "4")
+local wanderer = Mock.getShip(1, "Tug")
+local sinceWander = 0
+
+math.randomseed(os.time())
+
+local function wander()
+    if not wanderer then return end
+
+    wanderer.x = wanderer.x + math.random(-2, 2)
+    wanderer.y = wanderer.y + math.random(-2, 2)
+    wanderer.statusText = string.format("Flying to (%d:%d)", wanderer.x, wanderer.y)
+
+    Bridge.pushShipEvent(1, "Tug", "status", {text = wanderer.statusText})
+end
+
 while true do
     os.execute("sleep " .. step)
     Mock.advanceClock(step)
+
+    if WANDER_EVERY > 0 then
+        sinceWander = sinceWander + step
+        if sinceWander >= WANDER_EVERY then
+            sinceWander = 0
+            pcall(wander)
+        end
+    end
 
     local ok, err = pcall(Bridge.update, step)
     if not ok then

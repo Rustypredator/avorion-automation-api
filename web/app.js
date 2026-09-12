@@ -17,12 +17,13 @@
     key: 'avoconsole.key',
     remember: 'avoconsole.remember',
     filters: 'avoconsole.filters',
-    dock: 'avoconsole.dock'
+    dock: 'avoconsole.dock',
+    history: 'avoconsole.history'
   };
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
      pushes events as they happen, so polling faster buys nothing but queue depth. */
-  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45 };
+  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60 };
 
   var S = {
     connected: false,
@@ -54,6 +55,12 @@
 
     galaxy: null,
     lastRoute: null,
+
+    /* The bridge's own history store. Separate from S.events, which is the mod's
+       in-memory ring buffer read live: the two overlap but neither contains the other. */
+    history: { window: 86400, selectedOnly: false, summary: null, loaded: false },
+    shipHistory: {},
+
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
     busy: {}
   };
@@ -183,10 +190,25 @@
     setSeg('#filter-type', S.filters.type);
     setSeg('#filter-owner', S.filters.owner);
 
-    if (localStorage.getItem(LS.dock) === 'collapsed') {
-      $('#logdock').classList.add('collapsed');
-      $('#log-collapse').innerHTML = '&#9650;';
-    }
+    try {
+      var prefs = JSON.parse(localStorage.getItem(LS.history) || 'null');
+      if (prefs) {
+        S.history.window = Number(prefs.window) || 0;
+        S.history.selectedOnly = prefs.selectedOnly === true;
+        GalaxyMap.show.heat = prefs.heat === true;
+        GalaxyMap.show.tracks = prefs.tracks === true;
+      }
+    } catch (e) { /* as above: a stale value is not worth failing over */ }
+
+    setSeg('#history-window', String(S.history.window));
+    $('#history-mine').checked = S.history.selectedOnly;
+    $('#map-show-heat').checked = GalaxyMap.show.heat;
+    $('#map-show-tracks').checked = GalaxyMap.show.tracks;
+
+    /* Shut unless it was deliberately opened. The drawer covers the view it opens over,
+       so leaving it open by default means every new session starts with a third of the
+       map hidden behind a log nobody asked to read. */
+    setDock(localStorage.getItem(LS.dock) === 'open');
   }
 
   function saveConnection() {
@@ -230,9 +252,11 @@
         // A fresh session has no cursors, so the first sweep takes each ship's recent
         // history rather than only what happens from now on.
         S.cursors = {};
+        S.shipHistory = {};
         startLoops();
         refreshFleet();
         loadGalaxy();
+        loadHistory(true);
       })
       .catch(function (error) {
         S.connected = false;
@@ -285,7 +309,8 @@
     if (!(p.player && p.player.online)) {
       banner('warn', 'The owning player is logged out. Every read still works, but '
              + 'mission starts, recalls, collects, travel and orders answer '
-             + '<b>409 owner_offline</b>, and no ship events are recorded.');
+             + '<b>409 owner_offline</b>. Personal craft record no events either; '
+             + 'alliance craft keep recording as long as any member is in game.');
       return;
     }
 
@@ -319,6 +344,10 @@
     loop('detail', EVERY.detail, function () {
       if (S.selected) { return loadDetail(true); }
     });
+    loop('history', EVERY.history, function () {
+      // Cheap when nothing draws it: loadHistory returns without a call in that case.
+      if (historyWanted()) { return loadHistory(false); }
+    });
   }
 
   function setPaused(paused) {
@@ -348,6 +377,14 @@
     });
   }
 
+  function setDock(open) {
+    $('#logdock').classList.toggle('collapsed', !open);
+    $('#log-collapse').innerHTML = open ? '&#9660;' : '&#9650;';
+    $('#log-collapse').title = open ? 'Close the log drawer' : 'Open the log drawer';
+    localStorage.setItem(LS.dock, open ? 'open' : 'collapsed');
+    if (open) { drawLog(); }
+  }
+
   function showView(name) {
     $$('.tab').forEach(function (t) { t.classList.toggle('active', t.dataset.view === name); });
     $$('.view').forEach(function (v) { v.classList.toggle('active', v.id === 'view-' + name); });
@@ -361,7 +398,9 @@
     $$('.subview').forEach(function (v) { v.classList.toggle('active', v.dataset.sub === name); });
 
     if (name === 'mission' && S.selected && !S.catalog) { loadCatalog(); }
-    if (name === 'log') { renderShipLog(); }
+    if (name === 'cargo') { renderCargo(); }
+    if (name === 'loadout') { renderLoadout(); }
+    if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
     if (name === 'raw') { renderRaw(); }
   }
 
@@ -450,6 +489,7 @@
   }
 
   function select(name) {
+    var changed = S.selected !== name;
     S.selected = name;
     S.detail = null;
     S.mission = null;
@@ -471,13 +511,18 @@
     $('#ship-name').textContent = name;
     $('#ship-sub').textContent = 'loading…';
     $('#sv-overview').innerHTML = '<p class="muted">loading…</p>';
+    $('#sv-cargo').innerHTML = '<p class="muted">loading…</p>';
+    $('#sv-loadout').innerHTML = '<p class="muted">loading…</p>';
 
     loadDetail();
     loadMission();
     if (S.sub === 'mission') { loadCatalog(); }
+    if (S.sub === 'log') { loadShipHistory(name); }
     renderOrders();
     renderTravel();
     renderShipLog();
+
+    if (changed && S.history.selectedOnly && historyWanted()) { loadHistory(true); }
   }
 
   function loadDetail(background) {
@@ -491,6 +536,8 @@
         S.detail = body;
         renderShipHead();
         renderOverview();
+        renderCargo();
+        renderLoadout();
         if (S.sub === 'raw') { renderRaw(); }
       })
       .catch(function (error) {
@@ -527,15 +574,27 @@
 
     var badges = availabilityBadge(d) + usableBadge(d);
     if (S.recording[d.name] === false) {
-      badges += '<span class="badge warn" title="Player scripts do not run for a '
-             + 'logged-out player, so nothing is being recorded.">not recording</span>';
+      badges += '<span class="badge warn" title="No player whose agent watches this craft '
+             + 'is online, and the callbacks the log is built from only fire in a running '
+             + 'player script. Alliance craft are watched by any member who is in game.">'
+             + 'not recording</span>';
     }
     if (d.captain) { badges += '<span class="badge info">' + esc(captainLabel(d.captain)) + '</span>'; }
     $('#ship-badges').innerHTML = badges;
   }
 
+  /* Enum-ish lists arrive as [{value, name}], not as strings - see the CaptainClasses
+     handling in shipdata.lua. Joining them raw is where the [object Object] came from. */
+  function names(list) {
+    return (list || []).map(function (entry) {
+      if (entry === null || entry === undefined) { return ''; }
+      if (typeof entry === 'object') { return String(entry.name || entry.value || ''); }
+      return String(entry);
+    }).filter(Boolean);
+  }
+
   function captainLabel(captain) {
-    var classes = (captain.classes || []).join('/');
+    var classes = names(captain.classes).join('/');
     return (classes || 'Captain') + (captain.level != null ? ' L' + captain.level : '');
   }
 
@@ -564,13 +623,24 @@
     var durability = d.durability || {};
     var shields = d.shields || {};
     var energy = d.energy || {};
+
+    // Energy is a draw against a supply rather than a level in a tank, so the bar reads
+    // as how much of what the ship generates its systems are asking for. Over 100% is
+    // the interesting case - it is what BadEnergy on the usable check means - so the bar
+    // is clamped and the number left unclamped beside it.
+    var draw = energy.produced ? (energy.required / energy.produced) * 100 : (energy.required ? 100 : 0);
+
     cards.push(meterCard('Condition',
       '<div class="mute2">hull ' + pct(durability.percentage) + ' of ' + num(durability.max) + '</div>'
       + bar(durability.percentage, pctValue(durability.percentage) < 40 ? 'bad' : 'good')
       + '<div class="mute2">shields ' + pct(shields.percentage) + ' of ' + num(shields.max) + '</div>'
       + bar(shields.percentage, 'info')
+      + '<div class="mute2">energy ' + num(draw, 0) + '% of '
+        + num(energy.produced) + ' produced</div>'
+      + bar(draw, energy.sufficient === false ? 'bad' : (draw > 85 ? 'warn' : 'good'))
       + kv([
-        ['energy', (energy.sufficient ? '<span class="badge good">ok</span>' : '<span class="badge bad">short</span>')
+        ['energy', (energy.sufficient === false
+            ? '<span class="badge bad">short</span>' : '<span class="badge good">ok</span>')
           + ' ' + num(energy.required) + '/' + num(energy.produced)],
         ['damaged', durability.damaged ? '<span class="badge warn">yes</span>' : 'no'],
         ['malus', durability.malusReason ? esc(durability.malusReason) + ' ×' + num(durability.malusFactor, 2) : '—']
@@ -580,12 +650,12 @@
     if (d.captain) {
       var c = d.captain;
       cards.push(meterCard('Captain', kv([
-        ['name', esc(c.name || '—')],
-        ['classes', esc((c.classes || []).join(', ') || '—')],
+        ['name', esc(c.displayName || c.name || '—')],
+        ['classes', esc(names(c.classes).join(', ') || '—')],
         ['level', num(c.level) + (c.tier != null ? ' (tier ' + num(c.tier) + ')' : '')],
         ['experience', pct(c.experiencePercentage)],
         ['salary', num(c.salary) + ' ¢'],
-        ['perks', esc((c.perks || []).join(', ') || '—')]
+        ['perks', esc(names(c.perks).join(', ') || '—')]
       ])));
     } else {
       cards.push(meterCard('Captain',
@@ -613,21 +683,20 @@
         : '')));
 
     /* --- cargo -------------------------------------------------------- */
+    /* Usage only. The manifest lives on its own tab: a freighter carrying forty goods
+       turned this card into most of the page, which is the one thing an overview may
+       not do. */
     var cargo = d.cargo || {};
-    var goods = (cargo.goods || []).slice().sort(function (a, b) {
-      return (b.amount || 0) - (a.amount || 0);
-    });
+    var goods = cargoGoods(d);
     cards.push(meterCard('Cargo',
       '<div class="mute2">' + num(cargo.used) + ' of ' + num(cargo.capacity) + ' used</div>'
-      + bar(cargo.capacity ? (cargo.used / cargo.capacity) : 0,
-            cargo.free === 0 ? 'warn' : 'info')
-      + (goods.length
-        ? '<table style="margin-top:8px"><tbody>' + goods.slice(0, 14).map(function (g) {
-            return '<tr><td>' + esc(g.name || g.good || '?') + '</td>'
-              + '<td class="num">' + num(g.amount) + '</td></tr>';
-          }).join('') + '</tbody></table>'
-          + (goods.length > 14 ? '<div class="mute2">+' + (goods.length - 14) + ' more</div>' : '')
-        : '<div class="mute2">empty</div>')));
+      + cargoBar(cargo)
+      + kv([
+        ['free', num(cargo.free)],
+        ['goods', goods.length
+          ? num(goods.length) + ' <a href="#" data-sub-link="cargo">manifest</a>'
+          : '<span class="mute2">empty</span>']
+      ])));
 
     /* --- hyperspace --------------------------------------------------- */
     var hyper = d.hyperspace || {};
@@ -645,7 +714,10 @@
       ['fighter dps', num(dps.fighters)],
       ['total', '<b>' + num(dps.total) + '</b>'],
       ['turret groups', num((d.turrets || []).length)],
-      ['squads', num((d.hangar || []).length)]
+      ['subsystems', num((d.systems || []).length)],
+      // hangar is {squads, fighters}, not an array - see hangarOf() in shipdata.lua.
+      ['squads', num(squadsOf(d).length)
+        + ' <a href="#" data-sub-link="loadout">loadout</a>']
     ])));
 
     /* --- value & requirements ----------------------------------------- */
@@ -667,51 +739,6 @@
       ['icon', esc(d.icon || '—')]
     ])));
 
-    /* --- turrets ------------------------------------------------------ */
-    var turrets = d.turrets || [];
-    if (turrets.length) {
-      cards.push('<div class="card wide"><h3>Turrets</h3><table>'
-        + '<thead><tr><th></th><th>Turret</th><th>Category</th><th>Rarity</th>'
-        + '<th class="num">DPS</th><th class="num">Mining</th><th>Armed</th></tr></thead><tbody>'
-        + turrets.map(function (t) {
-            var mining = t.miningEfficiency != null ? pct(t.miningEfficiency)
-                       : (t.efficiency != null ? pct(t.efficiency) : '—');
-            return '<tr><td class="num">' + num(t.count || 1) + '×</td>'
-              + '<td>' + esc(t.name || '?') + '</td>'
-              + '<td class="mute2">' + esc(t.category || '') + '</td>'
-              + '<td class="mute2">' + esc(t.rarity || '') + '</td>'
-              + '<td class="num">' + num(t.dps) + '</td>'
-              + '<td class="num">' + mining + '</td>'
-              + '<td>' + (t.armed ? 'yes' : '<span class="mute2">no</span>') + '</td></tr>';
-          }).join('')
-        + '</tbody></table></div>');
-    }
-
-    /* --- systems & hangar --------------------------------------------- */
-    var systems = d.systems || [];
-    if (systems.length) {
-      cards.push('<div class="card wide"><h3>Subsystems</h3><table><tbody>'
-        + systems.map(function (sys) {
-            return '<tr><td>' + esc(sys.name || '?') + '</td>'
-              + '<td class="mute2">' + esc(sys.rarity || '') + '</td>'
-              + '<td class="num mute2">' + (sys.count ? sys.count + '×' : '') + '</td></tr>';
-          }).join('')
-        + '</tbody></table></div>');
-    }
-
-    var hangar = d.hangar || [];
-    if (hangar.length) {
-      cards.push('<div class="card wide"><h3>Hangar</h3><table>'
-        + '<thead><tr><th>Squad</th><th class="num">Fighters</th><th>Type</th></tr></thead><tbody>'
-        + hangar.map(function (sq) {
-            return '<tr><td>' + esc(sq.name || '?') + '</td>'
-              + '<td class="num">' + num(sq.fighters != null ? sq.fighters : sq.count)
-              + (sq.capacity != null ? ' / ' + num(sq.capacity) : '') + '</td>'
-              + '<td class="mute2">' + esc(sq.type || sq.category || '') + '</td></tr>';
-          }).join('')
-        + '</tbody></table></div>');
-    }
-
     var statusMessage = message(d.statusMessage);
     var header = statusMessage
       ? '<div class="okbox"><b>' + esc(statusMessage) + '</b>'
@@ -720,6 +747,167 @@
       : '';
 
     $('#sv-overview').innerHTML = header + '<div class="cards">' + cards.join('') + '</div>';
+  }
+
+  /* ================================= CARGO ================================= */
+
+  function cargoGoods(d) {
+    return ((d.cargo || {}).goods || []).slice().sort(function (a, b) {
+      return (b.amount || 0) - (a.amount || 0);
+    });
+  }
+
+  function cargoBar(cargo) {
+    var used = cargo.capacity ? (cargo.used / cargo.capacity) : 0;
+    return bar(used, cargo.free === 0 ? 'bad' : (used > 0.85 ? 'warn' : 'info'));
+  }
+
+  function renderCargo() {
+    var d = S.detail;
+    if (!d) { return; }
+
+    var cargo = d.cargo || {};
+    var goods = cargoGoods(d);
+    var total = goods.reduce(function (sum, g) { return sum + (g.amount || 0); }, 0);
+
+    /* The bar stays on the overview as well - it is a one-line health reading. What moved
+       here is the manifest, which on a hauler is longer than everything else put together. */
+    var head = '<div class="card wide"><h3>Hold</h3>'
+      + '<div class="mute2">' + num(cargo.used) + ' of ' + num(cargo.capacity)
+      + ' used &middot; ' + num(cargo.free) + ' free</div>'
+      + cargoBar(cargo)
+      + '</div>';
+
+    var body;
+    if (!goods.length) {
+      body = '<div class="card wide"><h3>Manifest</h3>'
+        + '<div class="mute2">The hold is empty.</div></div>';
+    } else {
+      body = '<div class="card wide"><h3>Manifest &mdash; ' + num(goods.length)
+        + ' goods, ' + num(total) + ' units</h3><div class="scroll-x"><table>'
+        + '<thead><tr><th>Good</th><th class="num">Amount</th><th class="num">Volume</th>'
+        + '<th class="num">Unit price</th><th>Flags</th></tr></thead><tbody>'
+        + goods.map(function (g) {
+            var flags = [];
+            if (g.dangerous) { flags.push('<span class="badge bad">dangerous</span>'); }
+            if (g.illegal) { flags.push('<span class="badge warn">illegal</span>'); }
+            if (g.stolen) { flags.push('<span class="badge warn">stolen</span>'); }
+            if (g.suspicious) { flags.push('<span class="badge warn">suspicious</span>'); }
+
+            var size = g.size != null ? g.size : g.volume;
+
+            return '<tr><td>' + esc(g.name || g.good || '?') + '</td>'
+              + '<td class="num">' + num(g.amount) + '</td>'
+              + '<td class="num mute2">' + (size != null
+                  ? num(size * (g.amount || 0), 1) : '—') + '</td>'
+              + '<td class="num mute2">' + (g.price != null ? num(g.price) + ' ¢' : '—') + '</td>'
+              + '<td>' + (flags.join(' ') || '<span class="mute2">—</span>') + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div></div>';
+    }
+
+    $('#sv-cargo').innerHTML = '<div class="cards">' + head + body + '</div>';
+  }
+
+  /* ================================ LOADOUT ================================ */
+
+  /* The hangar is {squads, fighters}, so it has no .length and never rendered when this
+     was treated as an array. */
+  function squadsOf(d) {
+    return ((d.hangar || {}).squads) || [];
+  }
+
+  /* A turret carries four separate mining efficiencies - raw and refined, metal and
+     stone - and they are what decides whether it is any use on a mining order. The best
+     of them is the headline; the full set is in the tooltip, since a turret that only
+     refines stone is a different tool from one that only mines metal. */
+  function miningHtml(mining) {
+    if (!mining) { return '<span class="mute2">—</span>'; }
+
+    var rows = [
+      ['metal', mining.metalRaw], ['metal R', mining.metalRefined],
+      ['stone', mining.stoneRaw], ['stone R', mining.stoneRefined]
+    ].filter(function (row) { return row[1]; });
+
+    if (!rows.length) { return '<span class="mute2">—</span>'; }
+
+    var best = rows.slice().sort(function (a, b) { return b[1] - a[1]; })[0];
+    var detail = rows.map(function (row) { return row[0] + ' ' + pct(row[1]); }).join(', ');
+
+    return '<span title="' + esc(detail) + '">' + esc(best[0]) + ' ' + pct(best[1]) + '</span>';
+  }
+
+  function renderLoadout() {
+    var d = S.detail;
+    if (!d) { return; }
+
+    var cards = [];
+    var dps = d.dps || {};
+
+    cards.push(meterCard('Firepower', kv([
+      ['turret dps', num(dps.turrets)],
+      ['fighter dps', num(dps.fighters)],
+      ['total', '<b>' + num(dps.total) + '</b>']
+    ])));
+
+    var req = d.requirements || {};
+    function tick(ok) {
+      return ok ? '<span class="badge good">ok</span>' : '<span class="badge bad">no</span>';
+    }
+    cards.push(meterCard('Slots', kv([
+      ['turret slots', tick(req.turretSlots)],
+      ['fighter starts', tick(req.fighterStarts)],
+      ['fighter squads', tick(req.fighterSquads)]
+    ])));
+
+    var turrets = d.turrets || [];
+    cards.push('<div class="card wide"><h3>Turrets</h3>' + (turrets.length
+      ? '<div class="scroll-x"><table>'
+        + '<thead><tr><th class="num"></th><th>Turret</th><th>Category</th><th>Rarity</th>'
+        + '<th>Material</th><th>Mining</th><th>Armed</th><th class="num">DPS</th>'
+        + '<th class="num">Reach</th><th class="num">Slots</th></tr></thead><tbody>'
+        + turrets.map(function (t) {
+            return '<tr><td class="num">' + num(t.count || 1) + '×</td>'
+              + '<td>' + esc(t.name || '?') + '</td>'
+              + '<td class="mute2">' + esc(t.category || '') + '</td>'
+              + '<td class="mute2">' + esc(t.rarity || '') + '</td>'
+              + '<td class="mute2">' + esc(t.material || '') + '</td>'
+              + '<td>' + miningHtml(t.mining) + '</td>'
+              + '<td>' + (t.armed ? 'yes' : '<span class="mute2">no</span>') + '</td>'
+              + '<td class="num">' + num(t.dps) + '</td>'
+              + '<td class="num mute2">' + num(t.reach, 1) + '</td>'
+              + '<td class="num mute2">' + num(t.slots, 1) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>'
+      : '<div class="mute2">No turrets.</div>') + '</div>');
+
+    var systems = d.systems || [];
+    cards.push('<div class="card wide"><h3>Subsystems</h3>' + (systems.length
+      ? '<div class="scroll-x"><table>'
+        + '<thead><tr><th>Subsystem</th><th>Rarity</th><th class="num"></th></tr></thead><tbody>'
+        + systems.map(function (sys) {
+            return '<tr><td>' + esc(sys.name || '?') + '</td>'
+              + '<td class="mute2">' + esc(sys.rarity || '') + '</td>'
+              + '<td class="num mute2">' + (sys.count ? sys.count + '×' : '') + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>'
+      : '<div class="mute2">No subsystems installed.</div>') + '</div>');
+
+    var squads = squadsOf(d);
+    var fighters = (d.hangar || {}).fighters;
+    cards.push('<div class="card wide"><h3>Hangar</h3>' + (squads.length
+      ? '<div class="mute2" style="margin-bottom:6px">' + num(squads.length) + ' squad'
+        + (squads.length === 1 ? '' : 's') + ' &middot; ' + num(fighters) + ' fighters</div>'
+        + '<div class="scroll-x"><table>'
+        + '<thead><tr><th>Squad</th><th class="num">Fighters</th></tr></thead><tbody>'
+        + squads.map(function (sq) {
+            return '<tr><td>' + esc(sq.name || '?') + '</td>'
+              + '<td class="num">' + num(sq.fighters) + '</td></tr>';
+          }).join('')
+        + '</tbody></table></div>'
+      : '<div class="mute2">No fighter squads.</div>') + '</div>');
+
+    $('#sv-loadout').innerHTML = '<div class="cards">' + cards.join('') + '</div>';
   }
 
   function renderRaw() {
@@ -1556,14 +1744,29 @@
     var events = body.events || [];
     var added = false;
 
+    /* When each event happened, rather than when this poll collected it.
+       A first sweep pulls the whole buffer at once, and stamping all of it with Date.now()
+       puts an hour of activity on one timestamp. The mod stamps each event with the
+       server's uptime in seconds, which dates nothing on its own but spaces them exactly,
+       so the newest is anchored to now and the rest walk back by their own offsets. */
+    var newest = 0;
+    for (var n = 0; n < events.length; n++) {
+      if (typeof events[n].at === 'number') { newest = Math.max(newest, events[n].at); }
+    }
+
+    var arrived = Date.now();
+
     for (var i = 0; i < events.length; i++) {
       var event = events[i];
       var key = name + '#' + event.seq;
       if (S.eventKeys[key]) { continue; }
       S.eventKeys[key] = true;
 
+      var offset = newest > 0 && typeof event.at === 'number' ? newest - event.at : 0;
+      if (offset < 0 || offset > 30 * 86400) { offset = 0; }
+
       event.ship = name;
-      event.recvAt = Date.now();
+      event.recvAt = arrived - offset * 1000;
       S.events.push(event);
       added = true;
 
@@ -1620,7 +1823,9 @@
     return '<div class="log-line ' + eventClass(event) + '">'
       + '<span class="t">' + clock(event.recvAt) + '</span>'
       + '<span class="sh" data-ship="' + esc(event.ship) + '">' + esc(event.ship) + '</span>'
-      + '<span class="k">' + esc(event.kind) + '</span>'
+      + '<span class="k">' + esc(event.kind)
+        + (event.recorded ? ' <span class="dim" title="from the bridge\'s log on disk">&bull;</span>' : '')
+        + '</span>'
       + '<span class="m">' + body + '</span>'
       + '</div>';
   }
@@ -1671,22 +1876,65 @@
     if (S.follow && atBottom) { node.scrollTop = node.scrollHeight; }
   }
 
+  /* A persisted row carries the same event the mod emitted, wrapped in the bridge's own
+     fields: `t` wall-clock seconds, `s` the craft, `q` the mod's sequence number. */
+  function fromHistory(row) {
+    var event = {};
+
+    for (var field in row) {
+      if (Object.prototype.hasOwnProperty.call(row, field)) { event[field] = row[field]; }
+    }
+
+    event.ship = row.s;
+    event.seq = row.q;
+    event.recvAt = (row.t || 0) * 1000;
+    event.recorded = true;
+
+    return event;
+  }
+
+  /* Sequence numbers restart with the server, so they do not identify an event on their
+     own - the text has to come into it or a post-restart event collides with an old one. */
+  function eventKey(event) {
+    return [event.seq, event.kind, event.text || '',
+            (event.chain || []).map(function (l) { return l.action; }).join('.')].join('|');
+  }
+
   function renderShipLog() {
     if (!S.selected) { return; }
     var name = S.selected;
-    var rows = S.events.filter(function (e) { return e.ship === name; });
 
-    var head = '';
+    var live = S.events.filter(function (e) { return e.ship === name; });
+    var seen = {};
+    live.forEach(function (e) { seen[eventKey(e)] = true; });
+
+    // Persisted first, then whatever the live feed holds that the disk copy does not yet.
+    // The two overlap heavily - the bridge builds its copy out of these very polls - so
+    // the merge is what stops the tab showing every recent event twice.
+    var rows = (S.shipHistory[name] || []).map(fromHistory).filter(function (e) {
+      return !seen[eventKey(e)];
+    }).concat(live).sort(function (a, b) { return a.recvAt - b.recvAt; });
+
+    var notes = [];
+
     if (S.recording[name] === false) {
-      head = '<div class="note warn" style="padding:9px">The owner is logged out, so '
-        + 'nothing is being recorded. A quiet log means nobody was watching, not that '
-        + 'nothing happened.</div>';
+      notes.push('<div class="note warn" style="padding:9px">Nothing is being recorded '
+        + 'right now: no player whose agent watches this craft is online. A quiet log '
+        + 'means nobody was watching, not that nothing happened.</div>');
     }
 
-    $('#sv-log').innerHTML = head + (rows.length
+    var recorded = (S.shipHistory[name] || []).length;
+    if (recorded) {
+      notes.push('<div class="note" style="padding:9px">' + recorded + ' of these came '
+        + 'from the bridge\'s own log on disk, which outlives the mod\'s 200-event '
+        + 'buffer and a server restart.</div>');
+    }
+
+    $('#sv-log').innerHTML = notes.join('') + (rows.length
       ? rows.map(eventHtml).join('')
-      : '<div class="empty muted">No events. The log lives in memory, is capped at 200 '
-        + 'per ship, and is empty after a server restart.</div>');
+      : '<div class="empty muted">No events. The mod keeps 200 per ship in memory and '
+        + 'loses them on restart; the bridge keeps a copy on disk of everything this '
+        + 'console has seen since it was deployed.</div>');
   }
 
   function renderRecordingNote() {
@@ -1696,9 +1944,163 @@
       total++;
       if (!S.recording[name]) { off++; }
     }
-    $('#log-recording').textContent = total && off
+
+    var node = $('#log-recording');
+    node.textContent = total && off
       ? 'not recording (' + off + '/' + total + ')'
       : (total ? 'recording' : '');
+    node.title = off
+      ? off + ' of ' + total + ' craft have no player agent watching them. An alliance '
+        + 'craft counts as watched while any member is in game, not only its key holder.'
+      : '';
+  }
+
+  /* ================================ HISTORY ================================ */
+  /*
+   * Served by the bridge, not by the mod - see docker/bridge/src/history.php. The mod
+   * keeps 200 events per ship in server memory and loses them at the next restart, which
+   * is the right shape for "what is this ship doing" and no use at all for "where has
+   * this fleet been". The bridge keeps a copy of the answers it relays, so the two
+   * together give a live feed and a month of it.
+   *
+   * It records while something is calling the API. A gap in it is a gap in who was
+   * looking, which is why dwell is reported as observed seconds and said so in the UI.
+   */
+
+  function historyFilter() {
+    var filter = { limit: 8000 };
+
+    if (S.history.window) {
+      filter.from = Math.floor(Date.now() / 1000) - S.history.window;
+    }
+    if (S.history.selectedOnly && S.selected) {
+      filter.ship = S.selected;
+    }
+
+    return filter;
+  }
+
+  function historyWanted() {
+    return GalaxyMap.show.heat || GalaxyMap.show.tracks;
+  }
+
+  function loadHistory(userInitiated) {
+    if (!S.connected) { return Promise.resolve(); }
+
+    if (!historyWanted()) {
+      // Nothing is drawing it. Do not spend a call on a query that can be several
+      // thousand rows just because a background loop came round.
+      renderHistoryPanel();
+      return Promise.resolve();
+    }
+
+    var filter = historyFilter();
+    var priority = userInitiated ? Api.P.USER : Api.P.POLL;
+
+    $('#history-status').textContent = 'loading…';
+
+    return Promise.all([
+      Api.get('/history/heatmap', filter, { priority: priority, label: 'heatmap' }),
+      GalaxyMap.show.tracks
+        ? Api.get('/history/visits', filter, { priority: priority, label: 'visits' })
+        : Promise.resolve({ visits: [] })
+    ]).then(function (answers) {
+      S.history.summary = answers[0];
+      S.history.loaded = true;
+      GalaxyMap.setHeat(answers[0]);
+      GalaxyMap.setTracks(answers[1].visits || []);
+      renderHistoryPanel();
+    }).catch(function (error) {
+      if (error.code === 'cancelled') { return; }
+
+      S.history.loaded = false;
+      $('#history-status').textContent = 'unavailable';
+
+      if (error.code === 'history_disabled' || error.status === 404) {
+        $('#history-legend').innerHTML = '<div class="note warn">This bridge keeps no '
+          + 'history. It is served by the bridge rather than the mod, so an older '
+          + 'deployment has no such route &mdash; run <code>docker compose up -d '
+          + '--build</code> on it, or unset HISTORY_DIR if it was turned off deliberately.'
+          + '</div>';
+        return;
+      }
+
+      apiFailed(error, 'Could not read the history');
+    });
+  }
+
+  function renderHistoryPanel() {
+    var heat = S.history.summary;
+
+    if (!historyWanted()) {
+      $('#history-status').textContent = 'off';
+      $('#history-legend').innerHTML = '<div class="mute2">Turn on <b>heatmap</b> or '
+        + '<b>tracks</b> above to draw where this fleet has been.</div>';
+      return;
+    }
+
+    if (!heat) { return; }
+
+    var cells = heat.cells || [];
+    if (!cells.length) {
+      $('#history-status').textContent = 'empty';
+      $('#history-legend').innerHTML = '<div class="mute2">Nothing recorded in this '
+        + 'window yet. The bridge builds the history out of the calls this console '
+        + 'makes, so it fills in while a tab is open on it.</div>';
+      return;
+    }
+
+    var bySeconds = heat.maxSeconds > 0;
+    var span = heat.from && heat.to ? duration(heat.to - heat.from) : '—';
+
+    $('#history-status').textContent = cells.length + ' sectors';
+
+    $('#history-legend').innerHTML =
+      '<div class="heat-scale"><span>low</span><i></i><span>high</span></div>'
+      + '<div class="mute2" style="margin-top:5px">Shaded by '
+        + (bySeconds ? 'observed time in sector, up to '
+            + GalaxyMap.humanDuration(heat.maxSeconds)
+          : 'number of visits, up to ' + heat.maxVisits)
+        + '.</div>'
+      + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
+        + span + ' of recorded travel</div>'
+      + '<div class="mute2">Only time the console was watching is counted, so a quiet '
+        + 'stretch means nobody was polling, not that nothing moved.</div>';
+  }
+
+  function setHistoryWindow(seconds) {
+    S.history.window = seconds;
+    saveHistoryPrefs();
+    loadHistory(true);
+  }
+
+  function saveHistoryPrefs() {
+    localStorage.setItem(LS.history, JSON.stringify({
+      window: S.history.window,
+      selectedOnly: S.history.selectedOnly,
+      heat: GalaxyMap.show.heat,
+      tracks: GalaxyMap.show.tracks
+    }));
+  }
+
+  /* The recorded log for one craft, which outlives both the mod's 200-event buffer and
+     this page. Fetched once per craft per visit to the Log tab rather than on a loop. */
+  function loadShipHistory(name) {
+    if (!S.connected || S.shipHistory[name]) { return Promise.resolve(); }
+
+    S.shipHistory[name] = [];
+
+    return Api.get('/history/events', { ship: name, limit: 500 },
+                   { priority: Api.P.DETAIL, label: 'ship history' })
+      .then(function (body) {
+        S.shipHistory[name] = body.events || [];
+        if (S.selected === name && S.sub === 'log') { renderShipLog(); }
+      })
+      .catch(function () {
+        // A bridge without the history route, or one with it turned off. The live feed
+        // above it still works, so this is a missing extra rather than a failure.
+        S.shipHistory[name] = [];
+      });
   }
 
   /* ================================== MAP ================================== */
@@ -2015,6 +2417,15 @@
       if (row) { select(row.dataset.ship); }
     });
 
+    /* The overview keeps a one-line reading of cargo and firepower and links to the tab
+       holding the detail, so moving those listings off it did not make them harder to find. */
+    $('#sv-overview').addEventListener('click', function (e) {
+      var link = e.target.closest('[data-sub-link]');
+      if (!link) { return; }
+      e.preventDefault();
+      showSub(link.dataset.subLink);
+    });
+
     /* --- mission tab -------------------------------------------------- */
     $('#sv-mission').addEventListener('click', function (e) {
       var button = e.target.closest('button');
@@ -2167,11 +2578,13 @@
       drawLog();
     });
     $('#log-collapse').addEventListener('click', function () {
-      var dock = $('#logdock');
-      dock.classList.toggle('collapsed');
-      var collapsed = dock.classList.contains('collapsed');
-      $('#log-collapse').innerHTML = collapsed ? '&#9650;' : '&#9660;';
-      localStorage.setItem(LS.dock, collapsed ? 'collapsed' : 'open');
+      setDock($('#logdock').classList.contains('collapsed'));
+    });
+
+    /* Esc closes it, which is the other half of "open only while I am looking at it". */
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') { return; }
+      if (!$('#logdock').classList.contains('collapsed')) { setDock(false); }
     });
 
     $('#log-rows').addEventListener('click', function (e) {
@@ -2197,6 +2610,29 @@
       GalaxyMap.show.unvisited = e.target.checked; GalaxyMap.draw();
     });
 
+    $('#map-show-heat').addEventListener('change', function (e) {
+      GalaxyMap.show.heat = e.target.checked;
+      GalaxyMap.draw();
+      saveHistoryPrefs();
+      loadHistory(true);
+    });
+    $('#map-show-tracks').addEventListener('change', function (e) {
+      GalaxyMap.show.tracks = e.target.checked;
+      GalaxyMap.draw();
+      saveHistoryPrefs();
+      loadHistory(true);
+    });
+
+    bindSeg('#history-window', function (value) { setHistoryWindow(Number(value)); });
+
+    $('#history-mine').addEventListener('change', function (e) {
+      S.history.selectedOnly = e.target.checked;
+      saveHistoryPrefs();
+      loadHistory(true);
+    });
+
+    $('#history-refresh').addEventListener('click', function () { loadHistory(true); });
+
     $('#map-side-body').addEventListener('click', function (e) {
       var link = e.target.closest('[data-goto]');
       if (link) {
@@ -2220,7 +2656,9 @@
       + '<div><i style="background:#a97cf0"></i>on a captain mission</div>'
       + '<div><i style="background:#e0b341"></i>craft failing its usable check</div>'
       + '<div><i style="background:#7d8ca3"></i>known sector · coloured = stations, by faction</div>'
-      + '<div><i style="border:1px solid #e0b341;background:transparent"></i>home sector</div>';
+      + '<div><i style="border:1px solid #e0b341;background:transparent"></i>home sector</div>'
+      + '<div><i style="background:hsla(30,80%,55%,.7)"></i>heatmap · time spent, from the '
+        + 'bridge\'s history</div>';
   }
 
   /* --------------------------------- boot --------------------------------- */
@@ -2258,6 +2696,7 @@
 
     setPaused(false);
     setStatus('off', 'not connected');
+    renderHistoryPanel();
 
     if ($('#conn-url').value && $('#conn-key').value) { connect(); }
   }
