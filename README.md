@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.3.0](https://img.shields.io/badge/version-0.3.0-8957e5)](modinfo.lua)
+[![version 0.4.0](https://img.shields.io/badge/version-0.4.0-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -27,6 +27,8 @@ galaxy map.
 - preview a captain mission with the game's own yield and risk prediction, then start it
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
 - query known sectors, and predict unvisited ones straight from the galaxy seed
+- read your stations' books - production chain, stock, and what each one has earned - and
+  keep a series of them, so a lifetime total becomes credits an hour
 
 ## How it talks to the outside world
 
@@ -99,7 +101,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.3.0 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.4.0 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -156,15 +158,22 @@ cat "$DIR/responses/$ID.json"; rm "$DIR/responses/$ID.json"
 ## Web console
 
 `web/` is a browser console for the API - fleet overview, cargo, loadout, captain
-missions, orders, travel, a galaxy map and a live per-ship event log. It is plain HTML and
-JavaScript with no build step and no CDN, and all of its logic runs in the browser: it
-holds your key, talks to the API directly and stores nothing on a server.
+missions, orders, travel, a galaxy map, a live per-ship event log and a per-station economy
+view. It is plain HTML and JavaScript with no build step and no CDN, and all of its logic
+runs in the browser: it holds your key, talks to the API directly and stores nothing on a
+server.
 
 The fleet filter searches names, status, sector and owner, and also the goods a craft is
 carrying: type `fusion` and the stations holding Fusion Cores come up, with the matching
 part of their manifest on the row. Holds are not in the listing endpoint, so that half of
 the search reads `/ships/{name}` once per craft, at background priority behind anything you
 are doing and cached for two minutes - it happens only once you have typed something.
+
+Select a station and the **Economy** tab shows its production chain, every good it trades
+with its stock against the cap the station itself works to, and what it has earned - with
+the bridge's own series underneath, turning that lifetime total into credits an hour and a
+bar per hour or day. Mission and Travel are not offered for a station: the game refuses
+both outright.
 
 The map can also draw where a fleet has actually been - a heatmap of time spent per sector
 and a per-craft travel track - out of the history the bridge keeps. See
@@ -186,8 +195,9 @@ the server's `--datapath` is [absolute](#2-start-the-server-with-an-absolute---d
 the directory itself rather than failing, at which point nothing can write to it; the
 bridge answers `bridge_unavailable` or `transport_not_writable` and says so.
 
-`tools/e2e.sh` tests the whole deployment - mounts, ownership, round trip, history -
-without Avorion, by running the real mod code against a throwaway directory.
+`tools/e2e.sh` tests the whole deployment - mounts, ownership, round trip, history,
+station economy - without Avorion, by running the real mod code against a throwaway
+directory.
 
 Then open `http://<your-api-host>/console/` and paste an API key. The address field is
 already filled in with the page's own origin, so there is nothing else to set.
@@ -207,20 +217,31 @@ next restart. That is the right shape for *what is this ship doing now* and no u
 writing a growing file from a galaxy script on the game server's own tick, which is a month
 of travel data paid for in frame time.
 
-So the bridge keeps the copy. It relays every call already, and two of them carry
+Station books have the same shape of problem for a different reason. The game keeps three
+money counters per station and no history at all, so the mod can only ever report a
+lifetime total - and *what did this factory make this week* is a question about two
+readings. So the bridge samples those counters too, along with each station's stock good by
+good, which is the only way to see what a line actually moved: the counters are one number
+for the whole station and never say which good earned it.
+
+So the bridge keeps the copy. It relays every call already, and four of them carry
 everything the store needs:
 
 | from | what it records |
 |---|---|
 | `GET /ships` | each craft's sector, as a visit - opened on arrival, closed when it moves on |
 | `GET /ships/{name}/events` | the mod's own events, past the 200 and past a restart |
+| `GET /stations` | each station's running earnings totals and its stock per good |
+| `GET /economy` | the faction's money and resources |
 
 Positions come from the ship database, which reads fine **with every player logged out**, so
-the travel record keeps filling whether or not anyone is flying.
+the travel record keeps filling whether or not anyone is flying. So do the station books:
+they are read out of the same database rows, not off a loaded sector.
 
-Read it at `/history/summary`, `/history/visits`, `/history/heatmap` and `/history/events` -
-full reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
-last two on the map.
+Read it at `/history/summary`, `/history/visits`, `/history/heatmap`, `/history/events`,
+`/history/economy/summary`, `/history/economy/series` and `/history/economy/goods` - full
+reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
+travel overlays on the map and the economy ones on the station's Economy tab.
 
 Two things to know about it:
 
@@ -238,7 +259,10 @@ Two things to know about it:
 
 It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns it off
 entirely; `HISTORY_DAYS` (default 30) sets how far back it keeps, and the poller deletes
-anything older on an hourly pass.
+anything older on an hourly pass. Economy samples are additionally thinned to one per
+station per `HISTORY_ECONOMY_INTERVAL` (default 300s) - the mod reads a station's books out
+of its database row, and the game only rewrites that row when it saves, so a faster sample
+is a copy of the last one.
 
 ## Endpoints
 
@@ -257,10 +281,12 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/travel` | send a ship anywhere in the galaxy |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
+| `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
+| `GET /economy` | the faction ledger, and what its stations have made |
 | `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and the game's own pathfinder |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
-| `GET /history/*` | where the fleet has been - served by the bridge, not the mod |
+| `GET /history/*` | where the fleet has been, and what its stations earned - served by the bridge, not the mod |
 
 ## What needs the owner online
 
@@ -316,7 +342,7 @@ against the game's copies after an Avorion update.
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-for t in bridge ships missions movement map shipevents; do lua5.4 tests/test_$t.lua; done
+for t in bridge ships missions movement map shipevents economy; do lua5.4 tests/test_$t.lua; done
 ```
 
 The bridge's history store is PHP over Postgres, so it is tested against a throwaway
@@ -326,6 +352,19 @@ bridge is built from, and takes both down again:
 ```bash
 tools/dbtest.sh
 ```
+
+The browser console is tested the same way, against a headless DOM and a fake API. `web/`
+deliberately has no build step and no dependencies, so jsdom lives in the test runner
+rather than in the repo: `tools/uitest.sh` installs it inside a node image and mounts the
+repo read-only.
+
+```bash
+tools/uitest.sh
+```
+
+It pins the parts of the console that are decided rather than displayed - which subtabs a
+craft is offered, whether the live event feed and the bridge's copy of it merge or double,
+and which end of the ship log the newest entry is at. All three are silent when they break.
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather
 than a convenient version of it, so bugs that would otherwise only show up in game fail in
@@ -338,6 +377,8 @@ tests instead. It reproduces, among others:
 - `orderchain` reaching only functions the game marks `callable()`
 - a captured owner handle serving a cached `ShipInfo` that never advances
 - `Simulation.getCommandUIData` raising for an idle ship, traceback and all
+- `getScripts()` and `getSecuredScriptValues()` keyed by script index rather than as a
+  sequence, so a station reader that assumes `1..n` finds nothing
 
 ## Security
 

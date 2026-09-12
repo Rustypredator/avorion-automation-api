@@ -97,7 +97,55 @@ Mock.addShip(1, "Ore Hound",
 })
 
 Mock.addShip(1, "Tug", {x = -3, y = 12, statusText = "Idle"})
-Mock.addShip(1, "Home Base", {type = EntityType.Station, x = 0, y = 0})
+
+-- A station with books, so /stations and /economy answer with something and the bridge's
+-- economy series has samples to difference. The secured values below are the shape the
+-- game writes into a craft's database row: one table per script index, with factory.lua
+-- nesting its trading data under `tradingData`.
+local refinery = Mock.addShip(1, "Home Base",
+{
+    type = EntityType.Station, x = 0, y = 0, usableError = 2,
+    cargoCapacity = 12000, cargoFree = 5000,
+    cargo =
+    {
+        [good("Oil", 320, 2)] = 900,
+        [good("Raw Oil", 66, 2)] = 400,
+        [good("Energy Cell", 61, 1)] = 1200,
+    },
+    scripts = {[1] = "data/scripts/entity/merchants/factory.lua"},
+    secured =
+    {
+        [1] =
+        {
+            maxNumProductions = 3,
+            shuttleVolume = 20,
+            production =
+            {
+                factory = "${good} Refinery ${size}",
+                factoryStyle = "Factory",
+                ingredients = {{name = "Energy Cell", amount = 5, optional = 0},
+                               {name = "Raw Oil", amount = 10, optional = 0}},
+                results = {{name = "Oil", amount = 5}},
+                garbages = {},
+            },
+            currentProductions = {[1] = {progress = 0.25}},
+            tradingData =
+            {
+                buyPriceFactor = 0.9, sellPriceFactor = 1.1,
+                buyFromOthers = true, sellToOthers = true,
+                activelyRequest = false, activelySell = true,
+                policies = {},
+                stats = {moneyGainedFromGoods = 4000000, moneySpentOnGoods = 1500000,
+                         moneyGainedFromTax = 25000},
+                boughtGoods = {good("Energy Cell", 61, 1), good("Raw Oil", 66, 2)},
+                soldGoods = {good("Oil", 320, 2)},
+            },
+        },
+    },
+})
+
+Mock.player(1).money = 12500000
+Mock.player(1).resources = {[0] = 40000, [1] = 9000}
 
 Bridge.initialize()
 
@@ -132,6 +180,29 @@ local function wander()
     Bridge.pushShipEvent(1, "Tug", "status", {text = wanderer.statusText})
 end
 
+-- And the refinery trades, so two economy samples are never identical. The counters only
+-- ever rise while a station stands, which is what the game does and what the bridge's
+-- differencing assumes; stock moves both ways.
+local trading = refinery.secured[1].tradingData.stats
+
+local function trade()
+    local sold = math.random(20, 60)
+
+    trading.moneyGainedFromGoods = trading.moneyGainedFromGoods + sold * 352
+    trading.moneySpentOnGoods = trading.moneySpentOnGoods + sold * 2 * 55
+    trading.moneyGainedFromTax = trading.moneyGainedFromTax + sold
+
+    for goodTable, amount in pairs(refinery.cargo) do
+        if goodTable.name == "Oil" then
+            refinery.cargo[goodTable] = math.max(0, amount - sold + math.random(0, 70))
+        elseif goodTable.name == "Raw Oil" then
+            refinery.cargo[goodTable] = math.max(0, amount - sold)
+        end
+    end
+
+    Mock.player(1).money = Mock.player(1).money + sold * 352
+end
+
 while true do
     os.execute("sleep " .. step)
     Mock.advanceClock(step)
@@ -141,6 +212,7 @@ while true do
         if sinceWander >= WANDER_EVERY then
             sinceWander = 0
             pcall(wander)
+            pcall(trade)
         end
     end
 

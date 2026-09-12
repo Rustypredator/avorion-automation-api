@@ -66,6 +66,13 @@
     history: { window: 86400, selectedOnly: false, summary: null, loaded: false },
     shipHistory: {},
 
+    /* The selected station's books, and what the bridge has recorded of them. `station`
+       is the live read and `stationHistory` the series; neither implies the other, since
+       a bridge may keep no history and a station may be brand new. */
+    station: null,
+    stationHistory: {},
+    economyWindow: 86400,
+
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
     busy: {}
   };
@@ -412,6 +419,11 @@
     loop('detail', EVERY.detail, function () {
       if (S.selected) { return loadDetail(true); }
     });
+    loop('station', EVERY.detail, function () {
+      // Gated on the tab being open: a station's books only move when the game saves,
+      // so reading them for a tab nobody is looking at is transport traffic for nothing.
+      if (S.selected && S.sub === 'economy') { return loadStation(true); }
+    });
     loop('history', EVERY.history, function () {
       // Cheap when nothing draws it: loadHistory returns without a call in that case.
       if (historyWanted()) { return loadHistory(false); }
@@ -469,7 +481,38 @@
     if (name === 'cargo') { renderCargo(); }
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
+    if (name === 'economy') { renderEconomy(); loadStationHistory(S.selected); }
     if (name === 'raw') { renderRaw(); }
+  }
+
+  /* Whether a craft is a station rather than a ship.
+
+     Both answers are in the listing row, so this is known before the detail call lands:
+     `type` comes from the entity type and `usable.code` is the gate every captain
+     mission runs first, which answers NotAShip for anything that cannot fly. */
+  function isStation(craft) {
+    if (!craft) { return false; }
+    if (craft.type === 'Station') { return true; }
+
+    return !!(craft.usable && craft.usable.code === 'NotAShip');
+  }
+
+  // Subtabs that only apply to one kind of craft. Mission and Travel are not merely
+  // empty for a station - the game refuses both outright - and the station books the
+  // Economy tab reads exist on nothing else.
+  var SHIP_ONLY = { mission: true, travel: true };
+  var STATION_ONLY = { economy: true };
+
+  function syncSubtabs() {
+    var station = isStation(S.detail || S.byName[S.selected]);
+
+    $$('.subtab').forEach(function (tab) {
+      var hidden = station ? SHIP_ONLY[tab.dataset.sub] : STATION_ONLY[tab.dataset.sub];
+      tab.hidden = !!hidden;
+    });
+
+    // The craft that was selected before may have had the tab that is open now.
+    if (station ? SHIP_ONLY[S.sub] : STATION_ONLY[S.sub]) { showSub('overview'); }
   }
 
   Api.onQueue = function (inflight, queued) {
@@ -659,6 +702,7 @@
     var changed = S.selected !== name;
     S.selected = name;
     S.detail = null;
+    S.station = null;
     S.mission = null;
     S.catalog = null;
     S.missionForm = null;
@@ -681,10 +725,16 @@
     $('#sv-cargo').innerHTML = '<p class="muted">loading…</p>';
     $('#sv-loadout').innerHTML = '<p class="muted">loading…</p>';
 
+    // Before the detail call, off the listing row - so the tab strip does not offer
+    // Mission and Travel for a station for the second it takes to come back.
+    syncSubtabs();
+
     loadDetail();
-    loadMission();
+    if (!isStation(ship)) { loadMission(); }
     if (S.sub === 'mission') { loadCatalog(); }
     if (S.sub === 'log') { loadShipHistory(name); }
+    if (S.sub === 'economy') { loadStationHistory(name); }
+    loadStation();
     renderOrders();
     renderTravel();
     renderShipLog();
@@ -702,6 +752,12 @@
         if (S.selected !== name) { return; }
         S.detail = body;
         indexCargo(name, body);
+
+        // The listing row is what select() decided from, and it can be absent - a craft
+        // reached by a stale link, or one the current type filter hides. The detail is
+        // authoritative, so a station spotted only here still gets its books read.
+        if (!S.station && isStation(body)) { loadStation(); loadStationHistory(name); }
+
         renderShipHead();
         renderOverview();
         renderCargo();
@@ -734,6 +790,8 @@
   function renderShipHead() {
     var d = S.detail || S.byName[S.selected];
     if (!d) { return; }
+
+    syncSubtabs();
 
     var bits = [d.type || '', coords(d.position)];
     if (d.owner) { bits.push(d.owner.kind === 'alliance' ? 'alliance craft' : esc(d.owner.name)); }
@@ -1109,7 +1167,8 @@
       summary: S.byName[S.selected] || null,
       detail: S.detail,
       mission: S.mission,
-      catalog: S.catalog
+      catalog: S.catalog,
+      station: S.station
     }, null, 2);
   }
 
@@ -2102,12 +2161,16 @@
     var seen = {};
     live.forEach(function (e) { seen[eventKey(e)] = true; });
 
-    // Persisted first, then whatever the live feed holds that the disk copy does not yet.
-    // The two overlap heavily - the bridge builds its copy out of these very polls - so
-    // the merge is what stops the tab showing every recent event twice.
+    // The disk copy plus whatever the live feed holds that it does not yet. The two
+    // overlap heavily - the bridge builds its copy out of these very polls - so the
+    // merge is what stops the tab showing every recent event twice.
+    //
+    // Newest first, unlike the dock. The dock is a follow view of the last few minutes
+    // and scrolls itself; this one is hundreds of persisted entries deep, where the row
+    // worth reading is at the end of the scroll rather than the top of the pane.
     var rows = (S.shipHistory[name] || []).map(fromHistory).filter(function (e) {
       return !seen[eventKey(e)];
-    }).concat(live).sort(function (a, b) { return a.recvAt - b.recvAt; });
+    }).concat(live).sort(function (a, b) { return b.recvAt - a.recvAt; });
 
     var notes = [];
 
@@ -2147,6 +2210,369 @@
       ? off + ' of ' + total + ' craft have no player agent watching them. An alliance '
         + 'craft counts as watched while any member is in game, not only its key holder.'
       : '';
+  }
+
+  /* ================================ ECONOMY ================================ */
+  /*
+   * A station's books, in two halves that come from different places and answer different
+   * questions.
+   *
+   * The mod's half is a reading taken now: what the line produces, what is in the bay,
+   * and three running totals since the station was founded. Useful, and no use at all for
+   * "how is it doing" - a lifetime total says nothing about this week.
+   *
+   * The bridge's half is the answer to that. It has been sampling those totals, so it can
+   * difference them into a rate, and it has been sampling the stock good by good, which is
+   * the only way to see what a line actually moved: the game keeps one money counter for
+   * the whole station and never attributes it to a good.
+   *
+   * Either half can be missing. A bridge with no history store answers 404 and the page
+   * shows the live reading alone rather than an error.
+   */
+
+  function loadStation(background) {
+    var name = S.selected;
+    if (!name || !isStation(S.byName[name] || S.detail)) { S.station = null; return Promise.resolve(); }
+
+    return Api.get('/stations/' + Api.seg(name), { owner: ownerParamFor(name) },
+                   { priority: background ? Api.P.POLL : Api.P.DETAIL, label: 'station' })
+      .then(function (body) {
+        if (S.selected !== name) { return; }
+        S.station = body;
+        renderEconomy();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled' || S.selected !== name) { return; }
+        // not_a_station is the ordinary answer for a defence platform or a shipyard with
+        // no trading manager, and is a state of the page rather than a failure.
+        S.station = { error: error };
+        renderEconomy();
+      });
+  }
+
+  function loadStationHistory(name) {
+    if (!S.connected || !name) { return Promise.resolve(); }
+    if (!isStation(S.byName[name] || S.detail)) { return Promise.resolve(); }
+
+    var filter = { station: name };
+    if (S.economyWindow) { filter.from = Math.floor(Date.now() / 1000) - S.economyWindow; }
+
+    return Promise.all([
+      Api.get('/history/economy/summary', filter, { priority: Api.P.DETAIL, label: 'economy' }),
+      Api.get('/history/economy/series', withBucket(filter),
+              { priority: Api.P.DETAIL, label: 'economy series' }),
+      Api.get('/history/economy/goods', filter, { priority: Api.P.DETAIL, label: 'economy goods' })
+    ]).then(function (answers) {
+      S.stationHistory[name] = { summary: answers[0], series: answers[1], goods: answers[2] };
+      if (S.selected === name && S.sub === 'economy') { renderEconomy(); }
+    }).catch(function (error) {
+      if (error.code === 'cancelled') { return; }
+
+      // A bridge built before the economy store existed, or one with the history turned
+      // off. The live half above still works, so this is a missing overlay.
+      S.stationHistory[name] = { unavailable: error };
+      if (S.selected === name && S.sub === 'economy') { renderEconomy(); }
+    });
+  }
+
+  /* Hourly buckets are unreadable past a couple of days and daily ones are one bar for
+     anything shorter, so the window picks the bucket rather than the reader. */
+  function withBucket(filter) {
+    var out = { bucket: S.economyWindow && S.economyWindow <= 172800 ? 'hour' : 'day' };
+    for (var key in filter) {
+      if (Object.prototype.hasOwnProperty.call(filter, key)) { out[key] = filter[key]; }
+    }
+    return out;
+  }
+
+  function setEconomyWindow(seconds) {
+    S.economyWindow = seconds;
+    if (S.selected) {
+      delete S.stationHistory[S.selected];
+      loadStationHistory(S.selected);
+    }
+    renderEconomy();
+  }
+
+  function credits(value) {
+    if (value == null || isNaN(value)) { return '—'; }
+    return num(value) + ' ¢';
+  }
+
+  function signedCredits(value) {
+    if (value == null || isNaN(value)) { return '—'; }
+    var tone = value > 0 ? 'good' : (value < 0 ? 'bad' : '');
+    return '<span class="' + tone + '">' + (value > 0 ? '+' : '') + credits(value) + '</span>';
+  }
+
+  function renderEconomy() {
+    var node = $('#sv-economy');
+    if (!node) { return; }
+
+    var name = S.selected;
+    if (!name) { node.innerHTML = ''; return; }
+
+    var station = S.station;
+    if (!station) { node.innerHTML = '<p class="muted">loading…</p>'; return; }
+
+    if (station.error) {
+      node.innerHTML = station.error.code === 'not_a_station'
+        ? '<div class="empty muted">This craft runs no merchant script, so it keeps no '
+          + 'books. Defence platforms and mines that were never given a production line '
+          + 'read like this.</div>'
+        : errorBox('Could not read the station', station.error);
+      return;
+    }
+
+    var economy = station.economy || {};
+
+    // One grid, so the wide cards below can span it - .card.wide is a grid-column rule
+    // and does nothing to a card that is not in a .cards container.
+    node.innerHTML = '<div class="cards">'
+      + economyHeadCard(station, economy)
+      + productionCard(economy.production, economy.secured)
+      + goodsTable(economy.goods, name)
+      + economyHistory(name)
+      + '</div>';
+  }
+
+  function economyHeadCard(station, economy) {
+    var earnings = economy.earnings || {};
+    var settings = economy.settings || {};
+
+    var flags = [];
+    if (settings.buysFromOthers === false) { flags.push('does not buy from others'); }
+    if (settings.sellsToOthers === false) { flags.push('does not sell to others'); }
+    if (settings.activelyRequest) { flags.push('requests deliveries'); }
+    if (settings.activelySell) { flags.push('sends out shuttles'); }
+
+    /* The one caveat worth putting on the page rather than only in the docs. These come
+       from the craft's database row, which the game rewrites when it saves or unloads a
+       sector - so an unloaded station is exact as of the moment it went quiet, and a
+       loaded one can be a save interval behind the entity flying around in it. */
+    var freshness = station.sectorLoaded
+      ? '<div class="mute2">The sector is loaded, so these figures can trail the station '
+        + 'itself by up to one server save.</div>'
+      : '<div class="mute2">The sector is unloaded. These figures are exactly what the '
+        + 'station held when it went quiet, which is also all that has happened to it.</div>';
+
+    return '<div class="card"><h3>Books &mdash; ' + esc(economy.kind || 'station') + '</h3>'
+      + kv([
+        ['earned', credits(earnings.fromGoods)],
+        ['spent', credits(earnings.spentOnGoods)],
+        ['tax taken', credits(earnings.fromTax)],
+        ['net', '<b>' + signedCredits(earnings.net) + '</b>'],
+        ['buy factor', settings.buyPriceFactor != null
+          ? num(settings.buyPriceFactor, 2) : '—'],
+        ['sell factor', settings.sellPriceFactor != null
+          ? num(settings.sellPriceFactor, 2) : '—']
+      ])
+      + '<div class="mute2">Totals since the station was founded &mdash; the only form the '
+      + 'game keeps them in. The window below turns them into a rate.</div>'
+      + (flags.length ? '<div class="mute2">' + esc(flags.join(' · ')) + '</div>' : '')
+      + freshness
+      + '</div>';
+  }
+
+  function productionCard(production, secured) {
+    if (!production) {
+      return '<div class="card"><h3>Production</h3><div class="mute2">'
+        + (secured === false
+            ? 'The game has not written this station to the ship database yet, which it '
+              + 'does when it next saves or the sector unloads. Until then there is '
+              + 'nothing to read &mdash; this is a station founded a few minutes ago, not '
+              + 'an idle one.'
+            : 'No production line. This station trades rather than makes.')
+        + '</div></div>';
+    }
+
+    var side = function (title, items, tone) {
+      if (!items || !items.length) {
+        return '<div class="mute2">' + title + ': none</div>';
+      }
+
+      return '<div class="chain"><span class="chain-head">' + title + '</span>'
+        + items.map(function (item) {
+            return '<span class="gchip ' + tone + '" title="'
+              + esc(numText(item.stock) + ' in the bay · ' + numText(item.price)
+                    + ' ¢ each') + '">'
+              + num(item.amount) + '&times; ' + esc(item.name || '?')
+              + (item.optional ? ' <span class="dim">opt</span>' : '')
+              + '</span>';
+          }).join('')
+        + '</div>';
+    };
+
+    var cycles = (production.running || []).map(function (cycle) {
+      return bar(cycle.progress, 'info');
+    }).join('');
+
+    return '<div class="card"><h3>Production &mdash; ' + esc(production.style || 'line')
+      + '</h3>'
+      + side('in', production.ingredients, '')
+      + side('out', production.results, 'good')
+      + (production.garbage && production.garbage.length
+          ? side('waste', production.garbage, 'warn') : '')
+      + kv([
+        ['cycles', num(production.active) + ' of ' + num(production.slots) + ' slots'],
+        ['input value', credits(production.inputValue)],
+        ['output value', credits(production.outputValue)],
+        ['margin a cycle', '<b>' + signedCredits(production.margin) + '</b>']
+      ])
+      + cycles
+      + '<div class="mute2">Values are the goods index\'s own prices, so the margin is '
+      + 'what a cycle is worth rather than what it will sell for &mdash; a sale is at the '
+      + 'base price below, and then supply and demand.</div>'
+      + '</div>';
+  }
+
+  function goodsTable(goods, name) {
+    if (!goods) { return ''; }
+
+    var recorded = (S.stationHistory[name] || {}).goods;
+    var flow = {};
+    ((recorded || {}).goods || []).forEach(function (row) { flow[row.good] = row; });
+
+    var rows = [];
+
+    [['buys', 'buys'], ['sells', 'sells']].forEach(function (pair) {
+      (goods[pair[0]] || []).forEach(function (good) {
+        rows.push({ side: pair[1], good: good });
+      });
+    });
+
+    if (!rows.length) {
+      return '<div class="card wide"><h3>Goods</h3>'
+        + '<div class="mute2">This station trades nothing.</div></div>';
+    }
+
+    var moved = recorded ? '<th class="num">In</th><th class="num">Out</th>' : '';
+
+    return '<div class="card wide"><h3>Goods</h3>'
+      + '<div class="scroll-x"><table>'
+      + '<thead><tr><th>Good</th><th></th><th class="num">Stock</th><th>Fill</th>'
+      + '<th class="num">Base price</th>' + moved + '</tr></thead><tbody>'
+      + rows.map(function (row) {
+          var good = row.good;
+          var move = flow[good.name];
+          var tone = row.side === 'sells'
+            ? (good.fill >= 0.95 ? 'bad' : 'good')
+            : (good.fill <= 0.05 ? 'bad' : 'info');
+
+          return '<tr><td>' + esc(good.name || '?') + '</td>'
+            + '<td><span class="badge ' + (row.side === 'sells' ? 'good' : 'info') + '">'
+              + row.side + '</span></td>'
+            + '<td class="num">' + num(good.stock) + ' <span class="mute2">/ '
+              + numText(good.maxStock) + '</span></td>'
+            + '<td class="fillcell">' + bar(good.fill, tone) + '</td>'
+            + '<td class="num">' + num(good.basePrice) + ' ¢</td>'
+            + (recorded
+                ? '<td class="num">' + (move ? num(move['in']) : '—') + '</td>'
+                  + '<td class="num">' + (move ? num(move.out) : '—') + '</td>'
+                : '')
+            + '</tr>';
+        }).join('')
+      + '</tbody></table></div>'
+      /* A sold good pinned full and a bought good sitting empty are the two states that
+         stop a line, and neither shows up in the earnings until it already has. */
+      + '<div class="mute2">A sold good at full stock has nowhere to put the next cycle; '
+      + 'a bought good at zero is an ingredient the line is waiting on.'
+      + (recorded
+          ? ' In and Out are units that appeared and left over the window &mdash; produced '
+            + 'or bought, and sold, consumed or shuttled away. The station\'s books keep '
+            + 'one money counter for the whole place, so which of those it was is not '
+            + 'recoverable.'
+          : '')
+      + '</div></div>';
+  }
+
+  function economyHistory(name) {
+    var recorded = S.stationHistory[name];
+
+    var picker = '<div class="seg" id="economy-window" data-value="'
+      + S.economyWindow + '">'
+      + [[3600, '1h'], [86400, '24h'], [604800, '7d'], [0, 'all']].map(function (w) {
+          return '<button data-v="' + w[0] + '"'
+            + (S.economyWindow === w[0] ? ' class="on"' : '') + '>' + w[1] + '</button>';
+        }).join('')
+      + '</div>';
+
+    if (!recorded) {
+      return '<div class="card wide"><h3>Over time</h3>' + picker
+        + '<div class="mute2">loading…</div></div>';
+    }
+
+    if (recorded.unavailable) {
+      return '<div class="card wide"><h3>Over time</h3>' + picker
+        + '<div class="note warn">This bridge keeps no economy history. It is the bridge '
+        + 'rather than the mod that samples the books over time, so an older deployment '
+        + 'has no such route &mdash; run <code>docker compose up -d --build</code> on it, '
+        + 'or set HISTORY_DB_HOST back if it was turned off deliberately.</div></div>';
+    }
+
+    var station = ((recorded.summary || {}).stations || [])[0];
+
+    if (!station || !station.samples) {
+      return '<div class="card wide"><h3>Over time</h3>' + picker
+        + '<div class="mute2">Nothing sampled in this window yet. The bridge records the '
+        + 'books when something asks for /stations, which the poller service does on a '
+        + 'timer &mdash; set POLL_KEYS in the stack\'s .env if it is not running.</div>'
+        + '</div>';
+    }
+
+    return '<div class="card wide"><h3>Over time</h3>' + picker
+      + kv([
+        ['earned', credits(station.earned)],
+        ['spent', credits(station.spent)],
+        ['tax', credits(station.tax)],
+        ['net', '<b>' + signedCredits(station.net) + '</b>'],
+        ['a net hour', '<b>' + signedCredits(station.perHour && station.perHour.net) + '</b>'],
+        ['observed', duration(station.observed)]
+      ])
+      + seriesChart((recorded.series || {}).points || [], (recorded.series || {}).bucket)
+      + '<div class="mute2">Rates are per <em>observed</em> hour. Nothing in the mod '
+      + 'pushes, so a stretch with no samples is a stretch when nobody was asking, and '
+      + 'counting it as a quiet hour would report a working station as idle.</div>'
+      + '</div>';
+  }
+
+  /* A bar per bucket, drawn as inline SVG rather than a canvas: it has to survive an
+     innerHTML rewrite on every poll, and there are a few dozen bars at most. */
+  function seriesChart(points, bucket) {
+    if (!points.length) { return ''; }
+
+    var width = 100, height = 34, gap = 0.6;
+    var peak = points.reduce(function (max, p) {
+      return Math.max(max, Math.abs(p.net), p.earned);
+    }, 0);
+
+    if (!peak) {
+      return '<div class="mute2">No movement in any bucket in this window.</div>';
+    }
+
+    var step = width / points.length;
+
+    var bars = points.map(function (point, index) {
+      var value = Math.max(0, Math.min(1, Math.abs(point.net) / peak));
+      var h = Math.max(value * height, point.net ? 0.6 : 0);
+      var when = new Date(point.at * 1000);
+
+      return '<rect x="' + (index * step).toFixed(2) + '" y="' + (height - h).toFixed(2)
+        + '" width="' + Math.max(step - gap, 0.4).toFixed(2) + '" height="' + h.toFixed(2)
+        + '" class="' + (point.net < 0 ? 'bad' : 'good') + '">'
+        + '<title>' + esc(when.toLocaleString() + ' — '
+            + numText(point.net) + ' ¢ net, ' + numText(point.earned) + ' ¢ earned')
+        + '</title></rect>';
+    }).join('');
+
+    var first = new Date(points[0].at * 1000);
+    var last = new Date(points[points.length - 1].at * 1000);
+
+    return '<svg class="spark" viewBox="0 0 ' + width + ' ' + height
+      + '" preserveAspectRatio="none" role="img">' + bars + '</svg>'
+      + '<div class="mute2 spark-axis"><span>' + esc(first.toLocaleString()) + '</span>'
+      + '<span>per ' + esc(bucket || 'hour') + ', peak ' + numText(peak) + ' ¢</span>'
+      + '<span>' + esc(last.toLocaleString()) + '</span></div>';
   }
 
   /* ================================ HISTORY ================================ */
@@ -2585,6 +3011,13 @@
       if (tab) { showSub(tab.dataset.sub); }
     });
 
+    /* Delegated rather than bound to the buttons: the card holding them is rewritten
+       whenever the station is re-read, which would drop a direct listener. */
+    $('#sv-economy').addEventListener('click', function (e) {
+      var button = e.target.closest('#economy-window button');
+      if (button) { setEconomyWindow(Number(button.dataset.v)); }
+    });
+
     bindSeg('#filter-type', function (value) {
       S.filters.type = value;
       localStorage.setItem(LS.filters, JSON.stringify(S.filters));
@@ -2613,7 +3046,14 @@
 
     $('#fleet-refresh').addEventListener('click', function () { refreshFleet(true); });
     $('#ship-refresh').addEventListener('click', function () {
-      loadDetail(); loadMission();
+      loadDetail();
+      if (isStation(S.byName[S.selected] || S.detail)) {
+        loadStation();
+        delete S.stationHistory[S.selected];
+        loadStationHistory(S.selected);
+      } else {
+        loadMission();
+      }
       S.catalog = null;
       if (S.sub === 'mission') { loadCatalog(); }
     });

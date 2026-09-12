@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 1;
+    private const SCHEMA = 2;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -256,6 +256,69 @@ final class Db
                  max_seq BIGINT  NOT NULL DEFAULT -1,
                  PRIMARY KEY (key_id, ship)
              )',
+
+            /*
+             * A station's books, sampled.
+             *
+             * The mod reports earnings as running totals since the station was founded,
+             * because that is what the game itself keeps - a TradingManager holds three
+             * counters and no history. A total is not an answer to "what did this place
+             * make last week", so the answer is built here, out of two samples and the
+             * time between them.
+             *
+             * `stock` is good name -> units held, which is the other half: the counters
+             * are one number for the whole station and cannot say which line earned it,
+             * while differencing the stock good by good says what was produced and what
+             * left. See History::economyGoods.
+             *
+             * Sampling is rate-limited per station rather than written every pass - see
+             * History::recordStations. Secured values are only refreshed when the game
+             * saves, so a faster sample is a copy of the previous one.
+             */
+            'CREATE TABLE IF NOT EXISTS station_samples (
+                 id       BIGSERIAL PRIMARY KEY,
+                 key_id   BIGINT      NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+                 ship     TEXT        NOT NULL,
+                 owner    TEXT        NOT NULL DEFAULT \'\',
+                 x        INTEGER     NOT NULL DEFAULT 0,
+                 y        INTEGER     NOT NULL DEFAULT 0,
+                 taken_at TIMESTAMPTZ NOT NULL,
+                 gained   BIGINT      NOT NULL DEFAULT 0,
+                 spent    BIGINT      NOT NULL DEFAULT 0,
+                 tax      BIGINT      NOT NULL DEFAULT 0,
+                 stock    JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 data     JSONB       NOT NULL DEFAULT \'{}\'::jsonb
+             )',
+
+            // Every economy read walks one key's samples in time order, and the window
+            // filter and the LAG() that turns totals into deltas both want this order.
+            'CREATE INDEX IF NOT EXISTS station_samples_window_idx
+                 ON station_samples (key_id, ship, taken_at)',
+
+            // Finding the newest sample per station, which every write does once to
+            // decide whether enough time has passed to take another.
+            'CREATE INDEX IF NOT EXISTS station_samples_latest_idx
+                 ON station_samples (key_id, taken_at DESC)',
+
+            /*
+             * The faction ledger over time: money and resources for the player and for
+             * their alliance. Rate-limited the same way, and kept apart from the station
+             * samples because it answers a different question - station earnings are
+             * gross, while this is what actually survived crew wages, ship losses and
+             * whatever the owner spent it on.
+             */
+            'CREATE TABLE IF NOT EXISTS faction_samples (
+                 id        BIGSERIAL PRIMARY KEY,
+                 key_id    BIGINT      NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+                 owner     TEXT        NOT NULL DEFAULT \'\',
+                 taken_at  TIMESTAMPTZ NOT NULL,
+                 money     BIGINT      NOT NULL DEFAULT 0,
+                 resources JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 stations  INTEGER     NOT NULL DEFAULT 0
+             )',
+
+            'CREATE INDEX IF NOT EXISTS faction_samples_window_idx
+                 ON faction_samples (key_id, owner, taken_at)',
 
             'DELETE FROM api_schema',
             'INSERT INTO api_schema (version) VALUES (' . self::SCHEMA . ')',

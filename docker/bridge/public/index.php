@@ -95,9 +95,10 @@ function fail(int $status, string $code, string $message): never
 }
 
 /**
- * Folds one relayed answer into the history store, if it is one of the two the store is
- * built from: the fleet listing, which carries every craft's position and keeps working
- * with everyone logged out, and a ship's event feed.
+ * Folds one relayed answer into the history store, if it is one the store is built from:
+ * the fleet listing, which carries every craft's position and keeps working with everyone
+ * logged out; a ship's event feed; the station listing, which carries each station's
+ * running earnings totals and stock; and the faction ledger.
  *
  * Wrapped whole in a try/catch. A history that cannot be written is a lost overlay; a
  * history that takes the API call down with it is an outage. The caller's answer has
@@ -117,6 +118,18 @@ function record(History $history, string $path, stdClass $answer): void
             if (is_string($ship) && $ship !== '') {
                 $history->recordEvents($ship, $answer);
             }
+            return;
+        }
+
+        // The two the economy series is built from. Both are rate-limited on the way in,
+        // so a console refreshing every few seconds costs the same rows as the poller.
+        if ($path === '/stations') {
+            $history->recordStations($answer);
+            return;
+        }
+
+        if ($path === '/economy') {
+            $history->recordFactions($answer);
         }
     } catch (Throwable $e) {
         error_log('AutomationAPI bridge: history write failed: ' . $e->getMessage());
@@ -227,7 +240,9 @@ if (str_starts_with($path, '/history')) {
     $what = rawurldecode(substr($path, strlen('/history')));
 
     $filter = [
-        'ship' => (string) ($query['ship'] ?? ''),
+        // `station` is an alias for `ship`: the economy views are about stations and
+        // reading `?ship=` on them is a small but constant papercut.
+        'ship' => (string) ($query['ship'] ?? $query['station'] ?? ''),
         'owner' => (string) ($query['owner'] ?? ''),
         'from' => (int) ($query['from'] ?? 0),
         'to' => (int) ($query['to'] ?? 0),
@@ -250,13 +265,32 @@ if (str_starts_with($path, '/history')) {
         reply(200, ['events' => $history->events($filter)]);
     }
 
+    /*
+     * The economy views. All three read the station samples the bridge has been keeping
+     * off GET /stations, and differ only in how they group them - by station, by time
+     * bucket, or by good. See History::economySummary for what a sample is and why the
+     * rates are per observed hour.
+     */
+    if ($method === 'GET' && ($what === '/economy' || $what === '/economy/summary')) {
+        reply(200, $history->economySummary($filter));
+    }
+
+    if ($method === 'GET' && $what === '/economy/series') {
+        reply(200, $history->economySeries($filter, (string) ($query['bucket'] ?? 'hour')));
+    }
+
+    if ($method === 'GET' && $what === '/economy/goods') {
+        reply(200, $history->economyGoods($filter));
+    }
+
     if ($method === 'POST' && $what === '/clear') {
         reply(200, $history->clear($filter['ship'] !== '' ? $filter['ship'] : null));
     }
 
     fail(404, 'no_such_route', sprintf(
-        'The bridge serves GET /history/summary, /history/visits, /history/heatmap and '
-        . '/history/events, and POST /history/clear. It does not serve %s %s.',
+        'The bridge serves GET /history/summary, /history/visits, /history/heatmap, '
+        . '/history/events, /history/economy/summary, /history/economy/series and '
+        . '/history/economy/goods, and POST /history/clear. It does not serve %s %s.',
         $method, $what === '' ? '/history' : '/history' . $what));
 }
 

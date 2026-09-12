@@ -21,6 +21,8 @@ declare(strict_types=1);
  *                   process logs why and exits, rather than looping doing nothing.
  *   POLL_INTERVAL   seconds between passes (default 30)
  *   POLL_EVENTS     "0" to record movement only and skip the per-ship event calls
+ *   POLL_ECONOMY    "0" to skip the station and faction calls the economy series is
+ *                   built from
  *   POLL_URL        base URL of the bridge (default http://api:80)
  *   POLL_TIMEOUT    seconds to allow one call (default 30)
  *
@@ -50,6 +52,7 @@ $interval = max(5, (int) (getenv('POLL_INTERVAL') ?: 30));
 $base = rtrim((string) (getenv('POLL_URL') ?: 'http://api:80'), '/');
 $timeout = max(5, (int) (getenv('POLL_TIMEOUT') ?: 30));
 $wantEvents = (string) (getenv('POLL_EVENTS') ?: '1') !== '0';
+$wantEconomy = (string) (getenv('POLL_ECONOMY') ?: '1') !== '0';
 
 /** Everything this process says goes to stderr, where compose collects it. */
 function say(string $message): void
@@ -100,12 +103,13 @@ function fetch(string $url, string $key, int $timeout): array
 }
 
 /**
- * One pass over one key: the fleet, then each craft's events.
+ * One pass over one key: the fleet, each craft's events, then the station and faction
+ * ledgers the economy series is built from.
  *
  * Nothing is recorded here. The bridge records what it relays, so calling it is the whole
  * of the job - which is also why a key this process cannot use records nothing at all.
  */
-function pass(string $base, string $key, int $timeout, bool $wantEvents): array
+function pass(string $base, string $key, int $timeout, bool $wantEvents, bool $wantEconomy): array
 {
     $answer = fetch($base . '/ships', $key, $timeout);
 
@@ -136,7 +140,33 @@ function pass(string $base, string $key, int $timeout, bool $wantEvents): array
         }
     }
 
-    return ['ok' => true, 'status' => 200, 'ships' => count($ships), 'events' => $polled];
+    $stations = 0;
+
+    /*
+     * Two flat calls, whatever the fleet looks like: both endpoints roll every station up
+     * themselves, so this does not grow with the number of stations the way the per-ship
+     * event calls above do.
+     *
+     * owner=all on purpose. An alliance station's earnings land in the alliance's account
+     * and the rest of this loop would never see them - the default scope is the calling
+     * player, and a series missing half of a co-owned industry is worse than none.
+     *
+     * The bridge thins these on the way past (HISTORY_ECONOMY_INTERVAL), so polling them
+     * every pass costs the game server two round trips and the database nothing.
+     */
+    if ($wantEconomy) {
+        $answer = fetch($base . '/stations?owner=all', $key, $timeout);
+        if ($answer['status'] === 200 && is_object($answer['body'])) {
+            $stations = is_array($answer['body']->stations ?? null)
+                ? count($answer['body']->stations)
+                : 0;
+        }
+
+        fetch($base . '/economy?owner=all', $key, $timeout);
+    }
+
+    return ['ok' => true, 'status' => 200, 'ships' => count($ships), 'events' => $polled,
+            'stations' => $stations];
 }
 
 function detail(array $answer): string
@@ -154,8 +184,9 @@ function detail(array $answer): string
 }
 
 say(sprintf(
-    'polling %d key%s every %ds at %s, events %s',
-    count($keys), count($keys) === 1 ? '' : 's', $interval, $base, $wantEvents ? 'on' : 'off'
+    'polling %d key%s every %ds at %s, events %s, economy %s',
+    count($keys), count($keys) === 1 ? '' : 's', $interval, $base,
+    $wantEvents ? 'on' : 'off', $wantEconomy ? 'on' : 'off'
 ));
 
 /*
@@ -184,7 +215,7 @@ while (true) {
         $label = 'key #' . ($index + 1);
 
         try {
-            $result = pass($base, $key, $timeout, $wantEvents);
+            $result = pass($base, $key, $timeout, $wantEvents, $wantEconomy);
         } catch (Throwable $e) {
             $result = ['ok' => false, 'status' => 0, 'detail' => $e->getMessage()];
         }

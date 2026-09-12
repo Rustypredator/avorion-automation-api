@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.3.0", "game": "2.5.13",
+  "api": 1, "mod": "0.4.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true}
@@ -374,6 +374,188 @@ records them as they fire. Nothing here is polled.
 
 Reads work offline; only the recording needs some agent online.
 
+## GET /stations
+
+Every station the caller owns, with its books. Reads the ship database, so it works for
+stations in unloaded sectors and with every player logged out - which is the normal state
+of a player's own stations.
+
+| query | values | default |
+|---|---|---|
+| `owner` | `player`, `alliance`, `all` | `player` |
+
+Only craft that run one of the game's merchant scripts appear. A ship is never in here,
+and neither is a defence platform or anything else with no trading manager; use
+`/ships?type=station` for a plain list of stations regardless.
+
+```json
+{
+  "count": 1,
+  "stations": [
+    {
+      "name": "Rusty Refinery",
+      "owner": {"kind": "player", "index": 1, "name": "..."},
+      "type": "Station",
+      "position": {"x": 12, "y": -4},
+      "availability": "Available",
+      "usable": {"ok": false, "code": "NotAShip", "message": "This is not a ship."},
+      "sectorLoaded": false,
+      "cargo": {"capacity": 12000, "free": 5000, "used": 7000},
+      "economy": {
+        "kind": "factory",
+        "scripts": ["factory.lua"],
+        "production": {"factory": "${good} Refinery ${size}", "style": "Factory",
+                       "slots": 3, "active": 2, "margin": 635},
+        "earnings": {"fromGoods": 4000000, "spentOnGoods": 1500000,
+                     "fromTax": 25000, "net": 2525000},
+        "stock": {"Oil": 900, "Raw Oil": 40, "Energy Cell": 1200},
+        "settings": {"buyPriceFactor": 0.9, "sellPriceFactor": 1.1}
+      }
+    }
+  ]
+}
+```
+
+`earnings` are **running totals since the station was founded**, not a rate. That is the
+only form the game keeps them in: a `TradingManager` holds three counters and no history.
+Two readings and the time between them make a rate, which is what
+[`/history/economy/summary`](#get-historyeconomysummary) does.
+
+`stock` is good name to units held, and is here rather than only on the detail endpoint
+because it is what a time series needs. The earnings counters are one number for the whole
+station and cannot say which line earned it; differencing the stock good by good can say
+what was produced and what left.
+
+This is the one call the bridge's economy history is built from, so it is flat and cheap
+on purpose - the priced goods lists live on the detail endpoint below.
+
+## GET /stations/{name}
+
+One station in full: everything [`/ships/{name}`](#get-shipsname) reports, plus the
+`economy` block with its production chain and the goods it trades.
+
+Answers `409 not_a_station` for a craft that runs no merchant script.
+
+```json
+{
+  "name": "Rusty Refinery",
+  "sectorLoaded": false,
+  "economy": {
+    "kind": "factory",
+    "scripts": ["factory.lua"],
+    "production": {
+      "factory": "${good} Refinery ${size}", "style": "Factory", "mine": false,
+      "ingredients": [
+        {"name": "Energy Cell", "amount": 5, "optional": null, "price": 61, "size": 1,
+         "value": 305, "stock": 1200},
+        {"name": "Raw Oil", "amount": 10, "price": 66, "size": 2, "value": 660, "stock": 40}
+      ],
+      "results": [{"name": "Oil", "amount": 5, "price": 320, "size": 2,
+                   "value": 1600, "stock": 900}],
+      "garbage": [],
+      "slots": 3, "active": 2, "running": [{"progress": 0.25}, {"progress": 0.8}],
+      "inputValue": 965, "outputValue": 1600, "margin": 635,
+      "shuttleVolume": 20
+    },
+    "goods": {
+      "buys": [
+        {"name": "Energy Cell", "plural": "Energy Cells", "price": 61, "size": 1,
+         "basePrice": 55, "stock": 1200, "maxStock": 4000, "fill": 0.3,
+         "illegal": false, "stolen": false, "dangerous": false, "suspicious": false}
+      ],
+      "sells": [
+        {"name": "Oil", "price": 320, "size": 2, "basePrice": 352,
+         "stock": 900, "maxStock": 2000, "fill": 0.45}
+      ]
+    },
+    "earnings": {"fromGoods": 4000000, "spentOnGoods": 1500000,
+                 "fromTax": 25000, "net": 2525000},
+    "settings": {
+      "buyPriceFactor": 0.9, "sellPriceFactor": 1.1,
+      "buysFromOthers": true, "sellsToOthers": false,
+      "activelyRequest": true, "activelySell": false,
+      "policies": {"sellsIllegal": false, "buysIllegal": false}
+    }
+  }
+}
+```
+
+- `kind` is the station's primary merchant script: `factory`, `tradingpost`, `consumer`,
+  `seller`, `equipmentdock`, `shipyard`, `resourcedepot`, `turretfactory`, and so on. A
+  station that runs several - a shipyard also runs a repair dock and a consumer - is named
+  after the one that defines it, and `scripts` lists them all.
+- `price` on a good is the goods index's base value; `basePrice` is that times the
+  station's own price factor, which is what the game's own trade UI shows as the base.
+  **Neither is what a trade will actually settle at.** The real price also carries a
+  supply/demand factor that lives in the sector's `economyupdater` script and a relations
+  factor for the counterparty, and neither is in the ship database.
+- `maxStock` is the cap the station itself uses to decide it has no room to produce. The
+  cargo bay is split evenly between every good traded, so adding a good lowers the cap on
+  all the others. `fill` is `stock / maxStock`: a **sold** good at 1 has nowhere to put the
+  next cycle, and a **bought** good at 0 is an ingredient the line is waiting on.
+- `margin` prices one production cycle at the goods index's own values. It says whether a
+  chain is worth running; it is not revenue, since the result still has to be sold.
+- `optional` marks an ingredient the line will use if it has it, for a faster cycle, and
+  will run without.
+- `secured` is false when the engine has not written this craft's scripts to its database
+  row yet - a station founded since the last save. Everything else is then empty rather
+  than wrong, which otherwise reads exactly like a factory with no line and no income.
+
+### Where these numbers come from, and how fresh they are
+
+Not from the station's `Entity` - that only exists while its sector is resident, and a
+player's stations sit in sectors nobody flies through, so an entity read would answer
+"sector not loaded" for exactly the stations their owner cares about.
+
+They come from the craft's database row instead. Every merchant script writes its state
+there through `secure()`, and `ShipDatabaseEntry:getSecuredScriptValues()` reads it back.
+The cost is that a snapshot is only as new as the last time the engine called `secure()`:
+on unload, and on the server's regular saves.
+
+`sectorLoaded` is the flag that matters:
+
+- **false** - the sector is unloaded, and the figures are exactly what the station held
+  when it went quiet. Which is also all that has happened to it.
+- **true** - the sector is resident, and the figures can trail the live entity by up to
+  one save interval.
+
+## GET /economy
+
+The faction ledger: what the caller holds, and what their stations have made.
+
+| query | values | default |
+|---|---|---|
+| `owner` | `player`, `alliance`, `all` | `player` |
+
+Pass `?owner=all` for the player and their alliance together, which is usually what you
+want here - an alliance station's earnings land in the alliance's account rather than in
+the founder's.
+
+```json
+{
+  "count": 2,
+  "factions": [
+    {
+      "owner": {"kind": "player", "index": 1, "name": "..."},
+      "money": 12500000,
+      "resources": [
+        {"material": "Iron", "value": 0, "amount": 40000},
+        {"material": "Titanium", "value": 1, "amount": 9000}
+      ],
+      "stations": {
+        "count": 7,
+        "earnings": {"fromGoods": 41000000, "spentOnGoods": 12000000,
+                     "fromTax": 90000, "net": 29090000}
+      }
+    }
+  ]
+}
+```
+
+`stations.earnings` is the sum of the running totals of every station the faction owns, so
+it is gross lifetime income from trade. `money` is what actually survived crew wages, ship
+losses and everything the owner spent it on; the two are not meant to reconcile.
+
 ## GET /galaxy/route
 
 Runs the game's own `calculateJumpPath`, the same pathfinder the travel analysis uses.
@@ -576,8 +758,13 @@ next restart. That is the right shape for "what is this ship doing now" and no u
 growing file from a galaxy script on the server's own tick, which is a bad trade: a month
 of travel data paid for in frame time on a running game server.
 
+The station books have the same shape of problem for a different reason. The game keeps
+three money counters per station and no history at all, so the mod can only ever report a
+lifetime total - and "what did this factory make this week" is a question about two
+readings, not one.
+
 So the bridge keeps the copy instead, in a Postgres database alongside it. The bridge
-already relays every call and two of them carry everything the store needs, so recording
+already relays every call and four of them carry everything the store needs, so recording
 costs a couple of statements on requests that were happening anyway and nothing at all on
 the game side.
 
@@ -592,6 +779,8 @@ written only when a craft changes sector, so a parked fleet costs nothing.
 |---|---|
 | `GET /ships` | each craft's sector, as a **visit** - opened when it arrives, closed when it moves on |
 | `GET /ships/{name}/events` | the mod's own order and status events, kept past the 200 and past a restart |
+| `GET /stations` | each station's running earnings totals and its stock per good, as a **sample** |
+| `GET /economy` | the faction's money and resources, likewise |
 
 Positions come from the ship database, which the mod reads **with every player logged out**,
 so the travel record keeps filling whether or not anything is online to fly.
@@ -599,13 +788,21 @@ so the travel record keeps filling whether or not anything is online to fly.
 **Nothing in the mod pushes.** History accumulates only while something is calling the API,
 and the mod's event log is a 200-entry ring buffer that drops its oldest entry whether or
 not anyone collected it. The compose stack runs a `poller` service for exactly this - set
-`POLL_KEYS` to the keys whose fleets should be recorded and it calls these two endpoints
+`POLL_KEYS` to the keys whose fleets should be recorded and it calls these endpoints
 every `POLL_INTERVAL` seconds (default 30), which is also the accuracy of a travel track.
 
 Without a poller the record covers only the moments a console or a script happened to be
 running, and a gap in it is a gap in who was looking rather than a gap in what happened.
 Either way dwell is reported as *observed* seconds: time nobody was watching counts as zero
 rather than being guessed at.
+
+**Economy samples are thinned on the way in.** Unlike a visit, a sample cannot be extended
+in place - a time series is exactly the repetition - so a row per station per pass would be
+thousands a day, all of them copies: the mod reads a station's books out of its database
+row, and the game only rewrites that row when it saves. `HISTORY_ECONOMY_INTERVAL` (default
+300s) is the floor between two stored samples of the same station. The poller keeps calling
+at its own rate either way, so a console that is open still shows live numbers; only the
+durable copy is thinned.
 
 Event timestamps are reconstructed rather than stamped on arrival. The mod tags each event
 with the server's uptime in seconds, which dates nothing on its own but spaces events
@@ -638,12 +835,17 @@ What is on disk, per craft.
 ```json
 {
   "ships": [
-    {"name": "Ore Hound", "visits": 41, "events": 190, "sectors": 12,
+    {"name": "Ore Hound", "visits": 41, "events": 190, "samples": 0, "sectors": 12,
      "first": 1757630000, "last": 1757719400}
   ],
-  "rows": 231, "retentionDays": 30, "recording": true
+  "rows": 231, "retentionDays": 30, "recording": true,
+  "economy": {"samples": 560, "stations": 2, "since": 1757630100, "interval": 300}
 }
 ```
+
+`economy` says whether there is a station series at all, which is what tells a client to
+offer the view rather than draw an empty chart - a deployment upgraded mid-month has travel
+history and no samples yet. Per craft, `samples` counts the station readings held for it.
 
 ## GET /history/visits
 
@@ -686,6 +888,111 @@ own event object wrapped in `t` (Unix seconds), `s` (craft), `q` (the mod's sequ
 number) and `o` (owner kind).
 
 Sequence numbers restart with the server, so `q` does not identify an event on its own.
+
+## GET /history/economy/summary
+
+What each station earned over a window, and what the faction was holding.
+
+The mod reports earnings as running totals since a station was founded, because that is
+all the game keeps. This differences consecutive samples and sums the differences, which
+is what turns a lifetime total into "what did this place make this week".
+
+| query | notes |
+|---|---|
+| `station` (or `ship`) | one station by name; omit for all of them |
+| `owner` | `player` or `alliance` |
+| `from`, `to` | Unix seconds |
+
+```json
+{
+  "window": {"from": 1757630000, "to": 1757716400, "seconds": 86400},
+  "stations": [
+    {
+      "ship": "Rusty Refinery", "owner": "player", "x": 12, "y": -4,
+      "kind": "factory", "produces": ["Oil"], "factory": "${good} Refinery ${size}",
+      "samples": 280, "first": 1757630100, "last": 1757716300, "observed": 84000,
+      "earned": 410000, "spent": 90000, "tax": 4000, "net": 324000,
+      "perHour": {"earned": 17571.43, "spent": 3857.14, "net": 13885.71}
+    }
+  ],
+  "totals": {"earned": 410000, "spent": 90000, "tax": 4000, "net": 324000,
+             "observed": 84000, "stations": 1,
+             "perHour": {"earned": 17571.43, "spent": 3857.14, "net": 13885.71}},
+  "factions": [
+    {
+      "owner": "player", "samples": 280, "first": 1757630100, "last": 1757716300,
+      "money": {"first": 11800000, "last": 12500000, "change": 700000},
+      "resources": {"Iron": 40000, "Titanium": 9000},
+      "stations": 7
+    }
+  ]
+}
+```
+
+- **Rates are per `observed` hour, not per wall-clock hour.** Nothing in the mod pushes, so
+  a stretch with no samples is a stretch when nobody was asking; counting it as a quiet
+  hour would report a working station as idle. A single gap longer than four sampling
+  intervals is capped, so one weekend with the stack down does not swallow the denominator.
+- **The window applies to the later sample of each pair, and the scan below it is not
+  bounded.** A station sampled at 09:55 and 10:05 earned something between those readings,
+  and asking about "since 10:00" returns it. Starting the scan at the window edge would
+  silently lose the first minutes of every window.
+- **A counter that fell contributes zero, never a negative.** The counters only rise while
+  a station stands, so a drop means the row was reset - destroyed and rebuilt, or founded
+  again under the same name - and the honest reading of that pair is "this measures
+  nothing" rather than a refund.
+- `factions` is not differenced. Money is a level rather than a counter, and a balance that
+  fell is as meaningful as one that rose, so it reports where the window started and ended.
+  `stations.earnings` above is gross trade income; `money` is what survived wages, losses
+  and spending. They are not meant to reconcile.
+
+## GET /history/economy/series
+
+The same numbers bucketed, which is what a chart wants. Same query parameters, plus:
+
+| query | values | default |
+|---|---|---|
+| `bucket` | `hour`, `day` | `hour` |
+
+```json
+{
+  "bucket": "hour", "window": {"from": 1757630000, "to": 1757716400}, "ship": "",
+  "points": [{"at": 1757631600, "earned": 20000, "spent": 4000, "tax": 200, "net": 16200}]
+}
+```
+
+Omit `station` and the points are every station summed; name one and they are that
+station's. A bucket is attributed to the **later** sample of each pair, so an interval
+straddling a boundary lands wholly in the bucket it ended in - a rounding error of at most
+one sampling interval, and the alternative is apportioning income across buckets on an
+assumption of evenness the data does not support.
+
+## GET /history/economy/goods
+
+Units in and out per good, which is as close as anything gets to "what did it sell".
+
+A station's own books cannot answer that: a `TradingManager` keeps one money counter for
+the whole station and never attributes it to a good. What it does keep, good by good, is
+how many units are in the bay, and differencing that says which way each good moved.
+
+```json
+{
+  "window": {"from": 1757630000, "to": 1757716400},
+  "goods": [
+    {"ship": "Rusty Refinery", "good": "Oil", "in": 400, "out": 380, "net": 20, "stock": 900},
+    {"ship": "Rusty Refinery", "good": "Raw Oil", "in": 0, "out": 240, "net": -240, "stock": 40}
+  ]
+}
+```
+
+`in` is units that appeared - produced by the line, bought from a passing trader, or
+delivered by a supply ship. `out` is units that left, whether sold, consumed as an
+ingredient, or shuttled to another of your stations. **The split between those causes is
+not recoverable from here and is not guessed at**; the fields are named for what they
+actually measure.
+
+`stock` is the latest reading in the window, so a good with a large `in`, a small `out` and
+a high `stock` is a line filling its own bay - which is what stops it producing.
 
 ## POST /history/clear
 

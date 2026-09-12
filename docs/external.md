@@ -339,6 +339,27 @@ loop:
 it faster than that returns the same answer while spending your 20 requests/second. The event
 feed is push-driven on the mod's side and is the cheaper way to notice change.
 
+`GET /stations` is the same argument with a longer period. A station's books are read out of
+its database row, which the game rewrites only when it saves or unloads the sector, so two
+calls a minute apart routinely return identical numbers. Sample it on the order of minutes;
+the bundled bridge stores at most one sample per station per `HISTORY_ECONOMY_INTERVAL`
+(default 300s) for exactly this reason.
+
+### Station earnings are totals, not rates
+
+The three counters in `economy.earnings` are lifetime sums since the station was founded -
+the only form the game keeps them in. Any rate is yours to derive from two readings and the
+time between them, and two things make that less obvious than it looks:
+
+- A counter that has **fallen** is a reset, not a refund. It means the station was destroyed
+  and rebuilt, or founded again under the same name, so the honest reading of that pair is
+  zero rather than a large negative.
+- Divide by time you actually **observed**, not wall-clock time. A gap in your sampling is a
+  gap in who was looking; counting it as a quiet hour reports a working station as idle.
+
+Both are what the bundled bridge's `/history/economy/*` endpoints do; see *Bridge-local
+endpoints* in [docs/api.md](api.md).
+
 ### Prefer observation to prediction
 
 `/map/predict` and `predict=true` searches run the galaxy generator and know only what the

@@ -180,6 +180,62 @@ check "$(json 'import json,sys;s=json.load(open(sys.argv[1]));sys.exit(0 if s["s
 status="$(get "$KEY" /history/nonsense)"
 check "$([ "$status" = "404" ] && echo 0 || echo 1)" "an unknown history route is a 404 from the bridge" "got $status"
 
+# #### The station economy #### --
+#
+# The store's other half: the mod reports lifetime totals, and the bridge differences
+# samples of them into a rate. Nothing in the Lua tests reaches that arithmetic, and
+# nothing in the PHP tests reaches it through the real transport.
+
+echo
+echo "economy"
+
+status="$(get "$KEY" /stations)"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "GET /stations round-trips" "got $status: $(head -c 200 "$WORK/body")"
+
+kind="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(b["stations"][0]["economy"]["kind"] if b["stations"] else "")')"
+check "$([ "$kind" = "factory" ] && echo 0 || echo 1)" \
+    "the station is read out of its database row, sector unloaded" "got '$kind'"
+
+status="$(get "$KEY" /economy)"
+money="$(json 'import json,sys;print(json.load(open(sys.argv[1]))["factions"][0]["money"])')"
+check "$([ -n "$money" ] && [ "$money" != "0" ] && echo 0 || echo 1)" \
+    "GET /economy reports the faction ledger" "got '$money'"
+
+# The fake server moves the station's counters every few seconds, so two samples far
+# enough apart must differ. HISTORY_ECONOMY_INTERVAL is the floor between stored samples
+# and defaults to 300s, which is longer than this test is prepared to wait.
+"${COMPOSE[@]}" down >/dev/null 2>&1
+echo "HISTORY_ECONOMY_INTERVAL=30" >> "$WORK/env"
+"${COMPOSE[@]}" up -d >/dev/null 2>&1
+await
+
+get "$KEY" /stations >/dev/null
+sleep 32
+get "$KEY" /stations >/dev/null
+
+status="$(get "$KEY" '/history/economy/summary')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "the bridge answers /history/economy/summary" "got $status"
+
+earned="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(b["stations"][0]["earned"] if b["stations"] else -1)')"
+check "$([ "${earned:-0}" -gt 0 ] && echo 0 || echo 1)" \
+    "two samples of a lifetime total become an amount earned" "got '$earned'"
+
+rate="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(1 if b["stations"] and b["stations"][0]["perHour"]["net"] != 0 else 0)')"
+check "$([ "$rate" = "1" ] && echo 0 || echo 1)" "and a rate per observed hour" "got '$rate'"
+
+status="$(get "$KEY" '/history/economy/goods')"
+moved="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(1 if any(g["in"] or g["out"] for g in b["goods"]) else 0)')"
+check "$([ "$moved" = "1" ] && echo 0 || echo 1)" \
+    "and the stock differences say which goods moved" "got '$moved'"
+
+status="$(get "$KEY" '/history/economy/series?bucket=day')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "the series buckets on request" "got $status"
+
+status="$(get bogus '/history/economy/summary')"
+stations="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["stations"]))')"
+check "$([ "$status" = "200" ] && [ "$stations" = "0" ] && echo 0 || echo 1)" \
+    "an unknown key reads an empty economy, not someone else's" "got $status, $stations stations"
+
 # #### The poller #### --
 #
 # The service that makes the history continuous. Nothing in the mod pushes, so without

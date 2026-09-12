@@ -44,6 +44,10 @@ services:
       HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
       HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
       HISTORY_DAYS: "${HISTORY_DAYS:-30}"
+      # The floor between two stored samples of the same station's books. The mod reads
+      # those out of the craft's database row, which the game only rewrites when it saves,
+      # so sampling faster than this buys duplicate rows rather than resolution.
+      HISTORY_ECONOMY_INTERVAL: "${HISTORY_ECONOMY_INTERVAL:-300}"
 
     # moddata only, so a bridge process that misbehaves still cannot reach saves or the
     # globals file the API keys live in.
@@ -144,6 +148,7 @@ services:
       POLL_KEYS: "${POLL_KEYS-}"
       POLL_INTERVAL: "${POLL_INTERVAL:-30}"
       POLL_EVENTS: "${POLL_EVENTS:-1}"
+      POLL_ECONOMY: "${POLL_ECONOMY:-1}"
       HISTORY_DSN: "${HISTORY_DSN-}"
       # Blank this in .env to keep no history at all - see bridge/src/db.php for why the
       # switch is here and not on HISTORY_DSN.
@@ -152,6 +157,7 @@ services:
       HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
       HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
       HISTORY_DAYS: "${HISTORY_DAYS:-30}"
+      HISTORY_ECONOMY_INTERVAL: "${HISTORY_ECONOMY_INTERVAL:-300}"
 
     depends_on:
       api:

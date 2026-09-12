@@ -22,6 +22,7 @@ local MissionsHandler = include("automationapi/handlers/missions")
 local MovementHandler = include("automationapi/handlers/movement")
 local ShipEvents = include("automationapi/shipevents")
 local MapHandler = include("automationapi/handlers/map")
+local EconomyHandler = include("automationapi/handlers/economy")
 
 local Analysis = include("automationapi/analysis")
 
@@ -498,6 +499,7 @@ function AutomationApiBridge.initialize()
     MissionsHandler.register(router)
     MovementHandler.register(router)
     MapHandler.register(router)
+    EconomyHandler.register(router)
 
     ready = true
 

@@ -306,6 +306,229 @@ check(count($left) === 1 && ($left[0]['open'] ?? false) === true,
       'and the visit still open is kept however old it is');
 putenv('HISTORY_DAYS');
 
+echo "\nstation samples\n";
+
+/*
+ * The economy views differ from everything above in one way that shapes the whole test:
+ * they answer with rates, and a rate needs samples at known, different times. The mod
+ * reports running totals, and recordStations stamps a sample with now() and refuses a
+ * second one for HISTORY_ECONOMY_INTERVAL - so a series cannot be built by calling it in
+ * a loop. The rate-limit is tested through the public method, and the series is then
+ * placed directly, which is the only way to control the clock.
+ */
+$economyKey = freshKey();
+$madeKeys[] = $economyKey;
+$economy = new History($economyKey);
+
+function stations(array $rows): stdClass
+{
+    $out = [];
+
+    foreach ($rows as $name => $row) {
+        $out[] = (object) [
+            'name' => $name,
+            'owner' => (object) ['kind' => $row['owner'] ?? 'player'],
+            'position' => (object) ['x' => $row['x'] ?? 0, 'y' => $row['y'] ?? 0],
+            'cargo' => (object) ['used' => 100.0, 'capacity' => 1000.0],
+            'economy' => (object) [
+                'kind' => $row['kind'] ?? 'factory',
+                'production' => (object) [
+                    'factory' => '${good} Refinery ${size}',
+                    'style' => 'Factory',
+                    'slots' => 3,
+                    'active' => 1,
+                    'results' => [(object) ['name' => 'Oil']],
+                ],
+                'earnings' => (object) [
+                    'fromGoods' => $row['gained'] ?? 0,
+                    'spentOnGoods' => $row['spent'] ?? 0,
+                    'fromTax' => $row['tax'] ?? 0,
+                ],
+                'stock' => (object) ($row['stock'] ?? []),
+            ],
+        ];
+    }
+
+    return (object) ['stations' => $out, 'count' => count($out)];
+}
+
+$economy->recordStations(stations(['Rusty Refinery' => ['gained' => 1000, 'x' => 12, 'y' => -4]]));
+
+$keyId = (int) $pdo->query(
+    "SELECT id FROM api_keys WHERE key_hash = '" . hash('sha256', $economyKey) . "'"
+)->fetch()['id'];
+
+$count = static function () use ($pdo, $keyId): int {
+    $row = $pdo->query("SELECT COUNT(*) AS n FROM station_samples WHERE key_id = {$keyId}")->fetch();
+    return (int) $row['n'];
+};
+
+check($count() === 1, 'a station listing is recorded as one sample');
+
+// The poller calls every 30s and a console faster than that. Without the floor the table
+// would grow by a row a pass per station, all of them copies: the mod reads these out of
+// the craft's database row, which the game only rewrites when it saves.
+$economy->recordStations(stations(['Rusty Refinery' => ['gained' => 1200, 'x' => 12, 'y' => -4]]));
+check($count() === 1, 'a second listing inside the sample interval adds nothing');
+
+$pdo->exec("DELETE FROM station_samples WHERE key_id = {$keyId}");
+
+/** Places one sample at a known time, which recordStations cannot be made to do. */
+function sample(PDO $pdo, int $keyId, string $ship, int $ago, array $row): void
+{
+    $pdo->prepare(
+        'INSERT INTO station_samples (key_id, ship, owner, x, y, taken_at, gained, spent, tax, stock, data)
+         VALUES (:k, :s, :o, 12, -4, now() - make_interval(secs => :ago), :g, :p, :a,
+                 CAST(:st AS jsonb), CAST(:d AS jsonb))'
+    )->execute([
+        ':k' => $keyId,
+        ':s' => $ship,
+        ':o' => $row['owner'] ?? 'player',
+        ':ago' => $ago,
+        ':g' => $row['gained'] ?? 0,
+        ':p' => $row['spent'] ?? 0,
+        ':a' => $row['tax'] ?? 0,
+        ':st' => json_encode($row['stock'] ?? []),
+        ':d' => json_encode(['kind' => 'factory',
+                             'production' => ['factory' => 'Oil Refinery', 'results' => ['Oil']]]),
+    ]);
+}
+
+// Two hours of a refinery, sampled every half hour. The counters only ever rise, which is
+// what the game does while a station stands.
+sample($pdo, $keyId, 'Rusty Refinery', 7200, ['gained' => 1000, 'spent' => 400, 'tax' => 10,
+                                              'stock' => ['Oil' => 100, 'Raw Oil' => 500]]);
+sample($pdo, $keyId, 'Rusty Refinery', 5400, ['gained' => 3000, 'spent' => 900, 'tax' => 30,
+                                              'stock' => ['Oil' => 260, 'Raw Oil' => 380]]);
+sample($pdo, $keyId, 'Rusty Refinery', 3600, ['gained' => 5000, 'spent' => 1400, 'tax' => 50,
+                                              'stock' => ['Oil' => 180, 'Raw Oil' => 260]]);
+sample($pdo, $keyId, 'Alliance Exchange', 3600, ['gained' => 500, 'spent' => 0, 'tax' => 0,
+                                                 'owner' => 'alliance', 'stock' => ['Ore' => 40]]);
+sample($pdo, $keyId, 'Alliance Exchange', 1800, ['gained' => 900, 'spent' => 0, 'tax' => 0,
+                                                 'owner' => 'alliance', 'stock' => ['Ore' => 90]]);
+
+echo "\neconomy summary\n";
+
+$summary = $economy->economySummary([]);
+$byName = [];
+foreach ($summary['stations'] as $station) {
+    $byName[$station['ship']] = $station;
+}
+
+check(count($summary['stations']) === 2, 'both stations are reported');
+
+$refinery = $byName['Rusty Refinery'];
+check($refinery['earned'] === 4000, 'earnings are differenced, not reported as the running total');
+check($refinery['spent'] === 1000, 'and so is what it spent');
+check($refinery['tax'] === 40, 'and the tax it took');
+check($refinery['net'] === 4000 + 40 - 1000, 'net is earned plus tax less spent');
+check($refinery['observed'] === 3600, 'observed time is the span the samples actually cover');
+check($refinery['perHour']['earned'] === 4000.0, 'the rate is per observed hour');
+check($refinery['kind'] === 'factory', 'the station description travels with the sample');
+check($refinery['produces'] === ['Oil'], 'including what it produces');
+
+check($summary['totals']['earned'] === 4400, 'the totals add both stations up');
+check($summary['totals']['stations'] === 2, 'and count them');
+
+$mine = $economy->economySummary(['owner' => 'player']);
+check(count($mine['stations']) === 1, 'the owner filter narrows it');
+
+$one = $economy->economySummary(['ship' => 'Alliance Exchange']);
+check(count($one['stations']) === 1 && $one['stations'][0]['earned'] === 400,
+      'and so does naming one station');
+
+/*
+ * The window applies to the later sample of each pair, and the scan below it does not
+ * stop at the window edge. Asking for the last 45 minutes has to include the 3000 -> 5000
+ * step, whose earlier half sits outside: the alternative silently loses whatever happened
+ * between the last sample before the window and the first one inside it.
+ */
+$recent = $economy->economySummary(['from' => time() - 2700]);
+check(count($recent['stations']) === 1 && $recent['stations'][0]['ship'] === 'Alliance Exchange',
+      'a station whose last sample predates the window drops out of it');
+check($recent['stations'][0]['earned'] === 400,
+      'and the pair whose earlier half sits outside the window still counts, not zero');
+
+echo "\na counter that went backwards\n";
+
+// A station destroyed and rebuilt under the same name starts its books again at zero.
+// Differencing that naively reports a refund of everything it ever made.
+sample($pdo, $keyId, 'Rusty Refinery', 900, ['gained' => 0, 'spent' => 0, 'tax' => 0,
+                                             'stock' => ['Oil' => 0]]);
+$afterReset = $economy->economySummary([]);
+foreach ($afterReset['stations'] as $station) {
+    if ($station['ship'] === 'Rusty Refinery') {
+        check($station['earned'] === 4000, 'a reset counter contributes nothing, not a negative');
+    }
+}
+
+echo "\neconomy series\n";
+
+$series = $economy->economySeries(['ship' => 'Alliance Exchange'], 'hour');
+check($series['bucket'] === 'hour', 'the bucket is echoed back');
+check(count($series['points']) >= 1, 'the window is bucketed');
+
+$earned = 0;
+foreach ($series['points'] as $point) {
+    $earned += $point['earned'];
+}
+check($earned === 400, 'and the buckets add up to the same total the summary reports');
+
+check($economy->economySeries([], 'nonsense')['bucket'] === 'hour',
+      'an unknown bucket falls back to the hour rather than reaching the query');
+
+echo "\neconomy goods\n";
+
+$goods = [];
+foreach ($economy->economyGoods(['ship' => 'Rusty Refinery'])['goods'] as $row) {
+    $goods[$row['good']] = $row;
+}
+
+// Oil went 100 -> 260 -> 180 -> 0: 160 units appeared, then 80 and then 180 left.
+check($goods['Oil']['in'] === 160, 'units that appeared are counted as in');
+check($goods['Oil']['out'] === 260, 'and units that left as out');
+check($goods['Oil']['net'] === -100, 'net is the difference');
+check($goods['Oil']['stock'] === 0, 'stock is the latest reading');
+
+// Raw Oil only ever drains, which is what an ingredient does.
+check($goods['Raw Oil']['in'] === 0 && $goods['Raw Oil']['out'] === 240,
+      'an ingredient that is only consumed shows no inflow');
+
+echo "\nfaction ledger\n";
+
+$economy->recordFactions((object) ['factions' => [
+    (object) [
+        'owner' => (object) ['kind' => 'player'],
+        'money' => 12500000,
+        'resources' => [(object) ['material' => 'Iron', 'amount' => 40000]],
+        'stations' => (object) ['count' => 2],
+    ],
+]]);
+
+$ledger = $economy->economySummary([])['factions'];
+check(count($ledger) === 1, 'the faction ledger is sampled');
+check($ledger[0]['money']['last'] === 12500000, 'with the balance');
+check($ledger[0]['money']['change'] === 0, 'and no change from a single sample');
+check((float) $ledger[0]['resources']['Iron'] === 40000.0,
+      'resources are flattened to material -> amount');
+check($ledger[0]['stations'] === 2, 'and the station count travels with it');
+
+$economy->recordFactions((object) ['factions' => [
+    (object) ['owner' => (object) ['kind' => 'player'], 'money' => 99],
+]]);
+check($economy->economySummary([])['factions'][0]['money']['last'] === 12500000,
+      'a second ledger sample inside the interval is refused too');
+
+echo "\neconomy in the summary\n";
+
+$shape = $economy->summary();
+check($shape['economy']['stations'] === 2, 'the store says how many stations it has samples for');
+check($shape['economy']['samples'] > 0, 'and how many samples it holds');
+check($shape['economy']['interval'] === 300, 'and the interval it is sampling at');
+
+$economy->clear(null);
+check($economy->economySummary([])['stations'] === [], 'clearing takes the samples with it');
+
 echo "\nclearing\n";
 
 $history->clear('Tug');

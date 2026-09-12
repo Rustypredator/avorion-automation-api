@@ -178,6 +178,14 @@ function M.install()
         function e:getTitle() return ship.title end
         function e:getIcon() return ship.icon end
         function e:getOrderInfo() return ship.orderInfo end
+        function e:getDocksEnabled() return ship.docksEnabled ~= false end
+
+        -- scriptIndex -> path, and scriptIndex -> the table that script's secure()
+        -- returned. Both are keyed by the same index and neither is a sequence, which is
+        -- how the game hands them over and what the station reader has to cope with.
+        function e:getScripts() return ship.scripts or {} end
+        function e:getSecuredScriptValues() return ship.secured or {} end
+
         function e:getTurretSlotRequirementsFulfilled() return ship.turretSlotsOk ~= false end
         function e:getFighterStartRequirementsFulfilled() return ship.fighterStartsOk ~= false end
         function e:getFighterSquadRequirementsFulfilled() return ship.fighterSquadsOk ~= false end
@@ -371,6 +379,23 @@ function M.install()
         -- lib/galaxy.lua only exists for its Balancing_* globals, which are installed
         -- below; the module itself is never indexed by this mod.
         galaxy = {},
+
+        -- lib/goods.lua is pure data that defines the `goods` global as a side effect.
+        -- economy.lua prices a production chain off it, so the mock installs a handful of
+        -- real entries rather than an empty table - a chain priced at zero would let a
+        -- broken lookup pass the tests.
+        goods = (function()
+            _G.goods =
+            {
+                ["Ore"] = {name = "Ore", plural = "Ore", price = 30, size = 1, level = 0},
+                ["Energy Cell"] = {name = "Energy Cell", plural = "Energy Cells",
+                                   price = 61, size = 1, level = 0},
+                ["Raw Oil"] = {name = "Raw Oil", plural = "Raw Oil", price = 66,
+                               size = 2, level = 0},
+                ["Oil"] = {name = "Oil", plural = "Oil", price = 320, size = 2, level = 1},
+            }
+            return {}
+        end)(),
 
         -- The seed-derived generator. The real one reproduces the galaxy generator's
         -- decision layer; the mock reads a table the test set up, so the endpoints can
@@ -612,6 +637,21 @@ function M.addShip(factionIndex, name, spec)
     return spec
 end
 
+-- The faction ledger, shared by Player and Alliance. Resources come back as one value
+-- per material rather than a table, exactly as the engine returns them.
+local function addLedgerApi(faction)
+    faction.money = faction.money or 0
+    faction.resources = faction.resources or {}
+
+    function faction:getResources()
+        local out = {}
+        for value = 0, NumMaterials() - 1 do
+            out[value + 1] = self.resources[value] or 0
+        end
+        return table.unpack(out)
+    end
+end
+
 -- The craft API shared by Player and Alliance.
 local function addCraftApi(faction)
     function faction:getShipNames()
@@ -782,6 +822,7 @@ function M.addPlayer(index, name)
     function p:getSectorCoordinates() return self.sectorX, self.sectorY end
 
     addCraftApi(p)
+    addLedgerApi(p)
 
     players[index] = p
 
@@ -806,6 +847,7 @@ function M.addAlliance(index, name, memberIndex, privileges, members)
     end
 
     addCraftApi(a)
+    addLedgerApi(a)
     M.alliances[index] = a
 
     for _, who in ipairs(roster) do
