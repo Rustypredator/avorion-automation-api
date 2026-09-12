@@ -53,6 +53,14 @@ a { color: var(--accent); }
 .hidden { display: none !important; }
 .muted { color: var(--text-dim); }
 .mute2 { color: var(--text-mute); }
+
+/* A shortened number (1.2M) or a truncated asset path, both carrying the full value in
+   their title. The dotted underline is the only hint that hovering says more. */
+.abbr {
+  border-bottom: 1px dotted var(--text-mute);
+  cursor: help;
+  font-variant-numeric: tabular-nums;
+}
 .spacer { flex: 1; }
 .pad { padding: 16px; overflow: auto; height: 100%; }
 
@@ -163,6 +171,8 @@ main { flex: 1 1 auto; overflow: hidden; min-height: 0; }
 .ship-row.sel { background: var(--bg-4); box-shadow: inset 2px 0 0 var(--accent); }
 .ship-row .n { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ship-row .s { grid-column: 1 / -1; font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* What a goods search actually matched, in place of the row's last event. */
+.ship-row .hit-goods { color: var(--accent); }
 
 .badges { display: flex; gap: 5px; flex-wrap: wrap; }
 .badge {
@@ -206,11 +216,15 @@ main { flex: 1 1 auto; overflow: hidden; min-height: 0; }
 .bar > i.good { background: var(--good); }
 .bar > i.warn { background: var(--warn); }
 .bar > i.bad { background: var(--bad); }
+/* A meter reading that is over its budget - energy drawn past what is produced. */
+.over { color: var(--bad); }
 
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th { text-align: left; color: var(--text-dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
 td { padding: 3px 8px 3px 0; border-bottom: 1px solid var(--bg-3); vertical-align: top; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+/* A right-aligned column runs into whatever is left-aligned next to it. */
+td.num + td, th.num + th { padding-left: 12px; }
 
 .section { margin-bottom: 18px; }
 .section > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-bottom: 9px; padding-bottom: 5px; border-bottom: 1px solid var(--line); }

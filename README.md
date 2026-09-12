@@ -160,6 +160,12 @@ missions, orders, travel, a galaxy map and a live per-ship event log. It is plai
 JavaScript with no build step and no CDN, and all of its logic runs in the browser: it
 holds your key, talks to the API directly and stores nothing on a server.
 
+The fleet filter searches names, status, sector and owner, and also the goods a craft is
+carrying: type `fusion` and the stations holding Fusion Cores come up, with the matching
+part of their manifest on the row. Holds are not in the listing endpoint, so that half of
+the search reads `/ships/{name}` once per craft, at background priority behind anything you
+are doing and cached for two minutes - it happens only once you have typed something.
+
 The map can also draw where a fleet has actually been - a heatmap of time spent per sector
 and a per-craft travel track - out of the history the bridge keeps. See
 [Fleet history](#fleet-history).

@@ -34,8 +34,13 @@
 
     ships: [],
     byName: {},
+    fleetCount: 0,
     selected: null,
     sub: 'overview',
+
+    /* ship name -> {at, goods: [{name, amount}]}. The listing carries no cargo, so
+       searching goods means reading details; see sweepCargo(). */
+    cargoIndex: {},
 
     detail: null,
     mission: null,
@@ -78,12 +83,75 @@
       .replace(/"/g, '&quot;');
   }
 
-  function num(value, digits) {
+  /* Plain text, no markup. For titles, textContent, and anywhere the result is not
+     going into innerHTML - num() below returns HTML. */
+  function numText(value, digits) {
     if (value == null || isNaN(value)) { return '—'; }
     return Number(value).toLocaleString(undefined, {
       minimumFractionDigits: digits || 0,
       maximumFractionDigits: digits === undefined ? 0 : digits
     });
+  }
+
+  var SCALES = [[1e12, 'T'], [1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+
+  /* Credits, cargo and hull figures here run to ten digits, and a column of them is a
+     wall. Anything from a thousand up is scaled to K/M/B/T with the exact figure kept in
+     the tooltip: "how much exactly" is a real question, just not the one being asked
+     while scanning a fleet. */
+  function abbrev(value) {
+    var v = Number(value);
+    var magnitude = Math.abs(v);
+    if (!(magnitude >= 1000)) { return null; }
+
+    var sign = v < 0 ? '-' : '';
+    for (var i = 0; i < SCALES.length; i++) {
+      if (magnitude < SCALES[i][0]) { continue; }
+      // 999999 scales to 1000.0K, which is one unit too low, so rounding decides the unit.
+      var rounded = Math.round((magnitude / SCALES[i][0]) * 10) / 10;
+      if (rounded >= 1000 && i > 0) {
+        i--;
+        rounded = Math.round((magnitude / SCALES[i][0]) * 10) / 10;
+      }
+      return sign + String(rounded) + SCALES[i][1];
+    }
+    return null;
+  }
+
+  /* Returns HTML: a shortened number carries the full one in a tooltip. Every call site
+     in this file writes into innerHTML; numText() is for the ones that would not. */
+  function num(value, digits) {
+    if (value == null || isNaN(value)) { return '—'; }
+
+    var full = numText(value, digits);
+    var short = abbrev(value);
+    if (short === null) { return esc(full); }
+
+    return '<span class="abbr" title="' + esc(full) + '">' + esc(short) + '</span>';
+  }
+
+  /* Some fields are asset or script paths rather than anything a player named: an order
+     chain entry comes back carrying its icon ("data/textures/icons/pixel/attack.png"),
+     and a subsystem with no display name falls back to its script file. Nothing in the
+     browser can resolve those against the game's data, so they are shown as the file name
+     alone with the full path in the tooltip. Extensions are listed rather than matched
+     loosely so that a real name holding a slash - "metal/stone" - is left alone. */
+  var ASSET_PATH = /^[\w .:+-]+(?:[\/\\][\w .:+-]+)*\.(?:png|jpg|jpeg|dds|tga|lua|xml|ogg|wav)$/i;
+
+  function pathText(value) {
+    var text = String(value == null ? '' : value);
+    if (!ASSET_PATH.test(text)) { return text; }
+
+    var file = text.split(/[\/\\]/).pop();
+    return file.replace(/\.[a-z0-9]+$/i, '') || file;
+  }
+
+  function pathLabel(value) {
+    var text = String(value == null ? '' : value);
+    var label = pathText(text);
+    if (label === text) { return esc(text); }
+
+    return '<span class="abbr" title="' + esc(text) + '">' + esc(label) + '</span>';
   }
 
   /* The mod reports some percentages as 0..1 and others already scaled; both appear in
@@ -424,8 +492,9 @@
         S.byName = {};
         S.ships.forEach(function (s) { S.byName[s.name] = s; });
 
-        $('#fleet-count').textContent = body.count + ' craft';
+        S.fleetCount = body.count;
         renderFleet();
+        sweepCargo();
         GalaxyMap.setShips(S.ships);
 
         // A ship that vanished from the listing - sold, destroyed, filtered out - must
@@ -456,7 +525,79 @@
     var hay = [ship.name, ship.status, ship.type, ship.availability,
                coords(ship.position), ship.usable && ship.usable.code,
                ship.owner && ship.owner.name].join(' ').toLowerCase();
-    return hay.indexOf(S.search) !== -1;
+    if (hay.indexOf(S.search) !== -1) { return true; }
+    return cargoMatches(ship.name).length > 0;
+  }
+
+  /* The goods in a craft's hold that the current search term names. Empty for anything
+     not indexed yet, so a sweep in progress makes rows appear as its answers land. */
+  function cargoMatches(name) {
+    if (!S.search) { return []; }
+
+    var entry = S.cargoIndex[name];
+    if (!entry) { return []; }
+
+    return entry.goods.filter(function (g) {
+      return g.name.toLowerCase().indexOf(S.search) !== -1;
+    });
+  }
+
+  /* ------------------------------ cargo search ------------------------------
+     Goods live on /ships/{name}, one call per craft: the listing is one row per craft out
+     of the ship database and has no hold in it. So the index is built lazily - never
+     unless someone typed something - at background priority behind every user action, and
+     cached per craft for as long as a manifest is worth trusting. */
+  var CARGO_TTL = 120000;
+  var cargoPending = {};
+
+  function indexCargo(name, detail) {
+    S.cargoIndex[name] = {
+      at: Date.now(),
+      goods: cargoGoods(detail || {}).map(function (g) {
+        return { name: String(g.name || g.good || ''), amount: g.amount || 0 };
+      })
+    };
+  }
+
+  function cargoIndexed(name) {
+    var entry = S.cargoIndex[name];
+    return !!entry && (Date.now() - entry.at) < CARGO_TTL;
+  }
+
+  function sweepCargo() {
+    // Two characters: one letter matches most of the goods in the game, and the sweep is
+    // a call per craft.
+    if (!S.connected || S.paused || S.search.length < 2) { return; }
+
+    S.ships.forEach(function (ship) {
+      var name = ship.name;
+      if (cargoIndexed(name) || cargoPending[name]) { return; }
+
+      cargoPending[name] = true;
+      Api.get('/ships/' + Api.seg(name), { owner: ownerParamFor(name) },
+              { priority: Api.P.POLL, label: 'cargo index' })
+        .then(function (body) { indexCargo(name, body); })
+        .catch(function (error) {
+          // A drained poll is not an answer - leave it unindexed so the next sweep asks
+          // again. Anything else is: a craft with no database row has no hold to find.
+          if (!error || error.code !== 'cancelled') { indexCargo(name, null); }
+        })
+        .then(function () {
+          delete cargoPending[name];
+          renderFleetCount();
+          if (S.search) { renderFleet(); }
+        });
+    });
+
+    renderFleetCount();
+  }
+
+  function cargoSweepProgress() {
+    var done = 0;
+    for (var i = 0; i < S.ships.length; i++) {
+      if (cargoIndexed(S.ships[i].name)) { done++; }
+    }
+    return { done: done, total: S.ships.length };
   }
 
   function lastEventFor(name) {
@@ -466,15 +607,39 @@
     return null;
   }
 
+  /* Craft counted by the API, how many the filter leaves, and - while a goods search is
+     reading holds - how far that has got. */
+  function renderFleetCount() {
+    if (!S.fleetCount && !S.ships.length) { $('#fleet-count').textContent = '—'; return; }
+
+    var parts = [numText(S.fleetCount) + ' craft'];
+
+    if (S.search) {
+      parts.push(numText(S.ships.filter(matchesSearch).length) + ' shown');
+
+      var progress = cargoSweepProgress();
+      if (progress.done < progress.total && S.search.length >= 2) {
+        parts.push('holds ' + progress.done + '/' + progress.total);
+      }
+    }
+
+    $('#fleet-count').textContent = parts.join(' · ');
+  }
+
   function renderFleet() {
     var rows = S.ships.filter(matchesSearch);
     var html = rows.map(function (ship) {
       var last = lastEventFor(ship.name);
+      var hits = cargoMatches(ship.name);
       var sub = [];
       if (ship.status) { sub.push(esc(ship.status)); }
       sub.push(coords(ship.position));
       if (ship.owner && ship.owner.kind === 'alliance') { sub.push('alliance'); }
-      if (last) { sub.push('· ' + esc(eventSummaryText(last))); }
+      if (hits.length) {
+        sub.push('· <span class="hit-goods">carrying ' + hits.map(function (g) {
+          return esc(g.name) + ' ' + num(g.amount);
+        }).join(', ') + '</span>');
+      } else if (last) { sub.push('· ' + esc(eventSummaryText(last))); }
 
       return '<div class="ship-row' + (S.selected === ship.name ? ' sel' : '')
         + '" data-ship="' + esc(ship.name) + '">'
@@ -486,6 +651,8 @@
 
     $('#fleet-rows').innerHTML = html
       || '<div class="empty muted">No craft match. Try a different owner or type.</div>';
+
+    renderFleetCount();
   }
 
   function select(name) {
@@ -534,6 +701,7 @@
       .then(function (body) {
         if (S.selected !== name) { return; }
         S.detail = body;
+        indexCargo(name, body);
         renderShipHead();
         renderOverview();
         renderCargo();
@@ -635,13 +803,16 @@
       + bar(durability.percentage, pctValue(durability.percentage) < 40 ? 'bad' : 'good')
       + '<div class="mute2">shields ' + pct(shields.percentage) + ' of ' + num(shields.max) + '</div>'
       + bar(shields.percentage, 'info')
-      + '<div class="mute2">energy ' + num(draw, 0) + '% of '
-        + num(energy.produced) + ' produced</div>'
+      // One reading, not two: the figures sit on the bar's own line, and a ship drawing
+      // more than it makes says so in the colour rather than in a second copy of itself.
+      + '<div class="mute2" title="' + (energy.sufficient === false
+          ? 'Systems ask for more energy than this ship produces.'
+          : 'What the installed systems draw, against what the ship produces.') + '">'
+        + 'energy <span' + (energy.sufficient === false ? ' class="over"' : '') + '>'
+        + numText(draw, 0) + '% &middot; ' + num(energy.required)
+        + '/' + num(energy.produced) + '</span></div>'
       + bar(draw, energy.sufficient === false ? 'bad' : (draw > 85 ? 'warn' : 'good'))
       + kv([
-        ['energy', (energy.sufficient === false
-            ? '<span class="badge bad">short</span>' : '<span class="badge good">ok</span>')
-          + ' ' + num(energy.required) + '/' + num(energy.produced)],
         ['damaged', durability.damaged ? '<span class="badge warn">yes</span>' : 'no'],
         ['malus', durability.malusReason ? esc(durability.malusReason) + ' ×' + num(durability.malusFactor, 2) : '—']
       ])));
@@ -695,7 +866,8 @@
         ['free', num(cargo.free)],
         ['goods', goods.length
           ? num(goods.length) + ' <a href="#" data-sub-link="cargo">manifest</a>'
-          : '<span class="mute2">empty</span>']
+          : '<span class="mute2">empty</span>'],
+        ['worth', goods.length ? num(cargoValue(goods)) + ' ¢' : '—']
       ])));
 
     /* --- hyperspace --------------------------------------------------- */
@@ -736,7 +908,7 @@
       ['blocks', num(d.blocks)],
       ['plan value', num(d.planValue) + ' ¢'],
       ['reconstruction', num(d.reconstructionValue) + ' ¢'],
-      ['icon', esc(d.icon || '—')]
+      ['icon', d.icon ? pathLabel(d.icon) : '—']
     ])));
 
     var statusMessage = message(d.statusMessage);
@@ -757,6 +929,18 @@
     });
   }
 
+  /* Goods carry their unit price, so a hold has a worth. A good the database has no
+     price for counts as nothing rather than being guessed at, which is also why the
+     manifest shows its value as a dash instead of a zero. */
+  function goodValue(g) {
+    if (!g || g.price == null || isNaN(g.price)) { return 0; }
+    return Number(g.price) * (g.amount || 0);
+  }
+
+  function cargoValue(goods) {
+    return (goods || []).reduce(function (sum, g) { return sum + goodValue(g); }, 0);
+  }
+
   function cargoBar(cargo) {
     var used = cargo.capacity ? (cargo.used / cargo.capacity) : 0;
     return bar(used, cargo.free === 0 ? 'bad' : (used > 0.85 ? 'warn' : 'info'));
@@ -769,6 +953,7 @@
     var cargo = d.cargo || {};
     var goods = cargoGoods(d);
     var total = goods.reduce(function (sum, g) { return sum + (g.amount || 0); }, 0);
+    var worth = cargoValue(goods);
 
     /* The bar stays on the overview as well - it is a one-line health reading. What moved
        here is the manifest, which on a hauler is longer than everything else put together. */
@@ -776,6 +961,11 @@
       + '<div class="mute2">' + num(cargo.used) + ' of ' + num(cargo.capacity)
       + ' used &middot; ' + num(cargo.free) + ' free</div>'
       + cargoBar(cargo)
+      + kv([
+        ['goods', goods.length ? num(goods.length) : '<span class="mute2">empty</span>'],
+        ['units', num(total)],
+        ['worth', goods.length ? '<b>' + num(worth) + ' ¢</b>' : '—']
+      ])
       + '</div>';
 
     var body;
@@ -784,9 +974,11 @@
         + '<div class="mute2">The hold is empty.</div></div>';
     } else {
       body = '<div class="card wide"><h3>Manifest &mdash; ' + num(goods.length)
-        + ' goods, ' + num(total) + ' units</h3><div class="scroll-x"><table>'
+        + ' goods, ' + num(total) + ' units, ' + num(worth) + ' ¢</h3>'
+        + '<div class="scroll-x"><table>'
         + '<thead><tr><th>Good</th><th class="num">Amount</th><th class="num">Volume</th>'
-        + '<th class="num">Unit price</th><th>Flags</th></tr></thead><tbody>'
+        + '<th class="num">Unit price</th><th class="num">Value</th>'
+        + '<th>Flags</th></tr></thead><tbody>'
         + goods.map(function (g) {
             var flags = [];
             if (g.dangerous) { flags.push('<span class="badge bad">dangerous</span>'); }
@@ -801,6 +993,8 @@
               + '<td class="num mute2">' + (size != null
                   ? num(size * (g.amount || 0), 1) : '—') + '</td>'
               + '<td class="num mute2">' + (g.price != null ? num(g.price) + ' ¢' : '—') + '</td>'
+              + '<td class="num">' + (g.price != null
+                  ? num(goodValue(g)) + ' ¢' : '<span class="mute2">—</span>') + '</td>'
               + '<td>' + (flags.join(' ') || '<span class="mute2">—</span>') + '</td></tr>';
           }).join('')
         + '</tbody></table></div></div>';
@@ -868,7 +1062,7 @@
         + '<th class="num">Reach</th><th class="num">Slots</th></tr></thead><tbody>'
         + turrets.map(function (t) {
             return '<tr><td class="num">' + num(t.count || 1) + '×</td>'
-              + '<td>' + esc(t.name || '?') + '</td>'
+              + '<td>' + pathLabel(t.name || '?') + '</td>'
               + '<td class="mute2">' + esc(t.category || '') + '</td>'
               + '<td class="mute2">' + esc(t.rarity || '') + '</td>'
               + '<td class="mute2">' + esc(t.material || '') + '</td>'
@@ -886,7 +1080,7 @@
       ? '<div class="scroll-x"><table>'
         + '<thead><tr><th>Subsystem</th><th>Rarity</th><th class="num"></th></tr></thead><tbody>'
         + systems.map(function (sys) {
-            return '<tr><td>' + esc(sys.name || '?') + '</td>'
+            return '<tr><td>' + pathLabel(sys.name || sys.script || '?') + '</td>'
               + '<td class="mute2">' + esc(sys.rarity || '') + '</td>'
               + '<td class="num mute2">' + (sys.count ? sys.count + '×' : '') + '</td></tr>';
           }).join('')
@@ -901,7 +1095,7 @@
         + '<div class="scroll-x"><table>'
         + '<thead><tr><th>Squad</th><th class="num">Fighters</th></tr></thead><tbody>'
         + squads.map(function (sq) {
-            return '<tr><td>' + esc(sq.name || '?') + '</td>'
+            return '<tr><td>' + pathLabel(sq.name || '?') + '</td>'
               + '<td class="num">' + num(sq.fighters) + '</td></tr>';
           }).join('')
         + '</tbody></table></div>'
@@ -1567,7 +1761,7 @@
     if (!chain || !chain.length) { return '<span class="mute2">empty</span>'; }
     return chain.map(function (link, i) {
       return '<span class="' + (i === activeIndex ? 'active' : 'dim') + '">'
-        + esc(link.name || link.action) + '</span>';
+        + pathLabel(link.name || link.action) + '</span>';
     }).join(' <span class="dim">→</span> ');
   }
 
@@ -1795,7 +1989,7 @@
     if (event.kind === 'status') { return event.text || event.template || ''; }
     if (event.idle) { return 'idle'; }
     var chain = event.chain || [];
-    var names = chain.map(function (link) { return link.name || link.action; });
+    var names = chain.map(function (link) { return pathText(link.name || link.action); });
     if (!names.length) { return 'no orders'; }
     return names.join(' → ');
   }
@@ -2061,7 +2255,7 @@
       + '<div class="mute2" style="margin-top:5px">Shaded by '
         + (bySeconds ? 'observed time in sector, up to '
             + GalaxyMap.humanDuration(heat.maxSeconds)
-          : 'number of visits, up to ' + heat.maxVisits)
+          : 'number of visits, up to ' + num(heat.maxVisits))
         + '.</div>'
       + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
         + span + ' of recorded travel</div>'
@@ -2403,9 +2597,18 @@
       refreshFleet(true);
     });
 
+    /* Typing is debounced before it reaches the sweep: the index is what costs a call
+       per craft, and nobody means to search for every prefix of what they typed. */
+    var searchDebounce = null;
     $('#fleet-search').addEventListener('input', function (e) {
       S.search = e.target.value.trim().toLowerCase();
       renderFleet();
+
+      if (searchDebounce) { clearTimeout(searchDebounce); }
+      searchDebounce = setTimeout(function () {
+        searchDebounce = null;
+        sweepCargo();
+      }, 350);
     });
 
     $('#fleet-refresh').addEventListener('click', function () { refreshFleet(true); });
