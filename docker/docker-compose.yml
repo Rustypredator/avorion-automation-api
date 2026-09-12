@@ -33,9 +33,16 @@ services:
       # headers at all (which also blocks the console unless it is loaded from
       # /console/ on this same origin).
       CORS_ORIGIN: "${CORS_ORIGIN:-*}"
-      # The bridge's own history store - see bridge/src/history.php. Set HISTORY_DIR to
-      # "" to keep no history at all.
-      HISTORY_DIR: "${HISTORY_DIR:-/history}"
+      # The bridge's own history store - see bridge/src/history.php for what it keeps and
+      # bridge/src/db.php for the schema. Set HISTORY_DSN to "" to keep no history at all;
+      # the bridge then relays every call exactly as before and serves 404 on /history.
+      HISTORY_DSN: "${HISTORY_DSN-}"
+      # Blank this in .env to keep no history at all - see bridge/src/db.php for why the
+      # switch is here and not on HISTORY_DSN.
+      HISTORY_DB_HOST: "${HISTORY_DB_HOST-db}"
+      HISTORY_DB_NAME: "${POSTGRES_DB:-avorion}"
+      HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
+      HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
       HISTORY_DAYS: "${HISTORY_DAYS:-30}"
 
     # moddata only, so a bridge process that misbehaves still cannot reach saves or the
@@ -60,11 +67,6 @@ services:
       #
       # Start the game server before this container, so these exist and belong to it.
       - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata:/galaxy/moddata
-      # Where the bridge keeps its durable copy of ship movement and events. A named
-      # volume rather than a path under the galaxy: that tree belongs to the mod, which
-      # re-creates its own directories on a timer, and this data outlives any one galaxy
-      # restart. Delete the volume to throw the history away.
-      - history:/history
       - caddy_data:/data
       - caddy_config:/config
 
@@ -76,6 +78,11 @@ services:
     depends_on:
       init:
         condition: service_completed_successfully
+      # Not service_started: the schema is created on the first connection, and Postgres
+      # refuses connections for a second or two after the process appears. Without the
+      # healthcheck the first few relayed calls would log a history write failure each.
+      db:
+        condition: service_healthy
 
     healthcheck:
       # Unauthenticated, so a healthy bridge answers 401 - which is proof enough that
@@ -85,6 +92,77 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Where ship movement and events are kept. On its own volume rather than anywhere under
+  # the galaxy: that tree belongs to the mod, which re-creates its own directories on a
+  # timer, and this data outlives any one galaxy restart. Delete the volume to throw the
+  # history away.
+  #
+  # Not published to a host port. Nothing outside this stack has any business reaching it,
+  # and the bridge is the only thing that knows the schema.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-avorion}"
+      POSTGRES_USER: "${POSTGRES_USER:-avorion}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      # The bridge stores no free text from players as an identifier - craft names are
+      # values, never table or column names - but the galaxy is full of non-ASCII ship
+      # names, so the database is created as UTF-8 rather than the image's locale default.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    volumes:
+      - history:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-avorion} -d ${POSTGRES_DB:-avorion}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Keeps something calling the API, so the history has no holes in it.
+  #
+  # The mod never pushes: movement is only recorded when someone asks for /ships, and the
+  # mod's own event log is a 200-entry ring buffer that drops the oldest entry whether or
+  # not anyone collected it. Without this service the record is a record of when a browser
+  # tab happened to be open. See bridge/src/poll.php.
+  #
+  # It calls the api service over HTTP like any other client rather than writing to the
+  # database itself, so there is one recording code path and the mod still authenticates
+  # every key. With POLL_KEYS unset it says so once and exits, which is why it is not
+  # restart: unless-stopped.
+  poller:
+    build: ./bridge
+    restart: on-failure
+    entrypoint: ["php", "/app/src/poll.php"]
+
+    environment:
+      POLL_URL: "http://api:80"
+      POLL_KEYS: "${POLL_KEYS-}"
+      POLL_INTERVAL: "${POLL_INTERVAL:-30}"
+      POLL_EVENTS: "${POLL_EVENTS:-1}"
+      HISTORY_DSN: "${HISTORY_DSN-}"
+      # Blank this in .env to keep no history at all - see bridge/src/db.php for why the
+      # switch is here and not on HISTORY_DSN.
+      HISTORY_DB_HOST: "${HISTORY_DB_HOST-db}"
+      HISTORY_DB_NAME: "${POSTGRES_DB:-avorion}"
+      HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
+      HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      HISTORY_DAYS: "${HISTORY_DAYS:-30}"
+
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+    # It sleeps between passes and cannot be woken early - pcntl is not in the image - so
+    # a long grace period just makes every restart slow. Nothing is lost: each pass has
+    # committed before the sleep begins.
+    stop_grace_period: 5s
 
   # Docker creates a named volume owned by root, so with BRIDGE_USER set the API cannot
   # write /data - and Caddy needs it on startup even in plain-HTTP mode, because
@@ -96,14 +174,15 @@ services:
   init:
     image: dunglas/frankenphp:1-php8.3-alpine
     user: root
-    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config", "/history"]
+    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config"]
     restart: "no"
     volumes:
       - caddy_data:/data
       - caddy_config:/config
-      - history:/history
 
 volumes:
   caddy_data:
   caddy_config:
+  # The Postgres data directory. Postgres manages its own ownership inside the volume, so
+  # unlike the caddy volumes this one needs nothing from the init service.
   history:

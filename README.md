@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.2.0](https://img.shields.io/badge/version-0.2.0-8957e5)](modinfo.lua)
+[![version 0.3.0](https://img.shields.io/badge/version-0.3.0-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -99,7 +99,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.2.0 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.3.0 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -169,6 +169,7 @@ The Docker stack in `docker/` serves it from the API's own origin:
 ```bash
 cd docker
 cp .env.example .env      # point GALAXY_DIR at the directory holding moddata/
+                          # and set POSTGRES_PASSWORD to anything
 docker compose up -d --build
 ```
 
@@ -217,16 +218,21 @@ last two on the map.
 
 Two things to know about it:
 
-- **Nothing polls.** History accumulates while something is calling the API. A gap in it is
-  a gap in who was looking, not a gap in what happened, which is why dwell is reported as
-  *observed* seconds rather than guessed at.
+- **Nothing in the mod pushes.** Movement is only recorded when something asks for `/ships`,
+  and the mod's own event log is a 200-entry ring buffer that drops its oldest entry whether
+  or not anyone collected it. The `poller` service is what keeps something asking - set
+  `POLL_KEYS` in `.env` to the keys whose fleets should be recorded. Without it the history
+  only covers the moments a console happened to be open, and dwell is reported as *observed*
+  seconds rather than guessed at either way.
 - **It is keyed by a hash of your API key and never stores the key.** An unknown key reads
   an empty history rather than anyone else's, and nothing is written except off the back of
   a call the mod itself answered - so a caller who cannot get a 200 out of the mod cannot
-  make the store exist.
+  make the store exist. `POLL_KEYS` is the one place a key is held at rest, because the
+  poller has to authenticate like any other client.
 
-It lives in the `history` Docker volume. `HISTORY_DIR=""` turns it off entirely;
-`HISTORY_DAYS` (default 30) sets how far back it keeps.
+It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns it off
+entirely; `HISTORY_DAYS` (default 30) sets how far back it keeps, and the poller deletes
+anything older on an hourly pass.
 
 ## Endpoints
 
@@ -307,12 +313,12 @@ The pure-Lua modules run outside the game against a mocked Avorion environment:
 for t in bridge ships missions movement map shipevents; do lua5.4 tests/test_$t.lua; done
 ```
 
-The bridge's history store is PHP and is tested the same way, against a throwaway
-directory:
+The bridge's history store is PHP over Postgres, so it is tested against a throwaway
+database. `tools/dbtest.sh` starts one, runs `tests/test_history.php` in the image the
+bridge is built from, and takes both down again:
 
 ```bash
-docker run --rm -v "$PWD:/w" -w /w dunglas/frankenphp:1-php8.3-alpine \
-    php tests/test_history.php
+tools/dbtest.sh
 ```
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather

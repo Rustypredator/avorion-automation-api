@@ -29,18 +29,17 @@ $requestDir = $root . '/requests';
 $responseDir = $root . '/responses';
 
 /*
- * Where the bridge keeps its own durable copy of what it has relayed - see src/history.php
- * for why it exists and what it can and cannot know. Deliberately NOT under the galaxy
- * mount: that tree belongs to the mod, which re-creates its own directories and would be
- * within its rights to clean up anything else it finds there.
+ * Whether the bridge keeps its own durable copy of what it has relayed - see src/history.php
+ * for why it exists and what it can and cannot know, and src/db.php for where it goes.
  *
- * Set HISTORY_DIR to an empty string to keep no history at all; nothing else changes.
+ * Deliberately NOT a file under the galaxy mount: that tree belongs to the mod, which
+ * re-creates its own directories and would be within its rights to clean up anything else
+ * it finds there. It is a Postgres database on its own volume instead.
+ *
+ * Set HISTORY_DSN to an empty string to keep no history at all; nothing else changes, and
+ * the bridge still relays every call exactly as before.
  */
-$historyDir = getenv('HISTORY_DIR');
-if ($historyDir === false) {
-    $historyDir = '/history';
-}
-$historyDir = rtrim($historyDir, '/');
+$keepHistory = Db::enabled();
 
 /**
  * Cross-origin access, so a browser page - the bundled console, or anything else - can
@@ -217,14 +216,14 @@ if (is_string($rawQuery) && $rawQuery !== '') {
  * ever written except off the back of a call the mod itself answered.
  */
 if (str_starts_with($path, '/history')) {
-    if ($historyDir === '') {
+    if (!$keepHistory) {
         fail(404, 'history_disabled',
-            'This bridge keeps no history: HISTORY_DIR is set empty. Unset it to turn the '
+            'This bridge keeps no history: HISTORY_DSN is set empty. Unset it to turn the '
             . 'store back on, or read the mod\'s own in-memory log at '
             . '/ships/{name}/events instead.');
     }
 
-    $history = new History($historyDir, $key);
+    $history = new History($key);
     $what = rawurldecode(substr($path, strlen('/history')));
 
     $filter = [
@@ -339,9 +338,9 @@ while (microtime(true) < $deadline) {
     // Keep a durable copy of the two answers worth keeping, on the way past. A successful
     // reply is also proof the mod recognised this key, which is the only authentication
     // the store gets - and the reason nothing is written before this line.
-    if ($historyDir !== '' && $method === 'GET' && $status >= 200 && $status < 300
+    if ($keepHistory && $method === 'GET' && $status >= 200 && $status < 300
         && $answer instanceof stdClass) {
-        record(new History($historyDir, $key), $path, $answer);
+        record(new History($key), $path, $answer);
     }
 
     reply($status, $answer);

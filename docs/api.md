@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.2.0", "game": "2.5.13",
+  "api": 1, "mod": "0.3.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true}
@@ -576,9 +576,15 @@ next restart. That is the right shape for "what is this ship doing now" and no u
 growing file from a galaxy script on the server's own tick, which is a bad trade: a month
 of travel data paid for in frame time on a running game server.
 
-So the bridge keeps the copy instead. It already relays every call, and two of them carry
-everything the store needs, so recording costs one file append on requests that were
-happening anyway and nothing at all on the game side.
+So the bridge keeps the copy instead, in a Postgres database alongside it. The bridge
+already relays every call and two of them carry everything the store needs, so recording
+costs a couple of statements on requests that were happening anyway and nothing at all on
+the game side.
+
+Postgres rather than a flat file because every overlay is an aggregate - the heatmap is a
+`GROUP BY x, y`, a track is an ordered window, the summary is a count per craft - and a
+file makes each of those a full scan in PHP. The volume is small either way: a visit row is
+written only when a craft changes sector, so a parked fleet costs nothing.
 
 ## What it records, and when
 
@@ -590,10 +596,16 @@ happening anyway and nothing at all on the game side.
 Positions come from the ship database, which the mod reads **with every player logged out**,
 so the travel record keeps filling whether or not anything is online to fly.
 
-**Nothing here polls.** History accumulates while something is calling the API - the
-console with a tab open, a cron job, your own client - and a gap in it is a gap in who was
-looking, not a gap in what happened. Dwell is therefore reported as *observed* seconds:
-time nobody was watching counts as zero rather than being guessed at.
+**Nothing in the mod pushes.** History accumulates only while something is calling the API,
+and the mod's event log is a 200-entry ring buffer that drops its oldest entry whether or
+not anyone collected it. The compose stack runs a `poller` service for exactly this - set
+`POLL_KEYS` to the keys whose fleets should be recorded and it calls these two endpoints
+every `POLL_INTERVAL` seconds (default 30), which is also the accuracy of a travel track.
+
+Without a poller the record covers only the moments a console or a script happened to be
+running, and a gap in it is a gap in who was looking rather than a gap in what happened.
+Either way dwell is reported as *observed* seconds: time nobody was watching counts as zero
+rather than being guessed at.
 
 Event timestamps are reconstructed rather than stamped on arrival. The mod tags each event
 with the server's uptime in seconds, which dates nothing on its own but spaces events
@@ -612,9 +624,12 @@ consequences worth stating:
   is the real authentication. A caller who cannot get a 200 out of the mod cannot make the
   store exist.
 
-It lives in the `history` Docker volume. `HISTORY_DIR=""` turns the whole thing off and
-every route below answers `404 history_disabled`; `HISTORY_DAYS` (default 30) sets how far
-back it goes.
+It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns the whole
+thing off and every route below answers `404 history_disabled`; `HISTORY_DAYS` (default 30)
+sets how far back it goes.
+
+Craft names reach the database as bound parameters, never as SQL - a ship called
+`'; DROP TABLE visits; --` is a row value and nothing more.
 
 ## GET /history/summary
 
@@ -626,7 +641,7 @@ What is on disk, per craft.
     {"name": "Ore Hound", "visits": 41, "events": 190, "sectors": 12,
      "first": 1757630000, "last": 1757719400}
   ],
-  "bytes": 68120, "retentionDays": 30, "recording": true
+  "rows": 231, "retentionDays": 30, "recording": true
 }
 ```
 

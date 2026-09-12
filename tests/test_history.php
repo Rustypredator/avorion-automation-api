@@ -5,14 +5,21 @@ declare(strict_types=1);
 /**
  * The bridge's durable history store.
  *
- * Runs outside Docker against a throwaway directory:
+ * Needs a Postgres to talk to. tools/dbtest.sh starts a throwaway one, runs this against
+ * it and takes it down again, which is the intended way in:
  *
- *   docker run --rm -v "$PWD:/w" -w /w dunglas/frankenphp:1-php8.3-alpine \
- *       php tests/test_history.php
+ *   tools/dbtest.sh
+ *
+ * To point it at a database you already have, set the same variables the bridge reads -
+ * HISTORY_DB_HOST, HISTORY_DB_NAME, HISTORY_DB_USER, HISTORY_DB_PASSWORD - and run it with
+ * any PHP that has pdo_pgsql.
  *
  * What it pins is the awkward half: the store is fed by whatever calls happen to be made,
  * so it has to survive a caller that polls irregularly, a server whose sequence numbers
- * restart under it, and two threads writing at once.
+ * restart under it, and two clients recording the same batch at once.
+ *
+ * Every run uses freshly generated keys, so it neither sees nor disturbs anything already
+ * in the database it is pointed at.
  */
 
 require __DIR__ . '/../docker/bridge/src/history.php';
@@ -31,22 +38,40 @@ function check(bool $cond, string $message): void
     }
 }
 
-$root = sys_get_temp_dir() . '/avo-history-' . bin2hex(random_bytes(6));
-register_shutdown_function(static function () use ($root): void {
-    if (!is_dir($root)) {
-        return;
+if (!Db::enabled()) {
+    fwrite(STDERR, "test_history.php needs a database: set HISTORY_DB_HOST and friends, "
+                 . "or run tools/dbtest.sh which starts one.\n");
+    exit(2);
+}
+
+try {
+    $pdo = Db::connect();
+} catch (Throwable $e) {
+    fwrite(STDERR, 'test_history.php cannot reach the database: ' . $e->getMessage() . "\n");
+    exit(2);
+}
+
+/** A key no previous run can have used, so every run starts empty. */
+function freshKey(): string
+{
+    return 'avo_' . bin2hex(random_bytes(32));
+}
+
+$key = freshKey();
+$history = new History($key);
+
+// Whatever happens, this run leaves the database as it found it.
+register_shutdown_function(static function () use (&$madeKeys): void {
+    foreach ($madeKeys ?? [] as $made) {
+        try {
+            (new History($made))->clear(null);
+        } catch (Throwable) {
+            // Nothing useful to do in a shutdown handler.
+        }
     }
-    foreach (glob($root . '/*/*') ?: [] as $file) {
-        @unlink($file);
-    }
-    foreach (glob($root . '/*') ?: [] as $dir) {
-        @rmdir($dir);
-    }
-    @rmdir($root);
 });
 
-$key = 'avo_' . str_repeat('a', 64);
-$history = new History($root, $key);
+$madeKeys = [$key];
 
 function ships(array $rows): stdClass
 {
@@ -64,17 +89,22 @@ function ships(array $rows): stdClass
 
 echo "\nkeying\n";
 
-check(!$history->exists(), 'a key that has never been used has no directory at all');
-check(!str_contains($history->directory(), $key), 'and the key itself is never a path');
+check(!$history->exists(), 'a key that has never been used is not in the database at all');
 
-$other = new History($root, 'avo_' . str_repeat('b', 64));
-check($other->directory() !== $history->directory(), 'two keys land in two directories');
+$other = new History(freshKey());
+$madeKeys[] = 'unused';
 check($other->visits([]) === [], 'and an unknown key reads an empty history, not a 500');
+
+$history->recordShips(ships(['Ore Hound' => [5, 5]]));
+
+$stored = $pdo->query('SELECT key_hash FROM api_keys')->fetchAll();
+$hashes = array_column($stored, 'key_hash');
+check(!in_array($key, $hashes, true), 'the key itself is never stored');
+check(in_array(hash('sha256', $key), $hashes, true), 'only a SHA-256 of it');
 
 echo "\nvisits are written on movement, not on polling\n";
 
-$history->recordShips(ships(['Ore Hound' => [5, 5]]));
-check($history->exists(), 'the first recorded answer creates the store');
+check($history->exists(), 'the first recorded answer creates the key');
 check(count($history->visits([])) === 1, 'the craft has one visit open');
 check($history->visits([])[0]['open'] === true, 'flagged as still open');
 
@@ -89,6 +119,11 @@ check(count($visits) === 2, 'moving closes the old visit and opens a new one');
 check($visits[0]['x'] === 5 && $visits[1]['x'] === 6, 'in the order they happened');
 check(!isset($visits[0]['open']) && $visits[1]['open'] === true,
       'and only the latest is still open');
+
+// The partial unique index is what makes this safe under two pollers. Without it a race
+// leaves two open rows for one craft and every later poll extends an arbitrary one.
+$open = $pdo->query('SELECT COUNT(*) AS n FROM visits WHERE open')->fetch();
+check((int) $open['n'] >= 1, 'the open visit is an ordinary row, not a separate file');
 
 echo "\nheatmap\n";
 
@@ -141,14 +176,19 @@ $history->recordEvents('Ore Hound', feed([
 check(count($history->events(['ship' => 'Ore Hound'])) === 3,
       'a replayed batch adds only what is new');
 
-// A restart takes the mod's global counter back to zero. Treating that as a replay would
-// swallow every event until it climbed past the old mark, which on a busy galaxy is hours.
+// A restart takes the mod's counter back to zero. Treating that as a replay would swallow
+// every event until it climbed past the old mark, which on a busy galaxy is hours - and
+// the unique index would otherwise reject seq 1 outright, which is why the epoch is in it.
 $history->recordEvents('Ore Hound', feed([
     ['seq' => 1, 'kind' => 'status', 'text' => 'after the restart'],
 ]));
 $events = $history->events(['ship' => 'Ore Hound']);
 check(count($events) === 4, 'a sequence number going backwards is a restart, not a replay');
 check(end($events)['text'] === 'after the restart', 'so the event is kept');
+
+$epochs = $pdo->query('SELECT COUNT(DISTINCT epoch) AS n FROM events
+                       WHERE ship = \'Ore Hound\'')->fetch();
+check((int) $epochs['n'] === 2, 'the two runs are kept apart by epoch, so neither is lost');
 
 $history->recordEvents('Tug', (object) [
     'ship' => 'Tug',
@@ -159,12 +199,27 @@ check(count($history->events(['ship' => 'Tug'])) === 1, 'logs stay per craft');
 check(count($history->events(['owner' => 'alliance'])) === 1,
       'and can be filtered to alliance craft');
 
+echo "\nrecording the same batch twice\n";
+
+// Two clients - the poller and an open console - routinely collect the same events. The
+// unique index is what makes the second one a no-op rather than a duplicate or an error.
+$twice = new History($key);
+$twice->recordEvents('Tug', (object) [
+    'ship' => 'Tug',
+    'owner' => (object) ['kind' => 'alliance'],
+    'events' => [(object) ['seq' => 7, 'kind' => 'status', 'text' => 'Alliance business']],
+]);
+check(count($history->events(['ship' => 'Tug'])) === 1,
+      'a second client recording the same batch changes nothing');
+
 echo "\nevent timestamps\n";
 
 // A caller that has been away collects a backlog in one call. Stamping all of it with the
 // arrival time puts an afternoon of events on one second, which makes the recorded log
 // useless as a timeline - so the mod's own uptime stamps are used to space them.
-$backlog = new History($root, 'avo_' . str_repeat('c', 64));
+$backlogKey = freshKey();
+$madeKeys[] = $backlogKey;
+$backlog = new History($backlogKey);
 $backlog->recordEvents('Ore Hound', (object) [
     'ship' => 'Ore Hound',
     'owner' => (object) ['kind' => 'player'],
@@ -190,8 +245,6 @@ $backlog->recordEvents('Tug', (object) [
 $row = $backlog->events(['ship' => 'Tug'])[0];
 check(abs($row['t'] - time()) <= 2, 'an event with no clock stamp falls back to arrival time');
 
-$backlog->clear(null);
-
 echo "\ntime filtering\n";
 
 check(count($history->events(['from' => time() + 60])) === 0, 'a window in the future is empty');
@@ -199,6 +252,19 @@ check(count($history->events(['to' => time() - 60])) === 0, 'so is one in the pa
 check(count($history->events(['from' => time() - 60, 'to' => time() + 60])) === 5,
       'and a window around now holds everything');
 check(count($history->events(['limit' => 2])) === 2, 'a limit is honoured');
+
+$newest = $history->events([]);
+check($history->events(['limit' => 2])[1] === end($newest),
+      'and keeps the newest, which is what a track wants');
+
+echo "\nisolation\n";
+
+// The whole point of keying by hash: a read needs no validation because an unknown key
+// cannot address anyone else's rows.
+$stranger = new History(freshKey());
+check($stranger->visits([]) === [], 'another key sees none of these visits');
+check($stranger->events([]) === [], 'and none of these events');
+check($stranger->summary()['ships'] === [], 'and an empty summary');
 
 echo "\nsummary\n";
 
@@ -211,8 +277,34 @@ foreach ($summary['ships'] as $ship) {
 check(isset($byName['Ore Hound'], $byName['Tug']), 'every craft seen is listed');
 check($byName['Ore Hound']['sectors'] === 2, 'with how many distinct sectors it has been in');
 check($byName['Ore Hound']['events'] === 4, 'and how many events are held for it');
-check($summary['bytes'] > 0, 'the size on disk is reported');
+check($summary['rows'] > 0, 'the number of rows held is reported');
 check($summary['recording'] === true, 'and that the store is live');
+
+echo "\nretention\n";
+
+// Pruning is by window, and must not take the visit a craft is still in the middle of -
+// a craft parked somewhere for longer than the window is still there.
+$pruneKey = freshKey();
+$madeKeys[] = $pruneKey;
+putenv('HISTORY_DAYS=1');
+$prune = new History($pruneKey);
+$prune->recordShips(ships(['Ore Hound' => [1, 1]]));
+$prune->recordShips(ships(['Ore Hound' => [2, 2]]));
+
+$keyRow = $pdo->prepare('SELECT id FROM api_keys WHERE key_hash = :h');
+$keyRow->execute([':h' => hash('sha256', $pruneKey)]);
+$pruneId = (int) $keyRow->fetch()['id'];
+
+// Age the closed visit past the window.
+$pdo->prepare('UPDATE visits SET entered_at = now() - interval \'5 days\',
+                                 left_at = now() - interval \'5 days\'
+               WHERE key_id = :k AND NOT open')->execute([':k' => $pruneId]);
+
+check($prune->prune() === 1, 'a visit older than the window is dropped');
+$left = $prune->visits([]);
+check(count($left) === 1 && ($left[0]['open'] ?? false) === true,
+      'and the visit still open is kept however old it is');
+putenv('HISTORY_DAYS');
 
 echo "\nclearing\n";
 
@@ -225,14 +317,9 @@ check($history->visits([]) === [] && $history->events([]) === [],
       'and the whole store can be dropped');
 check($history->summary()['ships'] === [], 'leaving nothing behind');
 
-echo "\ntorn lines\n";
-
-$history->recordShips(ships(['Ore Hound' => [1, 1]]));
-$history->recordShips(ships(['Ore Hound' => [2, 2]]));
-file_put_contents($history->directory() . '/visits.jsonl', '{"t":1,"s":"Half' . "\n",
-                  FILE_APPEND);
-check(count($history->visits([])) === 2,
-      'an unparseable line is skipped rather than failing the read');
+$gone = $pdo->prepare('SELECT COUNT(*) AS n FROM api_keys WHERE key_hash = :h');
+$gone->execute([':h' => hash('sha256', $key)]);
+check((int) $gone->fetch()['n'] === 0, 'including the key row itself');
 
 echo "\n";
 if ($failures === 0) {

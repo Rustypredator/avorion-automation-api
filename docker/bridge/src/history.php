@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/db.php';
+
 /**
  * Durable history for one API key.
  *
@@ -10,69 +12,61 @@ declare(strict_types=1);
  * callbacks fire. That is the right shape for "what is this ship doing now" and the wrong
  * one for "where has this fleet been all month", which is what a map overlay needs.
  *
- * So the bridge keeps a copy. Every answer it relays past on its way back to the caller is
- * also appended here, which costs one file write on calls that were happening anyway and
- * needs nothing at all from the Lua side - where a growing file on the server tick would
- * be a genuinely bad idea.
+ * So the bridge keeps a copy in Postgres. Every answer it relays past on its way back to
+ * the caller is also recorded here, which costs one statement on calls that were happening
+ * anyway and needs nothing at all from the Lua side - where a growing file written on the
+ * server tick would be a genuinely bad idea.
  *
- * Two files, both JSON Lines, both append-only:
+ * Two tables carry it, both defined in db.php:
  *
- *   visits.jsonl - one line per sector a craft was seen to occupy, closed off when it
- *                  moves on. Positions come from GET /ships, which reads the ship
- *                  database, so this keeps recording with every player logged out. It is
- *                  what the heatmap and the travel track are built from.
- *   events.jsonl - the mod's own order and status events, kept past the ring buffer's
- *                  200 and past a server restart.
+ *   visits - one row per sector a craft was seen to occupy. Positions come from
+ *            GET /ships, which reads the ship database, so this keeps recording with
+ *            every player logged out. It is what the heatmap and the travel track are
+ *            built from.
+ *   events - the mod's own order and status events, kept past the ring buffer's 200 and
+ *            past a server restart.
  *
  * ### On keying by the API key
  *
- * The directory is named for a SHA-256 of the key and never holds the key itself: this
- * process deliberately owns no credential, and storing one would change that. A key is
- * 256 bits of randomness, so the name cannot be guessed, and a key nobody has ever used
- * simply addresses a directory that does not exist.
+ * A key is identified by a SHA-256 of itself and the key is never stored: this process
+ * deliberately owns no credential, and keeping one would change that. A key is 256 bits of
+ * randomness, so the hash cannot be guessed, and a key nobody has ever used simply matches
+ * no row.
  *
  * That is what lets reads skip validation - an unknown key reads an empty history rather
  * than someone else's. Writes are a different matter and are only ever made after the mod
  * has answered a call successfully, which is the actual authentication. A caller who
- * cannot get a 200 out of the mod cannot make this directory exist.
+ * cannot get a 200 out of the mod cannot make a row here exist.
  *
  * ### What it does not know
  *
- * Nothing here polls. History accumulates while *something* is calling the API - the
- * console with a tab open, a cron job, your own script - and a gap in the files is a gap
- * in who was looking, not a gap in what happened. Dwell times are therefore reported as
- * observed seconds: time nobody was watching is counted as zero rather than guessed at.
+ * Nothing in the mod pushes. History accumulates while *something* is calling the API -
+ * the poller service, the console with a tab open, your own script - and a gap in the
+ * tables is a gap in who was looking, not a gap in what happened. Dwell times are
+ * therefore reported as observed seconds: time nobody was watching is counted as zero
+ * rather than guessed at. docker-compose.yml runs a poller on a timer so that, in a normal
+ * deployment, something is always looking.
  */
 final class History
 {
-    private const VISITS = 'visits.jsonl';
-    private const EVENTS = 'events.jsonl';
-    private const STATE = 'state.json';
-    private const LOCK = '.lock';
-    private const PRUNED = '.pruned';
-
-    /** How often pruning is even considered, in seconds. */
-    private const PRUNE_EVERY = 3600;
-
-    private string $dir;
+    private string $hash;
     private int $retentionDays;
-    private int $maxBytes;
+    private int $maxRows;
+    private ?PDO $pdo = null;
 
-    public function __construct(string $root, string $key)
+    /** Memoised api_keys.id: false means "looked and there was none". */
+    private int|false|null $keyId = null;
+
+    public function __construct(string $key)
     {
-        $this->dir = rtrim($root, '/') . '/' . substr(hash('sha256', $key), 0, 32);
+        $this->hash = hash('sha256', $key);
         $this->retentionDays = max(1, (int) (getenv('HISTORY_DAYS') ?: 30));
-        $this->maxBytes = max(256 * 1024, (int) (getenv('HISTORY_MAX_BYTES') ?: 16 * 1024 * 1024));
+        $this->maxRows = max(1000, (int) (getenv('HISTORY_MAX_ROWS') ?: 500000));
     }
 
     public function exists(): bool
     {
-        return is_dir($this->dir);
-    }
-
-    public function directory(): string
-    {
-        return $this->dir;
+        return $this->keyId(false) !== null;
     }
 
     /* ------------------------------- recording ------------------------------ */
@@ -80,10 +74,10 @@ final class History
     /**
      * Fold one GET /ships answer into the visit log.
      *
-     * A craft that has not moved produces no line - it only extends the visit already
-     * open for it in state.json. A craft that has moved closes that visit out and opens
-     * the next. So the file grows with travel rather than with polling, and a fleet
-     * parked for a week costs nothing.
+     * A craft that has not moved produces no new row - it extends the one already open for
+     * it, which the partial unique index guarantees there is at most one of. So the table
+     * grows with travel rather than with polling, and a fleet parked for a week costs one
+     * UPDATE per craft per poll and nothing on disk.
      */
     public function recordShips(object $body): void
     {
@@ -92,68 +86,116 @@ final class History
             return;
         }
 
-        $now = time();
-        $closed = [];
+        $seen = [];
 
-        $this->withState(static function (array $state) use ($ships, $now, &$closed): array {
-            $known = $state['ships'] ?? [];
+        foreach ($ships as $ship) {
+            $name = is_object($ship) ? ($ship->name ?? null) : null;
+            $position = is_object($ship) ? ($ship->position ?? null) : null;
 
-            foreach ($ships as $ship) {
-                $name = is_object($ship) ? ($ship->name ?? null) : null;
-                $position = is_object($ship) ? ($ship->position ?? null) : null;
-
-                if (!is_string($name) || $name === '' || !is_object($position)) {
-                    continue;
-                }
-                if (!isset($position->x, $position->y)) {
-                    continue;
-                }
-
-                $x = (int) $position->x;
-                $y = (int) $position->y;
-                $owner = is_object($ship->owner ?? null) ? (string) ($ship->owner->kind ?? '') : '';
-
-                $open = $known[$name] ?? null;
-
-                if (is_array($open) && (int) $open['x'] === $x && (int) $open['y'] === $y) {
-                    // Same sector: the visit simply got longer.
-                    $known[$name]['e'] = $now;
-                    continue;
-                }
-
-                if (is_array($open)) {
-                    $closed[] = [
-                        't' => (int) $open['t'],
-                        'e' => (int) $open['e'],
-                        's' => $name,
-                        'x' => (int) $open['x'],
-                        'y' => (int) $open['y'],
-                        'o' => (string) ($open['o'] ?? ''),
-                    ];
-                }
-
-                $known[$name] = ['x' => $x, 'y' => $y, 't' => $now, 'e' => $now, 'o' => $owner];
+            if (!is_string($name) || $name === '' || !is_object($position)) {
+                continue;
+            }
+            if (!isset($position->x, $position->y)) {
+                continue;
             }
 
-            $state['ships'] = $known;
-            $state['seen'] = $now;
-
-            return $state;
-        });
-
-        if ($closed !== []) {
-            $this->append(self::VISITS, $closed);
+            $seen[$name] = [
+                'x' => (int) $position->x,
+                'y' => (int) $position->y,
+                'o' => is_object($ship->owner ?? null) ? (string) ($ship->owner->kind ?? '') : '',
+            ];
         }
+
+        if ($seen === []) {
+            return;
+        }
+
+        $pdo = $this->db();
+        $keyId = $this->keyId(true);
+        if ($keyId === null) {
+            return;
+        }
+
+        $pdo->beginTransaction();
+
+        try {
+            /*
+             * FOR UPDATE rather than a lock file. Two pollers, or a poller and an open
+             * console, routinely fold the same answer at the same moment; without this both
+             * see no open visit and both insert one, and the partial unique index turns
+             * that into an error instead of a duplicate. Taking the rows first serialises
+             * them into "second one sees the first one's work".
+             */
+            $open = [];
+            $rows = $this->all(
+                $pdo,
+                'SELECT ship, x, y FROM visits WHERE key_id = :k AND open FOR UPDATE',
+                [':k' => $keyId]
+            );
+            foreach ($rows as $row) {
+                $open[(string) $row['ship']] = ['x' => (int) $row['x'], 'y' => (int) $row['y']];
+            }
+
+            $extend = $pdo->prepare(
+                'UPDATE visits SET left_at = now() WHERE key_id = :k AND ship = :s AND open'
+            );
+            $close = $pdo->prepare(
+                'UPDATE visits SET open = FALSE WHERE key_id = :k AND ship = :s AND open'
+            );
+            /*
+             * ON CONFLICT because FOR UPDATE above cannot lock a row that does not exist
+             * yet. Two writers recording a craft's very first visit at the same moment both
+             * see no open row and both insert, and the partial unique index is what stops
+             * that becoming two open visits for one craft. Without this the loser's whole
+             * transaction aborts; with it, it correctly does nothing, because the winner has
+             * already recorded exactly the visit it was going to record.
+             */
+            $insert = $pdo->prepare(
+                'INSERT INTO visits (key_id, ship, owner, x, y, entered_at, left_at, open)
+                 VALUES (:k, :s, :o, :x, :y, now(), now(), TRUE)
+                 ON CONFLICT (key_id, ship) WHERE open DO NOTHING'
+            );
+
+            foreach ($seen as $name => $at) {
+                $was = $open[$name] ?? null;
+
+                if ($was !== null && $was['x'] === $at['x'] && $was['y'] === $at['y']) {
+                    // Same sector: the visit simply got longer.
+                    $extend->execute([':k' => $keyId, ':s' => $name]);
+                    continue;
+                }
+
+                if ($was !== null) {
+                    $close->execute([':k' => $keyId, ':s' => $name]);
+                }
+
+                $insert->execute([
+                    ':k' => $keyId, ':s' => $name, ':o' => $at['o'],
+                    ':x' => $at['x'], ':y' => $at['y'],
+                ]);
+            }
+
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
+
+        $this->maybePrune();
     }
 
     /**
      * Fold one GET /ships/{name}/events answer into the event log.
      *
-     * Sequence numbers are the mod's and are global, monotonic, and reset to zero on a
-     * server restart. A batch whose highest sequence sits below what is already stored is
-     * therefore a restart rather than a replay, and the stored mark is dropped instead of
-     * swallowing every event until the counter catches up again - which, on a busy galaxy,
-     * is hours.
+     * Sequence numbers are the mod's and reset to zero on a server restart, so (ship, seq)
+     * is not unique over time - seq 4 after a restart is a different event from seq 4
+     * before it. A batch whose highest sequence sits below what is already stored is
+     * therefore a restart rather than a replay, and is answered by starting a new epoch
+     * instead of swallowing every event until the counter catches up again - which, on a
+     * busy galaxy, is hours.
+     *
+     * With the epoch in the unique index, recording is idempotent: the poller and an open
+     * console can collect the same batch and the second insert does nothing.
      */
     public function recordEvents(string $ship, object $body): void
     {
@@ -162,7 +204,6 @@ final class History
             return;
         }
 
-        $now = time();
         $owner = is_object($body->owner ?? null) ? (string) ($body->owner->kind ?? '') : '';
 
         $highest = 0;
@@ -175,7 +216,7 @@ final class History
          *
          * They are not the same and the difference is not small: a caller that has been
          * away comes back and collects a whole backlog in one call, and stamping all of it
-         * with time() lands an afternoon's worth of events on a single second.
+         * with now() lands an afternoon's worth of events on a single second.
          *
          * The mod stamps each event with Server().unpausedRuntime, which is seconds of
          * server uptime - no use as a date on its own, but exact as a spacing. The newest
@@ -185,6 +226,7 @@ final class History
          * poll interval for anything watched live, and it degrades gracefully: an event
          * without a usable stamp simply gets the arrival time it would have had anyway.
          */
+        $now = time();
         $newest = 0.0;
         foreach ($events as $event) {
             if (is_object($event) && is_numeric($event->at ?? null)) {
@@ -208,17 +250,39 @@ final class History
             return $now - $offset;
         };
 
-        $lines = [];
+        $pdo = $this->db();
+        $keyId = $this->keyId(true);
+        if ($keyId === null) {
+            return;
+        }
 
-        $this->withState(static function (array $state) use (
-            $events, $ship, $owner, $now, $highest, $happenedAt, &$lines
-        ): array {
-            $marks = $state['seqs'] ?? [];
-            $mark = (int) ($marks[$ship] ?? -1);
+        $pdo->beginTransaction();
+
+        try {
+            $pdo->prepare(
+                'INSERT INTO ship_state (key_id, ship) VALUES (:k, :s)
+                 ON CONFLICT (key_id, ship) DO NOTHING'
+            )->execute([':k' => $keyId, ':s' => $ship]);
+
+            $state = $this->one(
+                $pdo,
+                'SELECT epoch, max_seq FROM ship_state WHERE key_id = :k AND ship = :s FOR UPDATE',
+                [':k' => $keyId, ':s' => $ship]
+            );
+
+            $epoch = (int) ($state['epoch'] ?? 0);
+            $mark = (int) ($state['max_seq'] ?? -1);
 
             if ($highest < $mark) {
+                $epoch++;
                 $mark = -1;
             }
+
+            $insert = $pdo->prepare(
+                'INSERT INTO events (key_id, ship, owner, epoch, seq, happened_at, data)
+                 VALUES (:k, :s, :o, :e, :q, to_timestamp(:t), CAST(:d AS jsonb))
+                 ON CONFLICT (key_id, ship, epoch, seq) DO NOTHING'
+            );
 
             foreach ($events as $event) {
                 if (!is_object($event)) {
@@ -230,441 +294,471 @@ final class History
                     continue;
                 }
 
-                $line = ['t' => $happenedAt($event), 's' => $ship, 'q' => $seq, 'o' => $owner];
+                // Everything the mod sent except the two fields that became columns. The
+                // event shape belongs to the mod and should not need a migration to change.
+                $data = get_object_vars($event);
+                unset($data['seq']);
 
-                foreach (get_object_vars($event) as $field => $value) {
-                    if ($field === 'seq') {
-                        continue;
-                    }
-                    $line[$field] = $value;
-                }
-
-                $lines[] = $line;
+                $insert->execute([
+                    ':k' => $keyId,
+                    ':s' => $ship,
+                    ':o' => $owner,
+                    ':e' => $epoch,
+                    ':q' => $seq,
+                    ':t' => $happenedAt($event),
+                    ':d' => json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}',
+                ]);
             }
 
-            $marks[$ship] = max($mark, $highest);
-            $state['seqs'] = $marks;
+            $pdo->prepare(
+                'UPDATE ship_state SET epoch = :e, max_seq = GREATEST(max_seq, :q)
+                 WHERE key_id = :k AND ship = :s'
+            )->execute([':k' => $keyId, ':s' => $ship, ':e' => $epoch, ':q' => max($mark, $highest)]);
 
-            return $state;
-        });
-
-        if ($lines !== []) {
-            $this->append(self::EVENTS, $lines);
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
         }
+
+        $this->maybePrune();
     }
 
     /* -------------------------------- reading ------------------------------- */
 
     /**
-     * Every visit, oldest first, with the one currently open appended so that "where is
-     * it right now" is part of the same answer rather than a separate call.
+     * Every visit in the window, oldest first. The one a craft currently has open is an
+     * ordinary row carrying `open: true`, so "where is it right now" is part of the same
+     * answer rather than a separate call.
      */
     public function visits(array $filter): array
     {
-        $out = $this->scan(self::VISITS, $filter);
-
-        foreach ($this->openVisits() as $open) {
-            if ($this->keep($open, $filter)) {
-                $out[] = $open;
-            }
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return [];
         }
 
-        usort($out, static fn (array $a, array $b): int => $a['t'] <=> $b['t']);
+        [$where, $args] = $this->where($keyId, $filter, 'entered_at', 'left_at');
 
+        $sql = 'SELECT ship, owner, x, y, open,
+                       EXTRACT(EPOCH FROM entered_at)::bigint AS t,
+                       EXTRACT(EPOCH FROM left_at)::bigint    AS e
+                FROM visits WHERE ' . $where . ' ORDER BY entered_at, id';
+
+        // Keep the newest: a caller drawing a track wants where the ship has been lately,
+        // and can page back with `from` for the rest. Done as a descending LIMIT and
+        // flipped, so the database never materialises the rows being thrown away.
         $limit = (int) ($filter['limit'] ?? 0);
-        if ($limit > 0 && count($out) > $limit) {
-            // Keep the newest: a caller drawing a track wants where the ship has been
-            // lately, and can page back with `from` for the rest.
-            $out = array_slice($out, -$limit);
+        if ($limit > 0) {
+            // `id` is carried through the subquery so the outer sort can break ties the
+            // same way the inner one did. Several visits routinely share a second - a fleet
+            // jumping together is recorded in one pass - and ordering by t alone would let
+            // the planner hand them back in a different order each call.
+            $sql = 'SELECT * FROM (SELECT id, ship, owner, x, y, open,
+                           EXTRACT(EPOCH FROM entered_at)::bigint AS t,
+                           EXTRACT(EPOCH FROM left_at)::bigint    AS e
+                    FROM visits WHERE ' . $where . ' ORDER BY entered_at DESC, id DESC LIMIT '
+                    . $limit . ') q ORDER BY t, id';
+        }
+
+        $out = [];
+        foreach ($this->all($this->db(), $sql, $args) as $row) {
+            $visit = [
+                't' => (int) $row['t'],
+                'e' => (int) $row['e'],
+                's' => (string) $row['ship'],
+                'x' => (int) $row['x'],
+                'y' => (int) $row['y'],
+                'o' => (string) $row['owner'],
+            ];
+            if ($this->truthy($row['open'])) {
+                $visit['open'] = true;
+            }
+            $out[] = $visit;
         }
 
         return $out;
     }
 
-    /** Visits collapsed onto the grid: how often each sector was entered, and for how long. */
+    /**
+     * Visits collapsed onto the grid: how often each sector was entered, and for how long.
+     *
+     * This is the query the JSONL store could not do - it had to read every line and fold
+     * it in PHP. Here the grouping is the database's problem and the index on (key_id, x, y)
+     * is the whole of the work.
+     */
     public function heatmap(array $filter): array
     {
-        $cells = [];
-        $ships = [];
-        $first = null;
-        $last = null;
-
-        foreach ($this->visits($filter + ['limit' => 0]) as $visit) {
-            $key = $visit['x'] . ',' . $visit['y'];
-
-            if (!isset($cells[$key])) {
-                $cells[$key] = ['x' => $visit['x'], 'y' => $visit['y'], 'visits' => 0, 'seconds' => 0];
-            }
-
-            $cells[$key]['visits']++;
-            // Observed seconds only. A visit that opened and closed between two polls is
-            // a real visit of zero measured duration, not a missing one.
-            $cells[$key]['seconds'] += max(0, (int) $visit['e'] - (int) $visit['t']);
-
-            $ships[$visit['s']] = true;
-            $first = $first === null ? $visit['t'] : min($first, $visit['t']);
-            $last = $last === null ? $visit['e'] : max($last, $visit['e']);
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return ['cells' => [], 'maxVisits' => 0, 'maxSeconds' => 0,
+                    'ships' => [], 'from' => null, 'to' => null];
         }
 
+        [$where, $args] = $this->where($keyId, $filter, 'entered_at', 'left_at');
+
+        // Observed seconds only. A visit that opened and closed between two polls is a
+        // real visit of zero measured duration, not a missing one - hence GREATEST(...,0)
+        // rather than any attempt to guess at the gap.
+        $cells = $this->all(
+            $this->db(),
+            'SELECT x, y, COUNT(*)::bigint AS visits,
+                    SUM(GREATEST(0, EXTRACT(EPOCH FROM (left_at - entered_at))))::bigint AS seconds
+             FROM visits WHERE ' . $where . ' GROUP BY x, y ORDER BY y, x',
+            $args
+        );
+
+        $span = $this->one(
+            $this->db(),
+            'SELECT EXTRACT(EPOCH FROM MIN(entered_at))::bigint AS f,
+                    EXTRACT(EPOCH FROM MAX(left_at))::bigint    AS t,
+                    COUNT(DISTINCT ship)::bigint                AS n
+             FROM visits WHERE ' . $where,
+            $args
+        );
+
+        $ships = $this->all(
+            $this->db(),
+            'SELECT DISTINCT ship FROM visits WHERE ' . $where . ' ORDER BY ship',
+            $args
+        );
+
+        $out = [];
         $maxVisits = 0;
         $maxSeconds = 0;
+
         foreach ($cells as $cell) {
-            $maxVisits = max($maxVisits, $cell['visits']);
-            $maxSeconds = max($maxSeconds, $cell['seconds']);
+            $visits = (int) $cell['visits'];
+            $seconds = (int) $cell['seconds'];
+            $out[] = ['x' => (int) $cell['x'], 'y' => (int) $cell['y'],
+                      'visits' => $visits, 'seconds' => $seconds];
+            $maxVisits = max($maxVisits, $visits);
+            $maxSeconds = max($maxSeconds, $seconds);
         }
 
         return [
-            'cells' => array_values($cells),
+            'cells' => $out,
             'maxVisits' => $maxVisits,
             'maxSeconds' => $maxSeconds,
-            'ships' => array_keys($ships),
-            'from' => $first,
-            'to' => $last,
+            'ships' => array_map(static fn (array $r): string => (string) $r['ship'], $ships),
+            'from' => isset($span['f']) ? (int) $span['f'] : null,
+            'to' => isset($span['t']) ? (int) $span['t'] : null,
         ];
     }
 
     public function events(array $filter): array
     {
-        $out = $this->scan(self::EVENTS, $filter);
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return [];
+        }
+
+        [$where, $args] = $this->where($keyId, $filter, 'happened_at', 'happened_at');
 
         $limit = (int) ($filter['limit'] ?? 0);
-        if ($limit > 0 && count($out) > $limit) {
-            $out = array_slice($out, -$limit);
+        /*
+         * `id` is not decoration. A batch collected in one call is stored in one second, so
+         * happened_at alone leaves the order inside that second up to the planner - and a
+         * caller asking for the newest N would get an arbitrary N of them. The serial is
+         * insertion order, which for a batch is the mod's own sequence order.
+         */
+        $sql = 'SELECT ship, owner, seq, data, EXTRACT(EPOCH FROM happened_at)::bigint AS t
+                FROM events WHERE ' . $where
+                . ' ORDER BY happened_at ' . ($limit > 0 ? 'DESC, id DESC LIMIT ' . $limit : 'ASC, id ASC');
+
+        $out = [];
+        foreach ($this->all($this->db(), $sql, $args) as $row) {
+            $event = [
+                't' => (int) $row['t'],
+                's' => (string) $row['ship'],
+                'q' => (int) $row['seq'],
+                'o' => (string) $row['owner'],
+            ];
+
+            $data = json_decode((string) $row['data'], true);
+            if (is_array($data)) {
+                foreach ($data as $field => $value) {
+                    $event[$field] = $value;
+                }
+            }
+
+            $out[] = $event;
         }
 
-        return $out;
+        // The descending LIMIT above kept the newest; the caller wants them oldest first.
+        return $limit > 0 ? array_reverse($out) : $out;
     }
 
-    /** What is on disk, per craft, so a client can show the shape of it before asking for any. */
+    /** What is stored, per craft, so a client can show the shape of it before asking for any. */
     public function summary(): array
     {
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return ['ships' => [], 'rows' => 0, 'retentionDays' => $this->retentionDays,
+                    'recording' => false];
+        }
+
         $ships = [];
 
-        $note = static function (string $name, string $field, int $t, int $e) use (&$ships): void {
+        $note = static function (string $name, string $field, int $count, ?int $first, ?int $last)
+            use (&$ships): void {
             if (!isset($ships[$name])) {
                 $ships[$name] = ['name' => $name, 'visits' => 0, 'events' => 0,
-                                 'sectors' => 0, 'first' => $t, 'last' => $e];
+                                 'sectors' => 0, 'first' => null, 'last' => null];
             }
-            $ships[$name][$field]++;
-            $ships[$name]['first'] = min($ships[$name]['first'], $t);
-            $ships[$name]['last'] = max($ships[$name]['last'], $e);
+            $ships[$name][$field] = $count;
+            foreach ([['first', $first, 'min'], ['last', $last, 'max']] as [$slot, $value, $pick]) {
+                if ($value === null) {
+                    continue;
+                }
+                $ships[$name][$slot] = $ships[$name][$slot] === null
+                    ? $value
+                    : $pick($ships[$name][$slot], $value);
+            }
         };
 
-        $sectors = [];
-
-        foreach ($this->scan(self::VISITS, []) as $visit) {
-            $note($visit['s'], 'visits', (int) $visit['t'], (int) $visit['e']);
-            $sectors[$visit['s']][$visit['x'] . ',' . $visit['y']] = true;
+        $rows = $this->all(
+            $this->db(),
+            'SELECT ship, COUNT(*)::bigint AS n, COUNT(DISTINCT (x, y))::bigint AS sectors,
+                    EXTRACT(EPOCH FROM MIN(entered_at))::bigint AS f,
+                    EXTRACT(EPOCH FROM MAX(left_at))::bigint    AS l
+             FROM visits WHERE key_id = :k GROUP BY ship',
+            [':k' => $keyId]
+        );
+        foreach ($rows as $row) {
+            $note((string) $row['ship'], 'visits', (int) $row['n'], (int) $row['f'], (int) $row['l']);
+            $ships[(string) $row['ship']]['sectors'] = (int) $row['sectors'];
         }
 
-        foreach ($this->openVisits() as $visit) {
-            $note($visit['s'], 'visits', (int) $visit['t'], (int) $visit['e']);
-            $sectors[$visit['s']][$visit['x'] . ',' . $visit['y']] = true;
-        }
-
-        foreach ($this->scan(self::EVENTS, []) as $event) {
-            $note($event['s'], 'events', (int) $event['t'], (int) $event['t']);
-        }
-
-        foreach ($ships as $name => $_) {
-            $ships[$name]['sectors'] = count($sectors[$name] ?? []);
+        $rows = $this->all(
+            $this->db(),
+            'SELECT ship, COUNT(*)::bigint AS n,
+                    EXTRACT(EPOCH FROM MIN(happened_at))::bigint AS f,
+                    EXTRACT(EPOCH FROM MAX(happened_at))::bigint AS l
+             FROM events WHERE key_id = :k GROUP BY ship',
+            [':k' => $keyId]
+        );
+        foreach ($rows as $row) {
+            $note((string) $row['ship'], 'events', (int) $row['n'], (int) $row['f'], (int) $row['l']);
         }
 
         ksort($ships);
 
+        $total = 0;
+        foreach ($ships as $ship) {
+            $total += $ship['visits'] + $ship['events'];
+        }
+
         return [
             'ships' => array_values($ships),
-            'bytes' => $this->bytes(),
+            'rows' => $total,
             'retentionDays' => $this->retentionDays,
-            'recording' => $this->exists(),
+            'recording' => true,
         ];
     }
 
     /** Removes everything stored for this key, or just one craft's share of it. */
     public function clear(?string $ship): array
     {
-        if (!$this->exists()) {
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
             return ['cleared' => true, 'ship' => $ship, 'removed' => 0];
         }
 
+        $pdo = $this->db();
+        $removed = 0;
+
         if ($ship === null) {
-            $removed = 0;
-            foreach ([self::VISITS, self::EVENTS, self::STATE, self::PRUNED] as $file) {
-                $path = $this->dir . '/' . $file;
-                if (is_file($path)) {
-                    $removed++;
-                    @unlink($path);
-                }
-            }
+            // ON DELETE CASCADE takes visits, events and ship_state with it, and forgetting
+            // the key row means the next write starts over as if nothing had been recorded.
+            $removed = (int) $this->one($pdo, 'SELECT COUNT(*)::bigint AS n FROM visits WHERE key_id = :k',
+                [':k' => $keyId])['n'];
+            $removed += (int) $this->one($pdo, 'SELECT COUNT(*)::bigint AS n FROM events WHERE key_id = :k',
+                [':k' => $keyId])['n'];
+
+            $pdo->prepare('DELETE FROM api_keys WHERE id = :k')->execute([':k' => $keyId]);
+            $this->keyId = false;
 
             return ['cleared' => true, 'ship' => null, 'removed' => $removed];
         }
 
-        $removed = 0;
-        foreach ([self::VISITS, self::EVENTS] as $file) {
-            $removed += $this->rewrite($file, static function (array $row) use ($ship, &$removed): bool {
-                return ($row['s'] ?? null) !== $ship;
-            });
+        foreach (['visits', 'events', 'ship_state'] as $table) {
+            $statement = $pdo->prepare("DELETE FROM {$table} WHERE key_id = :k AND ship = :s");
+            $statement->execute([':k' => $keyId, ':s' => $ship]);
+            if ($table !== 'ship_state') {
+                $removed += $statement->rowCount();
+            }
         }
-
-        $this->withState(static function (array $state) use ($ship): array {
-            unset($state['ships'][$ship], $state['seqs'][$ship]);
-            return $state;
-        });
 
         return ['cleared' => true, 'ship' => $ship, 'removed' => $removed];
     }
 
+    /**
+     * Drops rows past the retention window, and past a hard row cap if the window alone is
+     * not enough. Public because the poller calls it on its own timer, which is where this
+     * work belongs - see maybePrune for why it also runs, rarely, from the request path.
+     */
+    public function prune(): int
+    {
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return 0;
+        }
+
+        $pdo = $this->db();
+        $cutoff = time() - $this->retentionDays * 86400;
+        $removed = 0;
+
+        foreach ([['visits', 'left_at'], ['events', 'happened_at']] as [$table, $column]) {
+            $statement = $pdo->prepare(
+                "DELETE FROM {$table} WHERE key_id = :k AND {$column} < to_timestamp(:c) AND NOT "
+                . ($table === 'visits' ? 'open' : 'FALSE')
+            );
+            $statement->execute([':k' => $keyId, ':c' => $cutoff]);
+            $removed += $statement->rowCount();
+
+            // Still over the cap for the window alone - a single very busy month. Trim the
+            // oldest rather than letting one key fill the volume.
+            $count = (int) $this->one($pdo, "SELECT COUNT(*)::bigint AS n FROM {$table} WHERE key_id = :k",
+                [':k' => $keyId])['n'];
+
+            if ($count > $this->maxRows) {
+                $statement = $pdo->prepare(
+                    "DELETE FROM {$table} WHERE id IN (
+                         SELECT id FROM {$table} WHERE key_id = :k ORDER BY {$column}, id LIMIT :n)"
+                );
+                $statement->bindValue(':k', $keyId, PDO::PARAM_INT);
+                $statement->bindValue(':n', $count - $this->maxRows, PDO::PARAM_INT);
+                $statement->execute();
+                $removed += $statement->rowCount();
+            }
+        }
+
+        return $removed;
+    }
+
     /* -------------------------------- internals ----------------------------- */
 
-    /** The visit each craft is in the middle of, which has not been written out yet. */
-    private function openVisits(): array
+    private function db(): PDO
     {
-        $state = $this->readState();
-        $out = [];
-
-        foreach (($state['ships'] ?? []) as $name => $open) {
-            if (!is_array($open)) {
-                continue;
-            }
-            $out[] = [
-                't' => (int) $open['t'],
-                'e' => (int) $open['e'],
-                's' => (string) $name,
-                'x' => (int) $open['x'],
-                'y' => (int) $open['y'],
-                'o' => (string) ($open['o'] ?? ''),
-                'open' => true,
-            ];
-        }
-
-        return $out;
-    }
-
-    private function keep(array $row, array $filter): bool
-    {
-        if (isset($filter['ship']) && $filter['ship'] !== '' && ($row['s'] ?? null) !== $filter['ship']) {
-            return false;
-        }
-        if (isset($filter['owner']) && $filter['owner'] !== '' && ($row['o'] ?? '') !== $filter['owner']) {
-            return false;
-        }
-
-        $to = (int) ($row['e'] ?? $row['t'] ?? 0);
-        $from = (int) ($row['t'] ?? 0);
-
-        if (!empty($filter['from']) && $to < (int) $filter['from']) {
-            return false;
-        }
-        if (!empty($filter['to']) && $from > (int) $filter['to']) {
-            return false;
-        }
-
-        return true;
-    }
-
-    /** Streams one JSONL file, keeping the rows a filter accepts. */
-    private function scan(string $file, array $filter): array
-    {
-        $path = $this->dir . '/' . $file;
-        if (!is_file($path)) {
-            return [];
-        }
-
-        $handle = @fopen($path, 'rb');
-        if ($handle === false) {
-            return [];
-        }
-
-        $out = [];
-
-        while (($line = fgets($handle)) !== false) {
-            $line = trim($line);
-            if ($line === '') {
-                continue;
-            }
-
-            $row = json_decode($line, true);
-            // A line truncated by a torn write is dropped rather than failing the read.
-            // Appends are locked, so this should not happen; if it does, one lost row is
-            // a far better outcome than an unreadable history.
-            if (!is_array($row)) {
-                continue;
-            }
-
-            if ($this->keep($row, $filter)) {
-                $out[] = $row;
-            }
-        }
-
-        fclose($handle);
-
-        return $out;
-    }
-
-    private function append(string $file, array $rows): void
-    {
-        if (!$this->ensureDir()) {
-            return;
-        }
-
-        $blob = '';
-        foreach ($rows as $row) {
-            $encoded = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            if (is_string($encoded)) {
-                $blob .= $encoded . "\n";
-            }
-        }
-
-        if ($blob === '') {
-            return;
-        }
-
-        // LOCK_EX around an append, so two PHP threads answering two calls at once cannot
-        // interleave half-lines into the same file.
-        @file_put_contents($this->dir . '/' . $file, $blob, FILE_APPEND | LOCK_EX);
-
-        $this->maybePrune($file);
-    }
-
-    private function readState(): array
-    {
-        $raw = @file_get_contents($this->dir . '/' . self::STATE);
-        if (!is_string($raw) || $raw === '') {
-            return [];
-        }
-
-        $state = json_decode($raw, true);
-
-        return is_array($state) ? $state : [];
+        return $this->pdo ??= Db::connect();
     }
 
     /**
-     * Read-modify-write of state.json under an exclusive lock.
+     * This key's row id, creating it only when something is about to be written.
      *
-     * The state holds each craft's open visit and each craft's highest seen sequence
-     * number, both of which two concurrent calls would otherwise clobber - and a lost
-     * sequence mark means every event in between gets written twice.
+     * Reads must not create: a read is unauthenticated by design, so letting one insert a
+     * row would let anybody fill the table with hashes of keys that do not exist.
      */
-    private function withState(callable $fn): void
+    private function keyId(bool $create): ?int
     {
-        if (!$this->ensureDir()) {
-            return;
+        if (is_int($this->keyId)) {
+            return $this->keyId;
+        }
+        if ($this->keyId === false && !$create) {
+            return null;
         }
 
-        $lock = @fopen($this->dir . '/' . self::LOCK, 'cb');
-        if ($lock === false) {
-            return;
+        $pdo = $this->db();
+
+        if ($create) {
+            // ON CONFLICT ... DO UPDATE rather than DO NOTHING, because DO NOTHING returns
+            // no row and would need a second SELECT on every single write.
+            $row = $this->one(
+                $pdo,
+                'INSERT INTO api_keys (key_hash) VALUES (:h)
+                 ON CONFLICT (key_hash) DO UPDATE SET seen_at = now()
+                 RETURNING id',
+                [':h' => $this->hash]
+            );
+        } else {
+            $row = $this->one($pdo, 'SELECT id FROM api_keys WHERE key_hash = :h', [':h' => $this->hash]);
         }
 
-        @flock($lock, LOCK_EX);
-
-        $state = $fn($this->readState());
-
-        $encoded = json_encode($state, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-        if (is_string($encoded)) {
-            @file_put_contents($this->dir . '/' . self::STATE, $encoded);
+        if (!isset($row['id'])) {
+            $this->keyId = false;
+            return null;
         }
 
-        @flock($lock, LOCK_UN);
-        fclose($lock);
-    }
-
-    private function ensureDir(): bool
-    {
-        if (is_dir($this->dir)) {
-            return true;
-        }
-
-        // Suppressed: two threads racing to create the same directory is normal, and the
-        // is_dir below is the real answer either way.
-        @mkdir($this->dir, 0o770, true);
-
-        return is_dir($this->dir);
-    }
-
-    private function bytes(): int
-    {
-        $total = 0;
-        foreach ([self::VISITS, self::EVENTS, self::STATE] as $file) {
-            $total += (int) @filesize($this->dir . '/' . $file);
-        }
-
-        return $total;
+        return $this->keyId = (int) $row['id'];
     }
 
     /**
-     * Drops rows past the retention window, and past a hard size cap if the window alone
-     * is not enough. Throttled hard: this rewrites a file, and doing it on every call
-     * would turn a cheap append into an O(n) one.
+     * Builds the WHERE shared by every read.
+     *
+     * A window overlaps a row when the row ends after `from` and starts before `to`, which
+     * is not the same as either endpoint being inside it: a craft parked in one sector for
+     * a week belongs in every window that week touches.
+     *
+     * @return array{0: string, 1: array<string, mixed>}
      */
-    private function maybePrune(string $file): void
+    private function where(int $keyId, array $filter, string $start, string $end): array
     {
-        $stamp = $this->dir . '/' . self::PRUNED;
-        $last = (int) @filemtime($stamp);
+        $sql = 'key_id = :k';
+        $args = [':k' => $keyId];
 
-        if ($last > 0 && time() - $last < self::PRUNE_EVERY) {
-            return;
+        if (isset($filter['ship']) && $filter['ship'] !== '') {
+            $sql .= ' AND ship = :s';
+            $args[':s'] = (string) $filter['ship'];
+        }
+        if (isset($filter['owner']) && $filter['owner'] !== '') {
+            $sql .= ' AND owner = :o';
+            $args[':o'] = (string) $filter['owner'];
+        }
+        if (!empty($filter['from'])) {
+            $sql .= " AND {$end} >= to_timestamp(:f)";
+            $args[':f'] = (int) $filter['from'];
+        }
+        if (!empty($filter['to'])) {
+            $sql .= " AND {$start} <= to_timestamp(:t)";
+            $args[':t'] = (int) $filter['to'];
         }
 
-        @touch($stamp);
-
-        $cutoff = time() - $this->retentionDays * 86400;
-        $this->rewrite($file, static fn (array $row): bool => (int) ($row['e'] ?? $row['t'] ?? 0) >= $cutoff);
-
-        if ((int) @filesize($this->dir . '/' . $file) <= $this->maxBytes) {
-            return;
-        }
-
-        // Still too large for the window alone - a single very busy month. Halve it,
-        // oldest first, rather than letting one key fill the volume.
-        $rows = $this->scan($file, []);
-        $keep = array_slice($rows, (int) (count($rows) / 2));
-        $this->replace($file, $keep);
+        return [$sql, $args];
     }
 
-    /** Rewrites a file keeping the rows a predicate accepts. Returns how many went. */
-    private function rewrite(string $file, callable $keep): int
+    private function all(PDO $pdo, string $sql, array $args): array
     {
-        $path = $this->dir . '/' . $file;
-        if (!is_file($path)) {
-            return 0;
-        }
+        $statement = $pdo->prepare($sql);
+        $statement->execute($args);
 
-        $rows = $this->scan($file, []);
-        $kept = array_values(array_filter($rows, $keep));
-
-        if (count($kept) === count($rows)) {
-            return 0;
-        }
-
-        $this->replace($file, $kept);
-
-        return count($rows) - count($kept);
+        return $statement->fetchAll();
     }
 
-    private function replace(string $file, array $rows): void
+    private function one(PDO $pdo, string $sql, array $args): array
     {
-        $blob = '';
-        foreach ($rows as $row) {
-            $encoded = json_encode($row, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-            if (is_string($encoded)) {
-                $blob .= $encoded . "\n";
-            }
-        }
+        $statement = $pdo->prepare($sql);
+        $statement->execute($args);
+        $row = $statement->fetch();
 
-        // Write beside it and rename in. Unlike the mod - whose sandbox loses a renamed
-        // file outright - this is an ordinary process, so the swap is atomic and a reader
-        // never sees a half-rewritten log.
-        $staged = $this->dir . '/' . $file . '.part';
+        return is_array($row) ? $row : [];
+    }
 
-        if (@file_put_contents($staged, $blob, LOCK_EX) === false) {
-            @unlink($staged);
+    /** Postgres hands booleans back as "t"/"f" over this driver, not as PHP bools. */
+    private function truthy(mixed $value): bool
+    {
+        return $value === true || $value === 't' || $value === 1 || $value === '1';
+    }
+
+    /**
+     * Pruning from the request path, throttled hard.
+     *
+     * The poller is what normally prunes, on its own timer and away from anyone waiting.
+     * This is the fallback for a deployment that runs no poller, so it is deliberately
+     * rare: a DELETE on the hot path of a relayed call is worth it once an hour and not
+     * once a call.
+     */
+    private function maybePrune(): void
+    {
+        if (random_int(1, 2000) !== 1) {
             return;
         }
 
-        if (!@rename($staged, $this->dir . '/' . $file)) {
-            @unlink($staged);
+        try {
+            $this->prune();
+        } catch (Throwable) {
+            // A failed prune is a table that stays large, which is not worth failing a
+            // write over - the poller will get it on its next pass.
         }
     }
 }

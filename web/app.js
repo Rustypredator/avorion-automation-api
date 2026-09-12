@@ -2020,7 +2020,8 @@
         $('#history-legend').innerHTML = '<div class="note warn">This bridge keeps no '
           + 'history. It is served by the bridge rather than the mod, so an older '
           + 'deployment has no such route &mdash; run <code>docker compose up -d '
-          + '--build</code> on it, or unset HISTORY_DIR if it was turned off deliberately.'
+          + '--build</code> on it, or set HISTORY_DB_HOST back if it was turned off '
+          + 'deliberately.'
           + '</div>';
         return;
       }
@@ -2064,8 +2065,10 @@
         + '.</div>'
       + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
         + span + ' of recorded travel</div>'
-      + '<div class="mute2">Only time the console was watching is counted, so a quiet '
-        + 'stretch means nobody was polling, not that nothing moved.</div>';
+      + '<div class="mute2">Only observed time is counted. The bridge records what it '
+        + 'relays, so this is continuous if the poller service is running and otherwise '
+        + 'covers only the moments something was calling the API &mdash; a quiet stretch '
+        + 'can mean nobody was looking rather than that nothing moved.</div>';
   }
 
   function setHistoryWindow(seconds) {

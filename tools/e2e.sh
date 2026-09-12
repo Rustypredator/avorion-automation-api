@@ -51,6 +51,9 @@ GALAXY_DIR=$GALAXY
 HTTP_PORT=$PORT
 HTTPS_PORT=$((PORT + 1))
 BRIDGE_USER=$(id -u):$(id -g)
+POSTGRES_PASSWORD=e2e-throwaway-$$
+# Short enough that the poller section does not have to wait half a minute to see a pass.
+POLL_INTERVAL=5
 EOF
 
 call() {
@@ -65,6 +68,19 @@ get() {
 }
 
 json() { python3 -c "$1" "$WORK/body" 2>/dev/null; }
+
+# Waits for the bridge to answer at all, whatever it answers.
+#
+# A fixed sleep was enough when the stack was one container. It is not now: compose holds
+# the api back until Postgres reports healthy, and how long a first-time initdb takes
+# depends on the machine. Every check below wants the bridge's answer, not a race with it.
+await() {
+    for _ in $(seq 1 "${1:-40}"); do
+        curl -s -m 5 -o /dev/null -w '' "http://127.0.0.1:$PORT/ping" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
 
 code() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("error",{}).get("code",""))' "$WORK/body" 2>/dev/null; }
 
@@ -82,7 +98,7 @@ echo
 echo "GALAXY_DIR pointing where the mod never wrote"
 wipe
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
-sleep 6
+await
 status="$(call)"
 check "$([ "$status" = "503" ] && echo 0 || echo 1)" "an empty galaxy directory is a 503, not a timeout" "got $status"
 check "$([ "$(code)" = "bridge_unavailable" ] && echo 0 || echo 1)" "it reports bridge_unavailable" "got $(code)"
@@ -96,7 +112,7 @@ wipe
 docker run --rm -v "$GALAXY:/g" alpine \
     mkdir -p /g/moddata/AutomationAPI/requests /g/moddata/AutomationAPI/responses >/dev/null 2>&1
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
-sleep 6
+await
 status="$(call)"
 check "$([ "$(code)" = "transport_not_writable" ] && echo 0 || echo 1)" \
     "a root-owned transport directory names itself" "got $status $(code)"
@@ -115,7 +131,7 @@ KEY="$(grep -o 'avo_[a-f0-9]*' "$WORK/fake.log" | head -1)"
 check "$([ -n "$KEY" ] && echo 0 || echo 1)" "the fake server came up and issued a key"
 
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
-sleep 6
+await
 
 status="$(call "$KEY")"
 check "$([ "$status" = "200" ] && echo 0 || echo 1)" "GET /ping round-trips through the file transport" "got $status: $(head -c 200 "$WORK/body")"
@@ -163,6 +179,44 @@ check "$(json 'import json,sys;s=json.load(open(sys.argv[1]));sys.exit(0 if s["s
 
 status="$(get "$KEY" /history/nonsense)"
 check "$([ "$status" = "404" ] && echo 0 || echo 1)" "an unknown history route is a 404 from the bridge" "got $status"
+
+# #### The poller #### --
+#
+# The service that makes the history continuous. Nothing in the mod pushes, so without
+# this the record only covers the moments something happened to be calling - which is the
+# one property of the store a user is most likely to be surprised by. Worth pinning that
+# it actually runs on its own.
+
+echo
+echo "poller"
+
+# It starts with POLL_KEYS empty, so up to here it has said so and exited. Give it the key
+# the fake server issued and bring it back.
+echo "POLL_KEYS=$KEY" >> "$WORK/env"
+"${COMPOSE[@]}" up -d poller >/dev/null 2>&1
+
+curl -s -m 40 -X POST -o /dev/null -H "X-API-Key: $KEY" \
+    "http://127.0.0.1:$PORT/history/clear" 2>/dev/null
+
+status="$(get "$KEY" /history/summary)"
+empty="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["ships"]))')"
+check "$([ "$empty" = "0" ] && echo 0 || echo 1)" "the history starts cleared" "got $empty"
+
+# Nothing below calls /ships. If craft show up in the history it is because the poller put
+# them there - which is the whole point of the service.
+for _ in $(seq 1 40); do
+    get "$KEY" /history/summary >/dev/null
+    seen="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["ships"]))')"
+    [ "${seen:-0}" -gt 0 ] && break
+    sleep 1
+done
+
+check "$([ "${seen:-0}" -gt 0 ] && echo 0 || echo 1)" \
+    "it records the fleet with nothing else calling the API" "saw ${seen:-0} craft"
+
+logs="$("${COMPOSE[@]}" logs poller 2>&1 | tail -20)"
+check "$(echo "$logs" | grep -q 'polling 1 key' && echo 0 || echo 1)" \
+    "and says what it is polling on startup" "$(echo "$logs" | tail -3)"
 
 # #### Self-healing #### --
 #
