@@ -311,7 +311,7 @@
       + 'it next saves or the sector unloads. Until then there is nothing to read '
       + '&mdash; this is a station founded a few minutes ago, not an idle one.',
 
-    'no-books':
+    'no-accounts':
       'This craft runs no merchant script. Defence platforms, and mines that were never '
       + 'given a production line, read like this.',
 
@@ -319,16 +319,16 @@
       'The bridge keeps its own log on disk, which outlives the mod\'s 200-event buffer '
       + 'and a server restart.',
 
-    'books-lifetime':
+    'earnings-lifetime':
       'Totals since the station was founded &mdash; the only form the game keeps them '
       + 'in. The window in <b>Over time</b> turns them into a rate.',
 
-    'books-loaded':
+    'earnings-loaded':
       'The sector is loaded, so these figures can trail the station itself by up to one '
       + 'server save. They come from the craft\'s database row, which the game rewrites '
       + 'when it saves or unloads a sector.',
 
-    'books-unloaded':
+    'earnings-unloaded':
       'The sector is unloaded. These figures are exactly what the station held when it '
       + 'went quiet, which is also all that has happened to it.',
 
@@ -345,18 +345,18 @@
       '<p>A sold good at full stock has nowhere to put the next cycle; a bought good at '
       + 'zero is an ingredient the line is waiting on.</p>'
       + '<p>In and Out are units that appeared and left over the window &mdash; produced '
-      + 'or bought, and sold, consumed or shuttled away. The station\'s books keep one '
-      + 'money counter for the whole place, so which of those it was is not '
+      + 'or bought, and sold, consumed or shuttled away. The station keeps one money '
+      + 'counter for the whole place, so which of those it was is not '
       + 'recoverable.</p>',
 
     'economy-no-history':
-      'It is the bridge rather than the mod that samples the books over time, so an '
+      'It is the bridge rather than the mod that samples the earnings over time, so an '
       + 'older deployment has no such route &mdash; run <code>docker compose up -d '
       + '--build</code> on it, or set HISTORY_DB_HOST back if it was turned off '
       + 'deliberately.',
 
     'economy-no-samples':
-      'The bridge records the books when something asks for /stations, which the poller '
+      'The bridge records a station when something asks for /stations, which the poller '
       + 'service does on a timer &mdash; set POLL_KEYS in the stack\'s .env if it is not '
       + 'running.',
 
@@ -2592,7 +2592,8 @@
 
     if (station.error) {
       node.innerHTML = station.error.code === 'not_a_station'
-        ? '<div class="empty muted">No books. ' + explain('no-books') + '</div>'
+        ? '<div class="empty muted">This station keeps no accounts. '
+          + explain('no-accounts') + '</div>'
         : errorBox('Could not read the station', station.error);
       return;
     }
@@ -2624,11 +2625,12 @@
        loaded one can be a save interval behind the entity flying around in it. Which of
        the two it is is the state; why it matters is behind the mark. */
     var freshness = station.sectorLoaded
-      ? '<span class="badge warn">sector loaded</span> ' + explain('books-loaded', 'warn')
-      : '<span class="badge">sector unloaded</span> ' + explain('books-unloaded');
+      ? '<span class="badge warn">sector loaded</span> ' + explain('earnings-loaded', 'warn')
+      : '<span class="badge">sector unloaded</span> ' + explain('earnings-unloaded');
 
-    return '<div class="card"><h3>Books &mdash; ' + esc(stationLabel(station, economy)) + ' '
-      + explain('books-lifetime') + '</h3>'
+    return '<div class="card"><h3>Earnings &mdash; '
+      + esc(stationLabel(station, economy)) + ' '
+      + explain('earnings-lifetime') + '</h3>'
       + kv([
         ['earned', credits(earnings.fromGoods)],
         ['spent', credits(earnings.spentOnGoods)],
@@ -2803,7 +2805,7 @@
 
     if (station.error) {
       node.innerHTML = station.error.code === 'not_a_station'
-        ? '<div class="empty muted">No production line. ' + explain('no-books') + '</div>'
+        ? '<div class="empty muted">No production line. ' + explain('no-accounts') + '</div>'
         : errorBox('Could not read the station', station.error);
       return;
     }

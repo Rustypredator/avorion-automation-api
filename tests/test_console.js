@@ -242,13 +242,16 @@ const ready = window.document.readyState === 'loading'
     const economy = $('#sv-economy');
     const text = economy.textContent;
 
-    check(/Books/.test(text), 'the books card renders');
+    check(/Earnings/.test(text), 'the earnings card renders');
+    // "Books" read as the good rather than as the ledger, on a page where a station may
+    // genuinely trade Books.
+    check(!/Books/.test(text), 'and does not call itself the station\'s books');
 
     /* Every station running factory.lua reports kind "factory", which named none of them -
        a Solar Power Plant read the same as a Book Factory. The heading uses the resolved
        factory title instead. */
     check(/Oil Refinery II/.test(text),
-          'the books card names the station the way the game does, not by its script');
+          'and names the station the way the game does, rather than by its script');
 
     // The chain moved to its own tab: the Economy tab is this station's money and goods.
     check(!/Scrap Metal/.test(text), 'and carries no part of the production chain');
