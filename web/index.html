@@ -42,6 +42,7 @@
 
 <nav id="tabs">
   <button class="tab active" data-view="fleet">Fleet</button>
+  <button class="tab" data-view="industry">Industry</button>
   <button class="tab" data-view="map">Map</button>
   <button class="tab" data-view="galaxy">Galaxy</button>
 </nav>
@@ -111,6 +112,26 @@
         <div class="subview" data-sub="raw"><pre id="sv-raw" class="json"></pre></div>
       </div>
     </section>
+  </section>
+
+  <!-- ============================= INDUSTRY ============================ -->
+  <section id="view-industry" class="view">
+    <aside id="industry-list">
+      <div class="pane-head">
+        <div class="seg" id="industry-owner" data-value="player">
+          <button data-v="player" class="on">Mine</button>
+          <button data-v="alliance">Alliance</button>
+          <button data-v="all">Both</button>
+        </div>
+        <div class="pane-head-row">
+          <span id="industry-count" class="muted">&mdash;</span>
+          <button id="industry-refresh" class="ghost small">refresh</button>
+        </div>
+      </div>
+      <div id="industry-rows" class="rows"></div>
+    </aside>
+
+    <section id="industry-pane"></section>
   </section>
 
   <!-- =============================== MAP =============================== -->

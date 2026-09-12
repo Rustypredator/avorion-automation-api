@@ -80,6 +80,44 @@ const refinery = {
     }
 };
 
+/*
+ * /stations as the listing answers it: production lines and positions, no goods lists.
+ * Two stations share a sector and feed each other; a third sits elsewhere making what
+ * that sector is short of.
+ */
+function listed(name, x, y, production) {
+    return {
+        name: name, type: 'Station', owner: { kind: 'player', index: 1, name: 'Rusty' },
+        position: { x: x, y: y }, availability: 'Available', sectorLoaded: false,
+        usable: { ok: false, code: 'NotAShip' },
+        economy: { kind: 'factory', scripts: ['factory.lua'], production: production, stock: {} }
+    };
+}
+
+function line(title, ingredients, results) {
+    return {
+        title: title, style: 'Factory', mine: false, ingredients: ingredients, results: results,
+        garbage: [], slots: 1, running: [], active: 0, inputValue: 0, outputValue: 0, margin: 0
+    };
+}
+
+const stationListing = {
+    stations: [
+        listed('Rusty Refinery', 12, -4, Object.assign({}, refinery.economy.production, {
+            // Out of Energy Cells, so the wire from the plant next door reads as starved.
+            ingredients: [
+                { name: 'Energy Cell', amount: 5, price: 61, stock: 0 },
+                { name: 'Raw Oil', amount: 10, price: 66, stock: 40 }
+            ]
+        })),
+        listed('Sun Farm', 12, -4, line('Solar Power Plant', [],
+            [{ name: 'Energy Cell', amount: 20, price: 61, stock: 3000 }])),
+        listed('Oil Well', 15, -2, line('Raw Oil Mine', [],
+            [{ name: 'Raw Oil', amount: 10, price: 66, stock: 800 }]))
+    ],
+    count: 3
+};
+
 const hound = {
     name: 'Ore Hound', type: 'Ship', owner: { kind: 'player', index: 1, name: 'Rusty' },
     position: { x: 1, y: 2 }, usable: { ok: true }, availability: 'Available',
@@ -125,6 +163,7 @@ const routes = {
     },
     '/ships/Ore%20Hound/mission': { active: null },
     '/history/events': storedEvents,
+    '/stations': stationListing,
     '/stations/Rusty%20Refinery': refinery,
     '/history/economy/summary': {
         window: { from: now - 86400, to: now },
@@ -314,6 +353,67 @@ const ready = window.document.readyState === 'loading'
 
     check(/newest/.test(said[0]), 'the newest entry is at the top');
     check(/oldest/.test(said[said.length - 1]), 'and the oldest at the bottom');
+
+    console.log('\nthe industry view');
+
+    const click = (node) => node.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
+    $('.tab[data-view="industry"]').click();
+    await settle(500);
+
+    const sectorRows = $$('#industry-rows [data-sector]');
+    check(sectorRows.length === 2, 'the stations are grouped into one row per sector');
+    check(sectorRows[0].dataset.sector === '12:-4', 'the sector with the most lines comes first');
+    check(/1 input missing/.test(sectorRows[0].textContent), 'and says what it is short of');
+
+    const pane = $('#industry-pane');
+    check(/Sector 12:-4/.test(pane.textContent), 'that sector is drawn by default');
+    check(pane.querySelectorAll('.inode').length === 2, 'a node per producing station in it');
+    const rusty = pane.querySelector('.inode[data-station="Rusty Refinery"]');
+    check(/Energy Cell/.test(rusty.textContent) && /Oil/.test(rusty.textContent),
+          'each station lists the goods it takes in and puts out');
+    check(pane.querySelectorAll('.pwire').length === 4,
+          'a wire per good passed between them, brought in or sent out');
+    check(pane.querySelectorAll('.pwire.bad').length === 2,
+          'red where the taker holds none of it or nothing here makes it');
+    check(pane.querySelectorAll('.pnode.bad').length === 1,
+          'an ingredient nothing here makes is drawn coming in');
+    check(pane.querySelectorAll('.pnode.good').length === 1
+          && pane.querySelectorAll('.pnode').length === 3,
+          'and what nothing here takes in going out');
+    check(/Brought in[\s\S]*Raw Oil[\s\S]*Oil Well[\s\S]*15:-2/.test(pane.textContent),
+          'the missing input names the station elsewhere that makes it');
+
+    click($('#industry-rows [data-sector="15:-2"]'));
+    await settle(100);
+
+    check(/Sector 15:-2/.test(pane.textContent), 'picking another sector draws that one');
+    check(/self-supplied/.test(pane.textContent), 'a mine needs nothing brought in');
+    check(/Left over[\s\S]*Raw Oil[\s\S]*Rusty Refinery/.test(pane.textContent),
+          'and its output names the station elsewhere that takes it');
+
+    click(pane.querySelector('[data-sector="12:-4"]'));
+    await settle(100);
+    check(/Sector 12:-4/.test(pane.textContent), 'the sector link goes back');
+
+    click(pane.querySelector('.inode[data-station="Rusty Refinery"]'));
+    await settle(600);
+
+    check($('#view-fleet').classList.contains('active'), 'a station node opens the Fleet view');
+    check($('#ship-name').textContent === 'Rusty Refinery', 'with that station selected');
+    check($('.subview.active').dataset.sub === 'production', 'on its own Production tab');
+
+    const back = $('#sv-production [data-sector]');
+    check(back !== null && back.dataset.sector === '12:-4',
+          'which links back to the chain of the sector it sits in');
+
+    click(back);
+    await settle(300);
+    check($('#view-industry').classList.contains('active'), 'and that link opens it');
+
+    $('.tab[data-view="fleet"]').click();
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
 
     console.log('\nexplanations behind a mark');
 

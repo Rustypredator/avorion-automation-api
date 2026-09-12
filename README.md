@@ -176,6 +176,15 @@ underneath, turning that lifetime total into credits an hour and a bar per hour 
 the factory in the middle, results and waste on the right, one arrow each. Mission and
 Travel are not offered for a station: the game refuses both outright.
 
+The **Industry** tab puts those lines together, one sector at a time. Each station in the
+sector is a card with its ingredients down one edge and its results down the other, wired
+to the stations it feeds, so a sector reads as the production chain it actually is. Goods
+nothing in the sector makes come in from the left, goods nothing in it uses leave on the
+right, and both are listed underneath with the nearest of your stations elsewhere that
+would cover them. A red wire is an ingredient the receiving station has run out of. All of
+it comes from one `/stations` call; clicking a station opens it in the Fleet view, and a
+station's Production tab links back to its sector.
+
 The heading on both is the station's real identity rather than its script. Every factory in
 the game - a Solar Power Plant, an Iron Mine, a Book Factory - runs the same `factory.lua`
 and reports the same `kind`, so the mod resolves the production's own title template against

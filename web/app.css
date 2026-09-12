@@ -406,6 +406,48 @@ marker#pa-warn path { fill: #5c4c1e; }
 .chain-legend .lg.good { background: #12261e; border-color: #2a5a44; }
 .chain-legend .lg.warn { background: #262013; border-color: #5c4c1e; }
 
+/* ------------------------------- industry -------------------------------- */
+
+/* The fleet layout again: sectors down the side, the one being drawn beside them. */
+#view-industry { grid-template-columns: 300px 1fr; }
+#industry-list { border-right: 1px solid var(--line); display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--bg-2); }
+#industry-pane { display: grid; grid-template-rows: auto 1fr; min-height: 0; overflow: hidden; }
+#industry-pane > .empty { grid-row: 1 / -1; }
+.industry-body { overflow: auto; min-height: 0; padding: 14px 16px; }
+
+/* A link sitting in a card heading, which is uppercase and letter-spaced. */
+.card h3 .card-link { margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 400; }
+
+.sector-graph .inode { cursor: pointer; }
+.inode rect { fill: var(--bg-4); stroke: var(--accent-2); stroke-width: 1.4; }
+.inode:hover rect { stroke: var(--accent); }
+.inode.starved rect { stroke: var(--bad); }
+
+.pnode.bad rect { fill: #291616; stroke: #5c2a2a; }
+.pwire.bad { stroke: #8a3a3a; }
+.pwire.back { stroke-dasharray: 5 3; }
+marker#ia-in path, marker#ia-opt path { fill: var(--line-2); }
+marker#ia-good path { fill: #2a5a44; }
+marker#ia-warn path { fill: #5c4c1e; }
+marker#ia-bad path { fill: #8a3a3a; }
+
+/* A station's goods, ingredients down its left edge and results down its right, which is
+   where the wires carrying them land. */
+.in-rule { stroke: var(--line-2); }
+.port-in, .port-out { fill: var(--text-dim); font-size: 11px; }
+.port-out { text-anchor: end; fill: var(--good); }
+.port-in.bad { fill: var(--bad); }
+.port-in.opt { fill: var(--text-mute); font-style: italic; }
+.port-out.warn { fill: var(--warn); }
+
+.chain-legend .lg.station { background: var(--bg-4); border-color: var(--accent-2); }
+.chain-legend .lg.bad { background: #291616; border-color: #8a3a3a; }
+
+@media (max-width: 900px) {
+  #view-industry { grid-template-columns: 1fr; grid-template-rows: 200px 1fr; }
+  #industry-list { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+
 /* ------------------------------- popovers -------------------------------- */
 
 /* Every explanation on this page hangs off one of these rather than sitting under the

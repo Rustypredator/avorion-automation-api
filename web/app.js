@@ -73,6 +73,11 @@
     stationHistory: {},
     economyWindow: 86400,
 
+    /* Every station at once, off /stations, for the Industry view. `sector` is the
+       "x:y" key of the sector being drawn. */
+    view: 'fleet',
+    industry: { stations: null, error: null, sector: null },
+
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
     busy: {}
   };
@@ -415,7 +420,24 @@
       + 'itself.</p>',
 
     'material-belts':
-      'Distance from the core at which each material peaks.'
+      'Distance from the core at which each material peaks.',
+
+    'industry-chain':
+      '<p>Each station feeds the ones to its right: a wire is a good one station makes and '
+      + 'another in the same sector takes in. Goods on the far left are needed here and '
+      + 'made by nothing in the sector; goods on the far right are made here and used by '
+      + 'nothing in it.</p>'
+      + '<p>A red wire is an ingredient the receiving station holds none of. Whether the '
+      + 'goods actually move is up to the stations\' own trading settings &mdash; this is '
+      + 'what could feed what, not a record of deliveries.</p>',
+
+    'industry-missing':
+      'Ingredients no station in this sector makes, with the nearest stations of yours '
+      + 'elsewhere that do. Distance is straight-line, in sectors.',
+
+    'industry-leaves':
+      'Results no station in this sector takes in, with the nearest stations of yours '
+      + 'elsewhere that would.'
   };
 
   /* `key` is either a name in EXPLAIN or the text itself. `tone` is a .info modifier, for
@@ -538,6 +560,7 @@
 
     setSeg('#filter-type', S.filters.type);
     setSeg('#filter-owner', S.filters.owner);
+    setSeg('#industry-owner', S.filters.owner);
 
     try {
       var prefs = JSON.parse(localStorage.getItem(LS.history) || 'null');
@@ -696,6 +719,10 @@
         return loadStation(true);
       }
     });
+    loop('industry', EVERY.detail, function () {
+      // Every station's database row in one call, so only while someone is looking.
+      if (S.view === 'industry') { return loadIndustry(false); }
+    });
     loop('history', EVERY.history, function () {
       // Cheap when nothing draws it: loadHistory returns without a call in that case.
       if (historyWanted()) { return loadHistory(false); }
@@ -738,10 +765,15 @@
   }
 
   function showView(name) {
+    S.view = name;
     $$('.tab').forEach(function (t) { t.classList.toggle('active', t.dataset.view === name); });
     $$('.view').forEach(function (v) { v.classList.toggle('active', v.id === 'view-' + name); });
     if (name === 'map') { setTimeout(GalaxyMap.resize, 0); }
     if (name === 'galaxy') { renderGalaxy(); }
+    if (name === 'industry') {
+      renderIndustry();
+      if (S.connected) { loadIndustry(true); }
+    }
   }
 
   function showSub(name) {
@@ -2822,8 +2854,13 @@
       return;
     }
 
+    var sectorLink = station.position
+      ? ' <a href="#" class="card-link" data-sector="' + esc(coords(station.position))
+        + '">sector ' + esc(coords(station.position)) + ' chain &rarr;</a>'
+      : '';
+
     node.innerHTML = '<div class="cards">'
-      + '<div class="card wide"><h3>' + esc(stationLabel(station, economy))
+      + '<div class="card wide"><h3>' + esc(stationLabel(station, economy)) + sectorLink
         + '</h3><div class="scroll-x">' + chainGraph(production) + '</div>'
         + chainLegend(production) + '</div>'
       + chainFiguresCard(production)
@@ -2983,6 +3020,684 @@
       ])
       + cycles
       + '</div>';
+  }
+
+  /* ================================ INDUSTRY =============================== */
+  /*
+   * The Production tab draws one station's line. This draws a sector's worth of them wired
+   * together: which station's results are another's ingredients, and what the sector as a
+   * whole still has to bring in or has left over.
+   *
+   * All of it comes out of one /stations call - the listing carries every station's
+   * production line and position - so nothing here costs a call per station. What it
+   * cannot say is whether the goods actually move: that is each station's trading settings
+   * and the game's own traders, and neither is part of a production line.
+   */
+
+  function loadIndustry(userInitiated) {
+    if (!S.connected) { return Promise.resolve(); }
+
+    var owner = S.filters.owner;
+
+    return Api.get('/stations', { owner: owner },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'stations' })
+      .then(function (body) {
+        if (S.filters.owner !== owner) { return; }
+        S.industry.stations = body.stations || [];
+        S.industry.error = null;
+        renderIndustry();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled' || S.filters.owner !== owner) { return; }
+        S.industry.error = error;
+        renderIndustry();
+      });
+  }
+
+  function sectorKey(station) {
+    var at = station && station.position;
+    return at && at.x != null ? coords(at) : null;
+  }
+
+  function lineOf(station) {
+    return (station && station.economy && station.economy.production) || null;
+  }
+
+  // What a line puts out: its results, and the waste it has to get rid of as well.
+  function outputsOf(station) {
+    var line = lineOf(station);
+    if (!line) { return []; }
+
+    return (line.results || []).map(function (item) {
+      return { item: item, waste: false };
+    }).concat((line.garbage || []).map(function (item) {
+      return { item: item, waste: true };
+    }));
+  }
+
+  function inputsOf(station) {
+    var line = lineOf(station);
+    return line ? (line.ingredients || []) : [];
+  }
+
+  function push(map, key, value) {
+    (map[key] = map[key] || []).push(value);
+  }
+
+  /* Which stations in a sector feed which, and what nothing in it covers.
+     A station never supplies itself: a line whose waste is also its own ingredient is
+     still short of that ingredient as far as the sector is concerned. */
+  function analyseSector(key, all) {
+    var here = all.filter(function (station) { return sectorKey(station) === key; });
+    var lines = here.filter(lineOf);
+
+    var makers = {};
+    var takers = {};
+
+    lines.forEach(function (station, index) {
+      outputsOf(station).forEach(function (out) {
+        push(makers, out.item.name, { at: index, item: out.item, waste: out.waste });
+      });
+      inputsOf(station).forEach(function (item) {
+        push(takers, item.name, { at: index, item: item });
+      });
+    });
+
+    var links = [];
+    var missing = {};
+    var leaves = {};
+
+    Object.keys(takers).forEach(function (good) {
+      takers[good].forEach(function (taker) {
+        var suppliers = (makers[good] || []).filter(function (m) { return m.at !== taker.at; });
+        if (!suppliers.length) { push(missing, good, taker); return; }
+
+        suppliers.forEach(function (maker) {
+          links.push({ from: maker.at, to: taker.at, good: good,
+                       made: maker.item, taken: taker.item, waste: maker.waste });
+        });
+      });
+    });
+
+    Object.keys(makers).forEach(function (good) {
+      makers[good].forEach(function (maker) {
+        var used = (takers[good] || []).some(function (t) { return t.at !== maker.at; });
+        if (!used) { push(leaves, good, maker); }
+      });
+    });
+
+    // Optional ingredients are not a gap: the line runs without them.
+    var gaps = Object.keys(missing).filter(function (good) {
+      return missing[good].some(function (taker) { return !taker.item.optional; });
+    });
+
+    return {
+      key: key, stations: here, lines: lines,
+      idle: here.filter(function (station) { return !lineOf(station); }),
+      links: links, missing: missing, leaves: leaves, gaps: gaps
+    };
+  }
+
+  function sectorsOf(stations) {
+    var keys = {};
+    stations.forEach(function (station) {
+      var key = sectorKey(station);
+      if (key) { keys[key] = true; }
+    });
+
+    return Object.keys(keys).map(function (key) {
+      return analyseSector(key, stations);
+    }).sort(function (a, b) {
+      return (b.lines.length - a.lines.length) || (b.stations.length - a.stations.length)
+        || (a.key < b.key ? -1 : (a.key > b.key ? 1 : 0));
+    });
+  }
+
+  /* The closest stations outside the sector that make (or take) a good. Straight-line
+     distance: a jump route depends on the ship doing the hauling, and this is a hint about
+     where to look rather than a route. */
+  function nearestElsewhere(all, key, good, makes) {
+    var here = key.split(':').map(Number);
+
+    return all.filter(function (station) {
+      var at = sectorKey(station);
+      if (!at || at === key) { return false; }
+
+      return makes
+        ? outputsOf(station).some(function (out) { return out.item.name === good; })
+        : inputsOf(station).some(function (item) { return item.name === good; });
+    }).map(function (station) {
+      return {
+        station: station,
+        distance: Math.sqrt(Math.pow(station.position.x - here[0], 2)
+                            + Math.pow(station.position.y - here[1], 2))
+      };
+    }).sort(function (a, b) {
+      return (a.distance - b.distance) || (a.station.name < b.station.name ? -1 : 1);
+    }).slice(0, 3);
+  }
+
+  /* Columns by longest path from a station nothing local feeds, so every wire runs left
+     to right. Links that close a loop are found first and left out of the layering -
+     otherwise a cycle would push its stations rightwards once per pass - and drawn as a
+     dashed loop under the graph instead. */
+  function chainColumns(analysis) {
+    var count = analysis.lines.length;
+    var out = analysis.lines.map(function () { return []; });
+
+    analysis.links.forEach(function (link) { out[link.from].push(link); });
+
+    var state = analysis.lines.map(function () { return 0; });
+    var visit = function (index) {
+      state[index] = 1;
+      out[index].forEach(function (link) {
+        if (state[link.to] === 1) { link.back = true; return; }
+        if (state[link.to] === 0) { visit(link.to); }
+      });
+      state[index] = 2;
+    };
+    for (var i = 0; i < count; i++) { if (state[i] === 0) { visit(i); } }
+
+    var column = analysis.lines.map(function () { return 0; });
+    for (var pass = 0; pass < count; pass++) {
+      var changed = false;
+      analysis.links.forEach(function (link) {
+        if (link.back || column[link.to] >= column[link.from] + 1) { return; }
+        column[link.to] = column[link.from] + 1;
+        changed = true;
+      });
+      if (!changed) { break; }
+    }
+
+    return column;
+  }
+
+  function lineTitle(station) {
+    var line = lineOf(station);
+    return (line && (line.title || line.style)) || (station.economy && station.economy.kind) || '';
+  }
+
+  // A required ingredient the station holds none of.
+  function starvedOf(station) {
+    return inputsOf(station).filter(function (item) {
+      return !item.optional && !item.stock;
+    });
+  }
+
+  function sectorGraph(analysis) {
+    var lines = analysis.lines;
+    var column = chainColumns(analysis);
+    var columns = Math.max.apply(null, column.concat([0])) + 1;
+
+    var imports = Object.keys(analysis.missing);
+    var exports = Object.keys(analysis.leaves);
+
+    /* A station is a card with its ingredients down the left edge and what it makes down
+       the right, and every wire lands on the row of the good it carries - so the goods
+       are named once, on the stations, rather than on labels that collide wherever the
+       wires bunch up. Monospace, so text budgets are arithmetic as in chainGraph(). */
+    var W = 320, HEAD = 40, ROW = 16, SGAP = 26, GW = 156, GH = 26, GGAP = 10;
+    var SPAN = 120, GSPAN = 90, PAD = 30;
+
+    var stack = function (sizes, gap) {
+      return sizes.length ? sizes.reduce(function (a, b) { return a + b; }, 0)
+        + (sizes.length - 1) * gap : 0;
+    };
+
+    var size = lines.map(function (station) {
+      return HEAD + Math.max(1, inputsOf(station).length, outputsOf(station).length) * ROW + 8;
+    });
+
+    var perColumn = [];
+    for (var c = 0; c < columns; c++) { perColumn.push([]); }
+    lines.forEach(function (station, index) { perColumn[column[index]].push(index); });
+
+    var goodsHeight = function (n) {
+      var sizes = [];
+      for (var i = 0; i < n; i++) { sizes.push(GH); }
+      return stack(sizes, GGAP);
+    };
+
+    var body = Math.max(goodsHeight(imports.length), goodsHeight(exports.length),
+      Math.max.apply(null, perColumn.map(function (list) {
+        return stack(list.map(function (index) { return size[index]; }), SGAP);
+      })));
+
+    var mid = PAD + body / 2;
+    var height = body + PAD * 2;
+
+    var left = imports.length ? GW + GSPAN : 0;
+    var stationX = function (col) { return left + col * (W + SPAN); };
+    var exportX = stationX(columns - 1) + W + GSPAN;
+    var width = exports.length ? exportX + GW : stationX(columns - 1) + W;
+
+    /* Top to bottom within a column by where the stations feeding it sit, which keeps the
+       wires from crossing in the common case of a few parallel chains in one sector. */
+    var top = [];
+    var centre = function (index) { return top[index] + size[index] / 2; };
+    var byTitle = function (a, b) {
+      var ta = lineTitle(lines[a]) + lines[a].name, tb = lineTitle(lines[b]) + lines[b].name;
+      return ta < tb ? -1 : (ta > tb ? 1 : 0);
+    };
+    var average = function (values) {
+      return values.length
+        ? values.reduce(function (a, b) { return a + b; }, 0) / values.length : mid;
+    };
+
+    perColumn.forEach(function (list, col) {
+      if (col > 0) {
+        var weight = {};
+        list.forEach(function (index) {
+          weight[index] = average(analysis.links.filter(function (link) {
+            return link.to === index && !link.back && top[link.from] != null;
+          }).map(function (link) { return centre(link.from); }));
+        });
+        list.sort(function (a, b) { return (weight[a] - weight[b]) || byTitle(a, b); });
+      } else {
+        list.sort(byTitle);
+      }
+
+      var y = mid - stack(list.map(function (index) { return size[index]; }), SGAP) / 2;
+      list.forEach(function (index) {
+        top[index] = y;
+        y += size[index] + SGAP;
+      });
+    });
+
+    var rowY = function (index, row) { return top[index] + HEAD + row * ROW + ROW / 2 + 4; };
+
+    var inPort = function (index, good) {
+      var row = 0;
+      inputsOf(lines[index]).some(function (item, i) { row = i; return item.name === good; });
+      return rowY(index, row);
+    };
+
+    var outPort = function (index, good) {
+      var row = 0;
+      outputsOf(lines[index]).some(function (out, i) { row = i; return out.item.name === good; });
+      return rowY(index, row);
+    };
+
+    imports.sort(function (a, b) {
+      return average(analysis.missing[a].map(function (t) { return inPort(t.at, a); }))
+        - average(analysis.missing[b].map(function (t) { return inPort(t.at, b); }));
+    });
+    exports.sort(function (a, b) {
+      return average(analysis.leaves[a].map(function (m) { return outPort(m.at, a); }))
+        - average(analysis.leaves[b].map(function (m) { return outPort(m.at, b); }));
+    });
+
+    var goodY = function (list, index) {
+      return mid - goodsHeight(list.length) / 2 + index * (GH + GGAP) + GH / 2;
+    };
+
+    /* A wire that skips a column goes through it between two stations rather than behind
+       one. Each column's free bands are worked out once; a wire takes the band nearest
+       to where it would have crossed, and wires sharing a band are fanned apart. */
+    var bands = perColumn.map(function (list) {
+      var free = [];
+      var from = 4;
+      list.forEach(function (index) {
+        free.push({ from: from, to: top[index] - 4, used: 0 });
+        from = top[index] + size[index] + 4;
+      });
+      free.push({ from: from, to: height - 4, used: 0 });
+      return free.filter(function (band) { return band.to - band.from >= 6; });
+    });
+
+    var laneThrough = function (col, want) {
+      var best = null, bestDistance = Infinity;
+      bands[col].forEach(function (band) {
+        var distance = want < band.from ? band.from - want : (want > band.to ? want - band.to : 0);
+        if (distance < bestDistance) { best = band; bestDistance = distance; }
+      });
+      if (!best) { return want; }
+
+      var n = best.used++;
+      var offset = (n % 2 ? -1 : 1) * Math.ceil(n / 2) * 5;
+      var base = bestDistance === 0 ? want : (best.from + best.to) / 2;
+      return Math.max(best.from + 2, Math.min(best.to - 2, base + offset));
+    };
+
+    var f = function (v) { return v.toFixed(1); };
+
+    // fromCol -1 is the imports column, toCol `columns` the exports one.
+    var route = function (x1, y1, fromCol, x2, y2, toCol) {
+      var d = 'M' + f(x1) + ' ' + f(y1);
+      var at = { x: x1, y: y1 };
+
+      var bendTo = function (x, y) {
+        var bend = (x - at.x) * 0.5;
+        d += ' C' + f(at.x + bend) + ' ' + f(at.y) + ' ' + f(x - bend) + ' ' + f(y)
+          + ' ' + f(x) + ' ' + f(y);
+        at = { x: x, y: y };
+      };
+
+      for (var k = fromCol + 1; k < toCol; k++) {
+        var share = (stationX(k) + W / 2 - x1) / (x2 - x1);
+        var y = laneThrough(k, y1 + (y2 - y1) * share);
+        bendTo(stationX(k) - 6, y);
+        d += ' L' + f(stationX(k) + W + 6) + ' ' + f(y);
+        at = { x: stationX(k) + W + 6, y: y };
+      }
+
+      bendTo(x2 - 3, y2);
+      return d;
+    };
+
+    /* A link that closes a loop runs back under the whole graph. */
+    var loopBack = function (x1, y1, x2, y2) {
+      var under = height - 8;
+      return 'M' + f(x1) + ' ' + f(y1)
+        + ' C' + f(x1 + 60) + ' ' + f(y1) + ' ' + f(x1 + 60) + ' ' + f(under) + ' ' + f(x1) + ' ' + f(under)
+        + ' L' + f(x2) + ' ' + f(under)
+        + ' C' + f(x2 - 60) + ' ' + f(under) + ' ' + f(x2 - 60) + ' ' + f(y2) + ' ' + f(x2 - 3) + ' ' + f(y2);
+    };
+
+    var markers = ['in', 'opt', 'good', 'warn', 'bad'].map(function (tone) {
+      return '<marker id="ia-' + tone + '" class="' + tone + '" viewBox="0 0 8 8"'
+        + ' refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">'
+        + '<path d="M0 0 L8 4 L0 8 z"/></marker>';
+    }).join('');
+
+    var wire = function (d, tone, title, back) {
+      return '<path class="pwire ' + tone + (back ? ' back' : '') + '" marker-end="url(#ia-'
+        + tone + ')" d="' + d + '"><title>' + esc(title) + '</title></path>';
+    };
+
+    var holds = function (station, item) {
+      return station.name + ' takes ' + numText(item.amount) + ' a cycle and holds '
+        + numText(item.stock);
+    };
+
+    var wires = [];
+    var nodes = [];
+
+    analysis.links.forEach(function (link) {
+      var from = lines[link.from], to = lines[link.to];
+      var tone = !link.taken.optional && !link.taken.stock ? 'bad'
+        : (link.taken.optional ? 'opt' : (link.waste ? 'warn' : 'in'));
+
+      var x1 = stationX(column[link.from]) + W, y1 = outPort(link.from, link.good);
+      var x2 = stationX(column[link.to]), y2 = inPort(link.to, link.good);
+
+      wires.push(wire(link.back
+          ? loopBack(x1, y1, x2, y2)
+          : route(x1, y1, column[link.from], x2, y2, column[link.to]),
+        tone,
+        link.good + ': ' + from.name + ' makes ' + numText(link.made.amount) + ' a cycle; '
+          + holds(to, link.taken),
+        link.back));
+    });
+
+    var goodNode = function (x, y, tone, name, title) {
+      return '<g class="pnode ' + tone + '" transform="translate(' + f(x) + ' '
+        + f(y - GH / 2) + ')"><title>' + esc(title) + '</title>'
+        + '<rect width="' + GW + '" height="' + GH + '" rx="4"/>'
+        + '<text class="pn-name" x="10" y="17">' + esc(clip(name, 19)) + '</text></g>';
+    };
+
+    imports.forEach(function (good, index) {
+      var takers = analysis.missing[good];
+      var optional = takers.every(function (t) { return t.item.optional; });
+      var y = goodY(imports, index);
+
+      nodes.push(goodNode(0, y, optional ? 'opt' : 'bad', good, good
+        + (optional ? ' (optional)' : '') + ' — nothing in this sector makes it; needed by '
+        + takers.map(function (t) { return lines[t.at].name; }).join(', ')));
+
+      takers.forEach(function (taker) {
+        wires.push(wire(route(GW, y, -1, stationX(column[taker.at]), inPort(taker.at, good),
+                              column[taker.at]),
+          taker.item.optional ? 'opt' : 'bad',
+          good + ': made nowhere in this sector; ' + holds(lines[taker.at], taker.item)));
+      });
+    });
+
+    exports.forEach(function (good, index) {
+      var makers = analysis.leaves[good];
+      var waste = makers.every(function (m) { return m.waste; });
+      var y = goodY(exports, index);
+
+      nodes.push(goodNode(exportX, y, waste ? 'warn' : 'good', good, good
+        + (waste ? ' (waste)' : '') + ' — nothing in this sector takes it in; made by '
+        + makers.map(function (m) { return lines[m.at].name; }).join(', ')));
+
+      makers.forEach(function (maker) {
+        wires.push(wire(route(stationX(column[maker.at]) + W, outPort(maker.at, good),
+                              column[maker.at], exportX, y, columns),
+          maker.waste ? 'warn' : 'good',
+          good + ': ' + lines[maker.at].name + ' makes ' + numText(maker.item.amount)
+            + ' a cycle and holds ' + numText(maker.item.stock)));
+      });
+    });
+
+    lines.forEach(function (station, index) {
+      var line = lineOf(station);
+      var starved = starvedOf(station);
+
+      var sub = lineTitle(station) + ' · ' + numText(line.active) + '/' + numText(line.slots)
+        + ' cycles · ' + (line.margin > 0 ? '+' : '') + numText(line.margin) + ' ¢';
+
+      // 11px rows: 0.6em is 6.6px, and each side gets half the card less its padding.
+      var rows = inputsOf(station).map(function (item, row) {
+        var tone = !item.optional && !item.stock ? ' bad' : (item.optional ? ' opt' : '');
+        return '<text class="port-in' + tone + '" x="10" y="' + f(rowY(index, row) - top[index] + 4)
+          + '">' + esc(clip(numText(item.amount) + '× ' + item.name, 22)) + '</text>';
+      }).concat(outputsOf(station).map(function (out, row) {
+        return '<text class="port-out' + (out.waste ? ' warn' : '') + '" x="' + (W - 10)
+          + '" y="' + f(rowY(index, row) - top[index] + 4) + '">'
+          + esc(clip(out.item.name + ' ×' + numText(out.item.amount), 22)) + '</text>';
+      }));
+
+      nodes.push('<g class="inode' + (starved.length ? ' starved' : '')
+        + '" data-station="' + esc(station.name) + '" data-owner="'
+        + esc((station.owner && station.owner.kind) || '') + '" transform="translate('
+        + f(stationX(column[index])) + ' ' + f(top[index]) + ')">'
+        + '<title>' + esc(station.name + ' — ' + lineTitle(station)
+            + (starved.length
+                ? '\nout of ' + starved.map(function (i) { return i.name; }).join(', ') : '')
+            + '\nopen in Fleet') + '</title>'
+        + '<rect width="' + W + '" height="' + size[index] + '" rx="5"/>'
+        + '<text class="ph-name" x="10" y="17">' + esc(clip(station.name, 38)) + '</text>'
+        + '<text class="pn-sub" x="10" y="32">' + esc(clip(sub, 50)) + '</text>'
+        + '<line class="in-rule" x1="0" y1="' + HEAD + '" x2="' + W + '" y2="' + HEAD + '"/>'
+        + rows.join('')
+        + '</g>');
+    });
+
+    return '<svg class="chain-graph sector-graph" width="' + width.toFixed(0) + '" height="'
+      + height.toFixed(0) + '" viewBox="0 0 ' + width.toFixed(0) + ' ' + height.toFixed(0)
+      + '" role="img" aria-label="sector production chain">'
+      + '<defs>' + markers + '</defs>' + wires.join('') + nodes.join('') + '</svg>';
+  }
+
+  function stationLink(station) {
+    return '<a href="#" data-station="' + esc(station.name) + '" data-owner="'
+      + esc((station.owner && station.owner.kind) || '') + '">' + esc(station.name) + '</a>';
+  }
+
+  function elsewhereCell(found) {
+    if (!found.length) { return '<span class="mute2">none of yours</span>'; }
+
+    return found.map(function (hit) {
+      return stationLink(hit.station) + ' <a href="#" class="mute2" data-sector="'
+        + esc(sectorKey(hit.station)) + '">' + esc(sectorKey(hit.station)) + '</a>'
+        + ' <span class="mute2">' + numText(hit.distance, 1) + ' away</span>';
+    }).join('<br>');
+  }
+
+  function missingCard(analysis, all) {
+    var goods = Object.keys(analysis.missing).sort();
+    if (!goods.length) { return ''; }
+
+    return '<div class="card wide"><h3>Brought in ' + explain('industry-missing') + '</h3>'
+      + '<div class="scroll-x"><table><thead><tr><th>Good</th><th>Needed by</th>'
+      + '<th>Made elsewhere</th></tr></thead><tbody>'
+      + goods.map(function (good) {
+          var takers = analysis.missing[good];
+          var optional = takers.every(function (t) { return t.item.optional; });
+
+          return '<tr><td>' + esc(good)
+            + (optional ? ' <span class="badge">optional</span>' : '') + '</td>'
+            + '<td>' + takers.map(function (t) {
+                var station = analysis.lines[t.at];
+                return stationLink(station) + (t.item.stock ? '' : ' <span class="badge bad">out</span>');
+              }).join('<br>') + '</td>'
+            + '<td>' + elsewhereCell(nearestElsewhere(all, analysis.key, good, true)) + '</td></tr>';
+        }).join('')
+      + '</tbody></table></div></div>';
+  }
+
+  function leavesCard(analysis, all) {
+    var goods = Object.keys(analysis.leaves).sort();
+    if (!goods.length) { return ''; }
+
+    return '<div class="card wide"><h3>Left over ' + explain('industry-leaves') + '</h3>'
+      + '<div class="scroll-x"><table><thead><tr><th>Good</th><th>Made by</th>'
+      + '<th>Taken in elsewhere</th></tr></thead><tbody>'
+      + goods.map(function (good) {
+          var makers = analysis.leaves[good];
+          var waste = makers.every(function (m) { return m.waste; });
+
+          return '<tr><td>' + esc(good)
+            + (waste ? ' <span class="badge warn">waste</span>' : '') + '</td>'
+            + '<td>' + makers.map(function (m) {
+                return stationLink(analysis.lines[m.at]);
+              }).join('<br>') + '</td>'
+            + '<td>' + elsewhereCell(nearestElsewhere(all, analysis.key, good, false)) + '</td></tr>';
+        }).join('')
+      + '</tbody></table></div></div>';
+  }
+
+  function sectorBadge(analysis) {
+    if (!analysis.lines.length) { return '<span class="badge">no production</span>'; }
+    if (analysis.gaps.length) {
+      return '<span class="badge warn">' + analysis.gaps.length + ' input'
+        + (analysis.gaps.length === 1 ? '' : 's') + ' missing</span>';
+    }
+    return '<span class="badge good">self-supplied</span>';
+  }
+
+  /* Both halves are rewritten on every poll, so each is left alone when nothing in it
+     changed - which keeps an open popover, a hovered tooltip and the scroll position. */
+  var industryHtml = { rows: null, pane: null };
+
+  function paint(node, key, html) {
+    if (industryHtml[key] === html && node.innerHTML) { return; }
+    industryHtml[key] = html;
+
+    var scrolled = $('.industry-body', node);
+    var top = scrolled ? scrolled.scrollTop : 0;
+    var wide = $('.sector-scroll', node);
+    var across = wide ? wide.scrollLeft : 0;
+
+    node.innerHTML = html;
+
+    if ($('.industry-body', node)) { $('.industry-body', node).scrollTop = top; }
+    if ($('.sector-scroll', node)) { $('.sector-scroll', node).scrollLeft = across; }
+  }
+
+  function renderIndustry() {
+    var rows = $('#industry-rows');
+    var pane = $('#industry-pane');
+    if (!rows || !pane) { return; }
+
+    var state = S.industry;
+
+    if (!state.stations) {
+      $('#industry-count').textContent = '—';
+      paint(rows, 'rows', '');
+      paint(pane, 'pane', state.error
+        ? '<div class="industry-body">' + errorBox('Could not list stations', state.error) + '</div>'
+        : '<div class="empty muted">' + (S.connected ? 'loading…' : 'Connect first.') + '</div>');
+      return;
+    }
+
+    var all = state.stations;
+    var sectors = sectorsOf(all);
+
+    $('#industry-count').textContent = numText(all.length) + ' stations · '
+      + numText(sectors.length) + ' sectors';
+
+    var current = sectors.filter(function (s) { return s.key === state.sector; })[0];
+    if (!current && sectors.length) {
+      current = sectors[0];
+      state.sector = current.key;
+    }
+
+    paint(rows, 'rows', sectors.map(function (sector) {
+      var titles = sector.lines.map(lineTitle).concat(sector.idle.map(function (station) {
+        return (station.economy && station.economy.kind) || 'station';
+      }));
+
+      return '<div class="ship-row' + (sector === current ? ' sel' : '') + '" data-sector="'
+        + esc(sector.key) + '">'
+        + '<div class="n">' + esc(sector.key) + ' <span class="mute2">· '
+          + numText(sector.stations.length) + '</span></div>'
+        + '<div class="badges">' + sectorBadge(sector) + '</div>'
+        + '<div class="s">' + esc(titles.join(', ')) + '</div></div>';
+    }).join('') || '<div class="empty muted">No stations with books.</div>');
+
+    if (!current) {
+      paint(pane, 'pane', '<div class="empty muted">No stations with books for this owner. '
+        + explain('no-accounts') + '</div>');
+      return;
+    }
+
+    var linked = {};
+    current.links.forEach(function (link) { linked[link.from] = linked[link.to] = true; });
+
+    var head = '<div class="ship-head"><div><h1>Sector ' + esc(current.key) + '</h1>'
+      + '<div class="muted">' + numText(current.stations.length) + ' stations · '
+      + numText(current.lines.length) + ' producing · '
+      + numText(Object.keys(linked).length) + ' linked</div></div>'
+      + '<div class="badges">' + sectorBadge(current) + '</div></div>';
+
+    var graph = current.lines.length
+      ? '<div class="card wide"><h3>Production chain ' + explain('industry-chain') + '</h3>'
+        + '<div class="scroll-x sector-scroll">' + sectorGraph(current) + '</div>'
+        + '<div class="chain-legend mute2">'
+        + '<span class="lg station"></span>station'
+        + '<span class="lg bad"></span>missing / out of stock'
+        + '<span class="lg good"></span>leaves the sector'
+        + '<span class="lg warn"></span>waste'
+        + '</div></div>'
+      : '';
+
+    var idle = current.idle.length
+      ? '<div class="card wide"><h3>Not producing</h3>'
+        + current.idle.map(function (station) {
+            return stationLink(station) + ' <span class="mute2">'
+              + esc((station.economy && station.economy.kind) || 'station') + '</span>';
+          }).join(' · ') + '</div>'
+      : '';
+
+    paint(pane, 'pane', head + '<div class="industry-body"><div class="cards">'
+      + graph + missingCard(current, all) + leavesCard(current, all) + idle
+      + '</div></div>');
+  }
+
+  /* Over to the Fleet view with the station selected and its own chain open. The
+     listing there may be filtered to ships, and a selection the listing does not hold is
+     dropped by the next refresh - so the filter is widened first when it has to be. */
+  function openStation(name) {
+    showView('fleet');
+
+    var land = function () {
+      select(name);
+      showSub('production');
+    };
+
+    if (S.filters.type !== 'ship' && S.byName[name]) { land(); return; }
+
+    if (S.filters.type === 'ship') {
+      S.filters.type = 'station';
+      setSeg('#filter-type', 'station');
+      localStorage.setItem(LS.filters, JSON.stringify(S.filters));
+    }
+
+    refreshFleet(true).then(land);
   }
 
   /* ================================ HISTORY ================================ */
@@ -3419,10 +4134,48 @@
       refreshFleet(true);
     });
 
-    bindSeg('#filter-owner', function (value) {
+    /* One owner filter behind both views, so a station opened from Industry is in the
+       fleet listing it lands on. */
+    var setOwner = function (value) {
       S.filters.owner = value;
+      setSeg('#filter-owner', value);
+      setSeg('#industry-owner', value);
       localStorage.setItem(LS.filters, JSON.stringify(S.filters));
       refreshFleet(true);
+      if (S.view === 'industry') { loadIndustry(true); }
+    };
+
+    bindSeg('#filter-owner', setOwner);
+    bindSeg('#industry-owner', setOwner);
+
+    $('#industry-refresh').addEventListener('click', function () { loadIndustry(true); });
+
+    $('#industry-rows').addEventListener('click', function (e) {
+      var row = e.target.closest('[data-sector]');
+      if (!row) { return; }
+      S.industry.sector = row.dataset.sector;
+      renderIndustry();
+    });
+
+    $('#industry-pane').addEventListener('click', function (e) {
+      var station = e.target.closest('[data-station]');
+      if (station) { e.preventDefault(); openStation(station.dataset.station); return; }
+
+      var sector = e.target.closest('[data-sector]');
+      if (sector) {
+        e.preventDefault();
+        S.industry.sector = sector.dataset.sector;
+        renderIndustry();
+      }
+    });
+
+    // The link from a station's own chain to the sector it sits in.
+    $('#sv-production').addEventListener('click', function (e) {
+      var link = e.target.closest('[data-sector]');
+      if (!link) { return; }
+      e.preventDefault();
+      S.industry.sector = link.dataset.sector;
+      showView('industry');
     });
 
     /* Typing is debounced before it reaches the sweep: the index is what costs a call
