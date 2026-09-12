@@ -11,10 +11,12 @@
  * NODE_PATH at that node_modules.
  *
  * What it pins is the part of the console that is decided rather than displayed: which
- * subtabs a craft is offered, and which end of the ship log the newest entry is at. Both
- * are one-line behaviours that no amount of reading the diff proves, and both are silent
- * when they break - a station simply offers a tab that answers 409, and a log quietly
- * reads oldest-first with the interesting row a thousand entries down.
+ * subtabs a craft is offered, which end of the ship log the newest entry is at, and that
+ * the marks the explanations moved behind still open. All three are one-line behaviours
+ * that no amount of reading the diff proves, and all three are silent when they break - a
+ * station simply offers a tab that answers 409, a log quietly reads oldest-first with the
+ * interesting row a thousand entries down, and a mark that no longer opens takes the
+ * explanation off the page rather than putting it behind a click.
  */
 
 'use strict';
@@ -271,6 +273,43 @@ const ready = window.document.readyState === 'loading'
 
     check(/newest/.test(said[0]), 'the newest entry is at the top');
     check(/oldest/.test(said[said.length - 1]), 'and the oldest at the bottom');
+
+    console.log('\nexplanations behind a mark');
+
+    tab('overview').click();
+    await settle(400);
+
+    const marks = $$('#sv-overview .explain, .subtabs ~ .subview .explain');
+    check(marks.length > 0, 'the overview carries at least one mark');
+
+    const popover = $('#popover');
+
+    marks[0].click();
+    check(!popover.classList.contains('hidden'), 'clicking one opens the popover');
+    check(popover.textContent.trim().length > 20, 'with the explanation in it');
+    check(marks[0].getAttribute('aria-expanded') === 'true', 'and the mark reads open');
+
+    marks[0].click();
+    check(popover.classList.contains('hidden'), 'clicking the same mark again closes it');
+
+    marks[0].click();
+    window.document.body.click();
+    check(popover.classList.contains('hidden'), 'and so does a click anywhere else');
+
+    /*
+     * A mark names a key in EXPLAIN, or carries its own text for the dynamic ones. A typo in
+     * a key is invisible on the page: info() happily emits it, and the popover opens on
+     * the key itself - a slug where a sentence should be. So open every mark currently
+     * rendered and insist none of them answers with its own key back.
+     */
+    const unresolved = $$('.explain').filter((mark) => {
+        mark.click();
+        return popover.textContent.trim() === mark.dataset.explain;
+    }).map((mark) => mark.dataset.explain);
+
+    check(unresolved.length === 0,
+          'every mark resolves to an explanation' + (unresolved.length
+              ? ' - ' + unresolved.join(', ') + ' did not' : ''));
 
     console.log('');
     if (failures === 0) {

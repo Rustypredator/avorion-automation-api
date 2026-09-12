@@ -377,3 +377,56 @@ td.fillcell .bar { margin: 0; }
 
 /* The window picker sits under the card heading rather than beside it. */
 #economy-window { margin-bottom: 8px; }
+
+/* ------------------------------- popovers -------------------------------- */
+
+/* Every explanation on this page hangs off one of these rather than sitting under the
+   thing it explains. The mark is the only thing the layout has to make room for. */
+.explain {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-mute);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: middle;
+  /* Most of these sit in a heading, which is uppercase and letter-spaced - both of which
+     would land inside the circle and push the glyph off its centre. */
+  text-transform: none;
+  letter-spacing: 0;
+  cursor: help;
+  flex: none;
+}
+.explain:hover:not(:disabled) { background: var(--bg-4); border-color: var(--accent-2); color: var(--accent); }
+.explain.on { background: var(--bg-4); border-color: var(--accent); color: var(--accent); }
+.explain.warn { border-color: #5c4c1e; color: var(--warn); }
+.explain.warn:hover:not(:disabled), .explain.warn.on { background: #262013; border-color: var(--warn); color: var(--warn); }
+
+/* Fixed, and parked on <body>, so no scrolling pane or card can clip it. Placed by
+   openPopover(); the rules here only say what it looks like. */
+#popover {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 80;
+  max-width: 320px;
+  padding: 9px 11px;
+  background: var(--bg-3);
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, .6);
+}
+#popover code { color: var(--text); background: var(--bg); padding: 0 3px; border-radius: 3px; }
+#popover b { color: var(--text); }
+#popover p { margin: 0 0 7px; }
+#popover p:last-child { margin-bottom: 0; }

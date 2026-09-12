@@ -242,6 +242,280 @@
     });
   }
 
+  /* ------------------------------- popovers -------------------------------
+   *
+   * The console explains a lot of itself - which figures are a lifetime total, why a log
+   * can be quiet without anything being wrong, what the mod refuses without a captain.
+   * None of that belongs on the page next to the number it qualifies, where it is read
+   * once and then crowds out the readings for good.
+   *
+   * So it lives here, keyed, and the page carries a mark. explain('key') emits the mark,
+   * EXPLAIN[key] is what it says. A key that is not in the table is taken as the text
+   * itself, which is how the dynamic ones (an error message from the API) get a popover
+   * without needing a name.
+   *
+   * One floating node does the showing, parked on <body> and position:fixed, so nothing
+   * a card or a scrolling pane does can clip it.
+   */
+
+  var EXPLAIN = {
+    'fleet-reads':
+      'Everything here reads the ship database, so it works while the sector is unloaded '
+      + 'and while you are logged out. Writes need the owning player in game.',
+
+    'no-captain':
+      'Missions and mine/salvage orders are refused without a captain.',
+
+    'owner-offline':
+      'Mission state lives in a script attached to the player, and those only run while '
+      + 'that player is in game. Log in to read it.',
+
+    'mission-usable':
+      'Every mission runs this check first.',
+
+    'area-fixed':
+      'This mission fixes its area: the game recentres it on the ship whatever is sent.',
+
+    'area-ship-inside':
+      'The ship must be inside this area.',
+
+    'mission-progress':
+      'Progress text is refreshed by the game once a minute.',
+
+    'mission-materials':
+      'All selected is the same as sending none, which is what the game\'s own UI '
+      + 'defaults to.',
+
+    'orders-background':
+      'A craft out on a captain mission has no order chain to talk to. Recall it first, '
+      + 'or orders answer <b>409 ship_in_background</b>.',
+
+    'order-chain':
+      'These are the same orders the galaxy map enqueues. The ship\'s sector has to be '
+      + 'loaded, and every order needs a captain &mdash; or you, in the ship\'s sector.',
+
+    'one-shot':
+      'Each of these is an engine wrapper that clears the chain, adds one order and runs '
+      + 'it, so it cannot be combined with anything. Mine and salvage need a captain.',
+
+    'log-not-recording':
+      'No player whose agent watches this craft is online. A quiet log means nobody was '
+      + 'watching, not that nothing happened.',
+
+    'log-empty':
+      'The mod keeps 200 events per ship in memory and loses them on restart; the bridge '
+      + 'keeps a copy on disk of everything this console has seen since it was deployed.',
+
+    'production-unsecured':
+      'The game has not written this station to the ship database yet, which it does when '
+      + 'it next saves or the sector unloads. Until then there is nothing to read '
+      + '&mdash; this is a station founded a few minutes ago, not an idle one.',
+
+    'no-books':
+      'This craft runs no merchant script. Defence platforms, and mines that were never '
+      + 'given a production line, read like this.',
+
+    'log-from-bridge':
+      'The bridge keeps its own log on disk, which outlives the mod\'s 200-event buffer '
+      + 'and a server restart.',
+
+    'books-lifetime':
+      'Totals since the station was founded &mdash; the only form the game keeps them '
+      + 'in. The window in <b>Over time</b> turns them into a rate.',
+
+    'books-loaded':
+      'The sector is loaded, so these figures can trail the station itself by up to one '
+      + 'server save. They come from the craft\'s database row, which the game rewrites '
+      + 'when it saves or unloads a sector.',
+
+    'books-unloaded':
+      'The sector is unloaded. These figures are exactly what the station held when it '
+      + 'went quiet, which is also all that has happened to it.',
+
+    'production-values':
+      'Values are the goods index\'s own prices, so the margin is what a cycle is worth '
+      + 'rather than what it will sell for &mdash; a sale is at the base price in '
+      + '<b>Goods</b>, and then supply and demand.',
+
+    'goods-stock':
+      'A sold good at full stock has nowhere to put the next cycle; a bought good at '
+      + 'zero is an ingredient the line is waiting on.',
+
+    'goods-flow':
+      '<p>A sold good at full stock has nowhere to put the next cycle; a bought good at '
+      + 'zero is an ingredient the line is waiting on.</p>'
+      + '<p>In and Out are units that appeared and left over the window &mdash; produced '
+      + 'or bought, and sold, consumed or shuttled away. The station\'s books keep one '
+      + 'money counter for the whole place, so which of those it was is not '
+      + 'recoverable.</p>',
+
+    'economy-no-history':
+      'It is the bridge rather than the mod that samples the books over time, so an '
+      + 'older deployment has no such route &mdash; run <code>docker compose up -d '
+      + '--build</code> on it, or set HISTORY_DB_HOST back if it was turned off '
+      + 'deliberately.',
+
+    'economy-no-samples':
+      'The bridge records the books when something asks for /stations, which the poller '
+      + 'service does on a timer &mdash; set POLL_KEYS in the stack\'s .env if it is not '
+      + 'running.',
+
+    'economy-observed':
+      'Rates are per <em>observed</em> hour. Nothing in the mod pushes, so a stretch with '
+      + 'no samples is a stretch when nobody was asking, and counting it as a quiet hour '
+      + 'would report a working station as idle.',
+
+    'history-no-history':
+      'The history is served by the bridge rather than the mod, so an older deployment '
+      + 'has no such route &mdash; run <code>docker compose up -d --build</code> on it, '
+      + 'or set HISTORY_DB_HOST back if it was turned off deliberately.',
+
+    'history-empty':
+      'The bridge builds the history out of the calls this console makes, so it fills in '
+      + 'while a tab is open on it.',
+
+    'history-observed':
+      'Only observed time is counted. The bridge records what it relays, so this is '
+      + 'continuous if the poller service is running and otherwise covers only the '
+      + 'moments something was calling the API &mdash; a quiet stretch can mean nobody '
+      + 'was looking rather than that nothing moved.',
+
+    'sector-predicted':
+      'From the galaxy seed. It cannot know what players built or destroyed, and a home '
+      + 'sector routinely predicts empty.',
+
+    'sector-known':
+      'You have seen this sector; prefer these numbers over the prediction.',
+
+    'config-clamped':
+      'Values outside the range are clamped by the game.',
+
+    'mission-preview':
+      'Preview is side-effect free and runs the same analysis, validation and prediction '
+      + 'a start runs &mdash; including the game\'s own calculatePrediction, the function '
+      + 'behind the order window\'s yield and risk figures. It takes a second or two.',
+
+    'orders-unconfirmed':
+      'Not proof of failure: a one-shot order that finishes instantly can land and clear '
+      + 'again inside the window. The event log below shows what actually happened.',
+
+    'travel':
+      'A Travel captain mission under a shorter name &mdash; the same analysis, '
+      + 'prediction and start path &mdash; so the answer carries a real route prediction '
+      + 'rather than an acknowledgement. Prefer it to orders for anything that is not '
+      + 'tactical: it loads no sectors and works wherever the ship is.',
+
+    'connect-network':
+      '<p>The browser reports no status for this, which means either the bridge is not '
+      + 'answering or it refused this page cross-origin; the browser\u2019s own console '
+      + 'says which.</p>'
+      + '<p>If it is CORS, the bridge only sends the headers a browser needs as of the '
+      + 'latest build, so run <code>docker compose up -d --build</code> on it. The surest '
+      + 'fix is to skip cross-origin entirely and open this console from the API '
+      + 'itself.</p>',
+
+    'material-belts':
+      'Distance from the core at which each material peaks.'
+  };
+
+  /* `key` is either a name in EXPLAIN or the text itself. `tone` is a .info modifier, for
+     an explanation of something the page is already flagging in amber. */
+  function explain(key, tone) {
+    return '<button type="button" class="explain' + (tone ? ' ' + tone : '')
+      + '" data-explain="' + esc(key) + '" aria-label="what is this"'
+      + ' aria-expanded="false">i</button>';
+  }
+
+  var popover = { node: null, trigger: null, timer: null };
+
+  function openPopover(trigger) {
+    var key = trigger.dataset.explain || '';
+    var node = popover.node;
+
+    closePopover();
+
+    node.innerHTML = Object.prototype.hasOwnProperty.call(EXPLAIN, key) ? EXPLAIN[key] : key;
+    node.classList.remove('hidden');
+
+    popover.trigger = trigger;
+    trigger.classList.add('on');
+    trigger.setAttribute('aria-expanded', 'true');
+
+    placePopover();
+
+    /* The views rewrite their own innerHTML on a poll, which takes the trigger with it
+       and would leave this hanging over whatever is now underneath. Cheaper to notice
+       than to teach every render to close it, and it keeps the placement honest while
+       a card above it grows. */
+    popover.timer = setInterval(function () {
+      if (!popover.trigger || !popover.trigger.isConnected) { closePopover(); return; }
+      placePopover();
+    }, 250);
+  }
+
+  function placePopover() {
+    var node = popover.node;
+    if (!popover.trigger || !popover.trigger.isConnected) { return; }
+
+    var at = popover.trigger.getBoundingClientRect();
+    var box = node.getBoundingClientRect();
+    var margin = 8;
+
+    var left = Math.min(at.left, window.innerWidth - box.width - margin);
+    var top = at.bottom + 6;
+
+    /* Below by preference, above when that would run off the bottom - and if neither
+       fits, below anyway, clamped, since the top of the box is the part worth reading. */
+    if (top + box.height > window.innerHeight - margin && at.top - box.height - 6 > margin) {
+      top = at.top - box.height - 6;
+    }
+
+    node.style.left = Math.max(margin, left) + 'px';
+    node.style.top = Math.max(margin, Math.min(top, window.innerHeight - box.height - margin)) + 'px';
+  }
+
+  function closePopover() {
+    if (popover.timer) { clearInterval(popover.timer); popover.timer = null; }
+    if (popover.trigger) {
+      popover.trigger.classList.remove('on');
+      popover.trigger.setAttribute('aria-expanded', 'false');
+      popover.trigger = null;
+    }
+    if (popover.node) { popover.node.classList.add('hidden'); }
+  }
+
+  function bindPopovers() {
+    popover.node = $('#popover');
+
+    document.addEventListener('click', function (e) {
+      var mark = e.target.closest ? e.target.closest('.explain') : null;
+
+      if (mark) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (popover.trigger === mark) { closePopover(); } else { openPopover(mark); }
+        return;
+      }
+
+      if (!e.target.closest || !e.target.closest('#popover')) { closePopover(); }
+    }, true);
+
+    /* Capturing, and it swallows the key: Esc also closes the log drawer, and with a
+       popover open it should shut that and nothing else. */
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape' || !popover.trigger) { return; }
+      e.stopPropagation();
+      closePopover();
+    }, true);
+
+    /* A pane scrolling under an open popover moves the mark out from under it. */
+    document.addEventListener('scroll', function () {
+      if (popover.trigger) { placePopover(); }
+    }, true);
+
+    window.addEventListener('resize', closePopover);
+  }
+
   /* ------------------------------ connection ------------------------------ */
 
   function defaultUrl() {
@@ -340,13 +614,9 @@
         // fetch cannot tell a cross-origin refusal from a dead host - both arrive as a
         // bare TypeError - so say what covers both rather than guessing at one.
         if (error.code === 'network') {
-          banner('bad', 'Could not reach <b>' + esc(url) + '</b>. The browser reports no '
-                 + 'status for this, which means either the bridge is not answering or it '
-                 + 'refused this page cross-origin; the browser\u2019s own console says '
-                 + 'which. If it is CORS: the bridge only sends the headers a browser '
-                 + 'needs as of the latest build, so run <code>docker compose up -d '
-                 + '--build</code> on it. The surest fix is to skip cross-origin entirely '
-                 + 'and open this console from the API itself, at <b>' + esc(url)
+          banner('bad', 'Could not reach <b>' + esc(url) + '</b> &mdash; not answering, '
+                 + 'or refusing this page cross-origin. ' + explain('connect-network')
+                 + ' Try opening this console from the API itself, at <b>' + esc(url)
                  + '/console/</b>.');
         } else {
           apiFailed(error, 'Could not connect');
@@ -888,8 +1158,7 @@
       ])));
     } else {
       cards.push(meterCard('Captain',
-        '<div class="note warn">No captain. Missions and mine/salvage orders are refused '
-        + 'without one.</div>'));
+        '<div class="note warn">No captain ' + explain('no-captain', 'warn') + '</div>'));
     }
 
     /* --- crew --------------------------------------------------------- */
@@ -1301,9 +1570,8 @@
       var e = m.error;
       if (e.code === 'owner_offline') {
         return '<div class="section"><h2>Current mission</h2>'
-          + '<div class="note warn">Mission state lives in a script attached to the '
-          + 'player, and those only run while that player is in game. Log in to read it.'
-          + '</div></div>';
+          + '<div class="note warn">Unreadable while the owner is offline '
+          + explain('owner-offline', 'warn') + '</div></div>';
       }
       return '<div class="section"><h2>Current mission</h2>' + errorBox('Status unavailable', e) + '</div>';
     }
@@ -1367,7 +1635,7 @@
       + 'finalisation. Use when a plain recall is refused.">Force recall</button>'
       + '<button class="primary" data-act="collect"' + (m.yields ? '' : ' disabled')
       + '>Collect ' + (m.yields ? num(m.yields) + ' yields' : 'yields') + '</button>'
-      + '<span class="mute2">progress text is refreshed by the game once a minute</span>'
+      + explain('mission-progress')
       + '</div>');
 
     return '<div class="section"><h2>Current mission</h2>' + rows.join('') + '</div>';
@@ -1393,7 +1661,7 @@
     if (catalog.usable && !catalog.usable.ok) {
       body += '<div class="note warn" style="margin-bottom:10px">'
         + '<b>' + esc(catalog.usable.code) + '</b> — ' + esc(catalog.usable.message || '')
-        + ' Every mission runs this check first.</div>';
+        + ' ' + explain('mission-usable', 'warn') + '</div>';
     }
 
     if (!S.missionForm) {
@@ -1407,11 +1675,12 @@
     var left = [];
 
     /* --- area --------------------------------------------------------- */
-    left.push('<div class="card"><h3>Area</h3>');
-    if (entry.areaFixed) {
-      left.push('<div class="note warn">This mission fixes its area: the game recentres '
-        + 'it on the ship whatever is sent.</div>');
-    }
+    var areaRules = [];
+    if (entry.areaFixed) { areaRules.push(EXPLAIN['area-fixed']); }
+    if (entry.shipRequiredInArea) { areaRules.push(EXPLAIN['area-ship-inside']); }
+
+    left.push('<div class="card"><h3>Area'
+      + (areaRules.length ? ' ' + explain(areaRules.join(' '), 'warn') : '') + '</h3>');
     left.push('<div class="row tight" style="margin:6px 0">'
       + '<span class="mute2">centre</span>'
       + '<input type="number" data-form="cx" value="' + form.center.x + '" style="width:88px">'
@@ -1435,9 +1704,6 @@
     left.push('<div class="mute2" data-area style="margin-top:6px">'
       + area.lower.x + ':' + area.lower.y + ' → ' + area.upper.x + ':' + area.upper.y
       + ' (inclusive)</div>');
-    if (entry.shipRequiredInArea) {
-      left.push('<div class="mute2">the ship must be inside this area</div>');
-    }
     left.push('</div>');
 
     /* --- configurable ------------------------------------------------- */
@@ -1469,7 +1735,7 @@
             ? '<input type="range" data-config-range="' + esc(field) + '" min="' + spec.from
               + '" max="' + spec.to + '" step="' + step + '" value="' + esc(value) + '">'
               + '<div class="mute2" style="font-size:11px">' + spec.from + ' – ' + spec.to
-              + ' · values outside the range are clamped by the game</div>'
+              + ' ' + explain('config-clamped') + '</div>'
             : '')
           + '</div>');
       });
@@ -1478,14 +1744,14 @@
 
     /* --- materials ---------------------------------------------------- */
     if (entry.materials) {
-      left.push('<div class="card"><h3>Materials</h3><div class="chips">'
+      left.push('<div class="card"><h3>Materials ' + explain('mission-materials')
+        + '</h3><div class="chips">'
         + entry.materials.map(function (name) {
             var on = !form.materials || form.materials.indexOf(name) !== -1;
             return '<button class="chip' + (on ? ' on' : ' off') + '" data-material="'
               + esc(name) + '">' + esc(name) + '</button>';
           }).join('')
-        + '</div><div class="mute2" style="margin-top:6px">all selected is the same as '
-        + 'sending none, which is what the game\'s own UI defaults to</div></div>');
+        + '</div></div>');
     }
 
     /* --- escorts ------------------------------------------------------ */
@@ -1513,11 +1779,8 @@
     if (preview) {
       right.push(renderPreview(preview));
     } else if (!form.previewError) {
-      right.push('<div class="card"><h3>Preview</h3><div class="mute2">'
-        + 'Preview is side-effect free and runs the same analysis, validation and '
-        + 'prediction a start runs — including the game\'s own calculatePrediction, the '
-        + 'function behind the order window\'s yield and risk figures. It takes a second '
-        + 'or two.</div></div>');
+      right.push('<div class="card"><h3>Preview ' + explain('mission-preview') + '</h3>'
+        + '<div class="mute2">Not run yet.</div></div>');
     }
 
     var canStart = preview && preview.canStart;
@@ -1712,14 +1975,12 @@
 
     if (ship.availability === 'InBackground') {
       out.push('<div class="note warn" style="margin-bottom:12px">'
-        + 'This craft is out on a captain mission and has no order chain to talk to. '
-        + 'Recall it first, or orders answer <b>409 ship_in_background</b>.</div>');
+        + 'Out on a captain mission &mdash; no order chain '
+        + explain('orders-background', 'warn') + '</div>');
     }
 
-    out.push('<div class="section"><h2>Order chain</h2>'
-      + '<div class="mute2" style="margin-bottom:9px">These are the same orders the '
-      + 'galaxy map enqueues. The ship\'s sector has to be loaded, and every order needs '
-      + 'a captain — or you, in the ship\'s sector.</div>');
+    out.push('<div class="section"><h2>Order chain ' + explain('order-chain')
+      + '</h2>');
 
     out.push('<div id="order-rows">' + S.orderRows.map(function (row, i) {
       return '<div class="order-row" data-row="' + i + '">'
@@ -1760,10 +2021,7 @@
 
     out.push('</div>');
 
-    out.push('<div class="section"><h2>One-shot orders</h2>'
-      + '<div class="mute2" style="margin-bottom:9px">Each of these is an engine wrapper '
-      + 'that clears the chain, adds one order and runs it, so it cannot be combined with '
-      + 'anything. Mine and salvage need a captain.</div>'
+    out.push('<div class="section"><h2>One-shot orders ' + explain('one-shot') + '</h2>'
       + '<div class="row">'
       + ONE_SHOT.map(function (t) {
           return '<button data-oneshot="' + t + '">' + t + '</button>';
@@ -1833,9 +2091,8 @@
       + '<div class="mute2">sent ' + esc((result.dispatched || []).join(', '))
       + (result.cleared ? ' · cleared the previous chain' : '')
       + (result.oneShot ? ' · one-shot' : '') + '</div>'
-      + (confirmed ? '' : '<div class="mute2">Not proof of failure: a one-shot order that '
-        + 'finishes instantly can land and clear again inside the window. The event log '
-        + 'below shows what actually happened.</div>')
+      + (confirmed ? '' : '<div class="mute2">unconfirmed '
+        + explain('orders-unconfirmed') + '</div>')
       + '</div>';
 
     // The chain moved, so the summary and the event feed are both stale.
@@ -1854,12 +2111,7 @@
 
     var out = [];
 
-    out.push('<div class="section"><h2>Travel</h2>'
-      + '<div class="mute2" style="margin-bottom:10px">A Travel captain mission under a '
-      + 'shorter name — the same analysis, prediction and start path — so the answer '
-      + 'carries a real route prediction rather than an acknowledgement. Prefer it to '
-      + 'orders for anything that is not tactical: it loads no sectors and works wherever '
-      + 'the ship is.</div>');
+    out.push('<div class="section"><h2>Travel ' + explain('travel') + '</h2>');
 
     out.push('<div class="row" style="margin-bottom:10px">'
       + '<span class="mute2">from</span><b>' + coords(position) + '</b>'
@@ -2175,23 +2427,22 @@
     var notes = [];
 
     if (S.recording[name] === false) {
-      notes.push('<div class="note warn" style="padding:9px">Nothing is being recorded '
-        + 'right now: no player whose agent watches this craft is online. A quiet log '
-        + 'means nobody was watching, not that nothing happened.</div>');
+      notes.push('<span class="note warn">not recording '
+        + explain('log-not-recording', 'warn') + '</span>');
     }
 
     var recorded = (S.shipHistory[name] || []).length;
     if (recorded) {
-      notes.push('<div class="note" style="padding:9px">' + recorded + ' of these came '
-        + 'from the bridge\'s own log on disk, which outlives the mod\'s 200-event '
-        + 'buffer and a server restart.</div>');
+      notes.push('<span class="note">' + recorded + ' from the bridge log '
+        + explain('log-from-bridge') + '</span>');
     }
 
-    $('#sv-log').innerHTML = notes.join('') + (rows.length
+    $('#sv-log').innerHTML = (notes.length
+      ? '<div class="row" style="padding:7px 9px">' + notes.join('') + '</div>'
+      : '')
+      + (rows.length
       ? rows.map(eventHtml).join('')
-      : '<div class="empty muted">No events. The mod keeps 200 per ship in memory and '
-        + 'loses them on restart; the bridge keeps a copy on disk of everything this '
-        + 'console has seen since it was deployed.</div>');
+      : '<div class="empty muted">No events. ' + explain('log-empty') + '</div>');
   }
 
   function renderRecordingNote() {
@@ -2317,9 +2568,7 @@
 
     if (station.error) {
       node.innerHTML = station.error.code === 'not_a_station'
-        ? '<div class="empty muted">This craft runs no merchant script, so it keeps no '
-          + 'books. Defence platforms and mines that were never given a production line '
-          + 'read like this.</div>'
+        ? '<div class="empty muted">No books. ' + explain('no-books') + '</div>'
         : errorBox('Could not read the station', station.error);
       return;
     }
@@ -2349,14 +2598,14 @@
     /* The one caveat worth putting on the page rather than only in the docs. These come
        from the craft's database row, which the game rewrites when it saves or unloads a
        sector - so an unloaded station is exact as of the moment it went quiet, and a
-       loaded one can be a save interval behind the entity flying around in it. */
+       loaded one can be a save interval behind the entity flying around in it. Which of
+       the two it is is the state; why it matters is behind the mark. */
     var freshness = station.sectorLoaded
-      ? '<div class="mute2">The sector is loaded, so these figures can trail the station '
-        + 'itself by up to one server save.</div>'
-      : '<div class="mute2">The sector is unloaded. These figures are exactly what the '
-        + 'station held when it went quiet, which is also all that has happened to it.</div>';
+      ? '<span class="badge warn">sector loaded</span> ' + explain('books-loaded', 'warn')
+      : '<span class="badge">sector unloaded</span> ' + explain('books-unloaded');
 
-    return '<div class="card"><h3>Books &mdash; ' + esc(economy.kind || 'station') + '</h3>'
+    return '<div class="card"><h3>Books &mdash; ' + esc(economy.kind || 'station') + ' '
+      + explain('books-lifetime') + '</h3>'
       + kv([
         ['earned', credits(earnings.fromGoods)],
         ['spent', credits(earnings.spentOnGoods)],
@@ -2367,10 +2616,8 @@
         ['sell factor', settings.sellPriceFactor != null
           ? num(settings.sellPriceFactor, 2) : '—']
       ])
-      + '<div class="mute2">Totals since the station was founded &mdash; the only form the '
-      + 'game keeps them in. The window below turns them into a rate.</div>'
       + (flags.length ? '<div class="mute2">' + esc(flags.join(' · ')) + '</div>' : '')
-      + freshness
+      + '<div class="row tight" style="margin-top:6px">' + freshness + '</div>'
       + '</div>';
   }
 
@@ -2378,10 +2625,7 @@
     if (!production) {
       return '<div class="card"><h3>Production</h3><div class="mute2">'
         + (secured === false
-            ? 'The game has not written this station to the ship database yet, which it '
-              + 'does when it next saves or the sector unloads. Until then there is '
-              + 'nothing to read &mdash; this is a station founded a few minutes ago, not '
-              + 'an idle one.'
+            ? 'Not written to the ship database yet ' + explain('production-unsecured')
             : 'No production line. This station trades rather than makes.')
         + '</div></div>';
     }
@@ -2408,7 +2652,7 @@
     }).join('');
 
     return '<div class="card"><h3>Production &mdash; ' + esc(production.style || 'line')
-      + '</h3>'
+      + ' ' + explain('production-values') + '</h3>'
       + side('in', production.ingredients, '')
       + side('out', production.results, 'good')
       + (production.garbage && production.garbage.length
@@ -2420,9 +2664,6 @@
         ['margin a cycle', '<b>' + signedCredits(production.margin) + '</b>']
       ])
       + cycles
-      + '<div class="mute2">Values are the goods index\'s own prices, so the margin is '
-      + 'what a cycle is worth rather than what it will sell for &mdash; a sale is at the '
-      + 'base price below, and then supply and demand.</div>'
       + '</div>';
   }
 
@@ -2448,7 +2689,10 @@
 
     var moved = recorded ? '<th class="num">In</th><th class="num">Out</th>' : '';
 
-    return '<div class="card wide"><h3>Goods</h3>'
+    /* A sold good pinned full and a bought good sitting empty are the two states that
+       stop a line, and neither shows up in the earnings until it already has. */
+    return '<div class="card wide"><h3>Goods '
+      + explain(recorded ? 'goods-flow' : 'goods-stock') + '</h3>'
       + '<div class="scroll-x"><table>'
       + '<thead><tr><th>Good</th><th></th><th class="num">Stock</th><th>Fill</th>'
       + '<th class="num">Base price</th>' + moved + '</tr></thead><tbody>'
@@ -2472,18 +2716,7 @@
                 : '')
             + '</tr>';
         }).join('')
-      + '</tbody></table></div>'
-      /* A sold good pinned full and a bought good sitting empty are the two states that
-         stop a line, and neither shows up in the earnings until it already has. */
-      + '<div class="mute2">A sold good at full stock has nowhere to put the next cycle; '
-      + 'a bought good at zero is an ingredient the line is waiting on.'
-      + (recorded
-          ? ' In and Out are units that appeared and left over the window &mdash; produced '
-            + 'or bought, and sold, consumed or shuttled away. The station\'s books keep '
-            + 'one money counter for the whole place, so which of those it was is not '
-            + 'recoverable.'
-          : '')
-      + '</div></div>';
+      + '</tbody></table></div></div>';
   }
 
   function economyHistory(name) {
@@ -2504,23 +2737,20 @@
 
     if (recorded.unavailable) {
       return '<div class="card wide"><h3>Over time</h3>' + picker
-        + '<div class="note warn">This bridge keeps no economy history. It is the bridge '
-        + 'rather than the mod that samples the books over time, so an older deployment '
-        + 'has no such route &mdash; run <code>docker compose up -d --build</code> on it, '
-        + 'or set HISTORY_DB_HOST back if it was turned off deliberately.</div></div>';
+        + '<div class="note warn">This bridge keeps no economy history '
+        + explain('economy-no-history', 'warn') + '</div></div>';
     }
 
     var station = ((recorded.summary || {}).stations || [])[0];
 
     if (!station || !station.samples) {
       return '<div class="card wide"><h3>Over time</h3>' + picker
-        + '<div class="mute2">Nothing sampled in this window yet. The bridge records the '
-        + 'books when something asks for /stations, which the poller service does on a '
-        + 'timer &mdash; set POLL_KEYS in the stack\'s .env if it is not running.</div>'
-        + '</div>';
+        + '<div class="mute2">Nothing sampled in this window yet '
+        + explain('economy-no-samples') + '</div></div>';
     }
 
-    return '<div class="card wide"><h3>Over time</h3>' + picker
+    return '<div class="card wide"><h3>Over time ' + explain('economy-observed')
+      + '</h3>' + picker
       + kv([
         ['earned', credits(station.earned)],
         ['spent', credits(station.spent)],
@@ -2530,9 +2760,6 @@
         ['observed', duration(station.observed)]
       ])
       + seriesChart((recorded.series || {}).points || [], (recorded.series || {}).bucket)
-      + '<div class="mute2">Rates are per <em>observed</em> hour. Nothing in the mod '
-      + 'pushes, so a stretch with no samples is a stretch when nobody was asking, and '
-      + 'counting it as a quiet hour would report a working station as idle.</div>'
       + '</div>';
   }
 
@@ -2638,11 +2865,7 @@
 
       if (error.code === 'history_disabled' || error.status === 404) {
         $('#history-legend').innerHTML = '<div class="note warn">This bridge keeps no '
-          + 'history. It is served by the bridge rather than the mod, so an older '
-          + 'deployment has no such route &mdash; run <code>docker compose up -d '
-          + '--build</code> on it, or set HISTORY_DB_HOST back if it was turned off '
-          + 'deliberately.'
-          + '</div>';
+          + 'history ' + explain('history-no-history', 'warn') + '</div>';
         return;
       }
 
@@ -2666,8 +2889,7 @@
     if (!cells.length) {
       $('#history-status').textContent = 'empty';
       $('#history-legend').innerHTML = '<div class="mute2">Nothing recorded in this '
-        + 'window yet. The bridge builds the history out of the calls this console '
-        + 'makes, so it fills in while a tab is open on it.</div>';
+        + 'window yet ' + explain('history-empty') + '</div>';
       return;
     }
 
@@ -2684,11 +2906,7 @@
           : 'number of visits, up to ' + num(heat.maxVisits))
         + '.</div>'
       + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
-        + span + ' of recorded travel</div>'
-      + '<div class="mute2">Only observed time is counted. The bridge records what it '
-        + 'relays, so this is continuous if the poller service is running and otherwise '
-        + 'covers only the moments something was calling the API &mdash; a quiet stretch '
-        + 'can mean nobody was looking rather than that nothing moved.</div>';
+        + span + ' of recorded travel ' + explain('history-observed') + '</div>';
   }
 
   function setHistoryWindow(seconds) {
@@ -2797,14 +3015,10 @@
     out.push('<div class="row" style="justify-content:space-between;margin-bottom:8px">'
       + '<h2 style="font-size:15px">' + esc(s.name || (c.x + ':' + c.y)) + '</h2>'
       + '<span class="badge ' + (source === 'predicted' ? 'warn' : 'info') + '">'
-      + source + '</span></div>');
+      + source + '</span>'
+      + (source === 'predicted' ? ' ' + explain('sector-predicted', 'warn') : '')
+      + '</div>');
     out.push('<div class="mute2" style="margin-bottom:9px">' + c.x + ':' + c.y + '</div>');
-
-    if (source === 'predicted') {
-      out.push('<div class="note warn" style="margin-bottom:9px">From the galaxy seed. It '
-        + 'cannot know what players built or destroyed, and a home sector routinely '
-        + 'predicts empty.</div>');
-    }
 
     out.push(kv([
       ['visited', s.visited ? 'yes' : 'no'],
@@ -2853,9 +3067,8 @@
     if (s.note) { out.push('<div class="note" style="margin-top:9px">' + esc(s.note) + '</div>'); }
 
     if (s.known) {
-      out.push('<div class="card" style="margin-top:10px"><h3>Also observed</h3>'
-        + '<div class="mute2">You have seen this sector; prefer these numbers over the '
-        + 'prediction.</div>' + kv([
+      out.push('<div class="card" style="margin-top:10px"><h3>Also observed '
+        + explain('sector-known') + '</h3>' + kv([
           ['stations', num(s.known.numStations)],
           ['ships', num(s.known.numShips)],
           ['visited', s.known.visited ? 'yes' : 'no']
@@ -2947,9 +3160,8 @@
       var belts = Object.keys(g.materialBelts).sort(function (a, b) {
         return g.materialBelts[b] - g.materialBelts[a];
       });
-      cards.push('<div class="card"><h3>Material belts</h3>'
-        + '<div class="mute2" style="margin-bottom:6px">distance from the core at which '
-        + 'each material peaks</div>'
+      cards.push('<div class="card"><h3>Material belts ' + explain('material-belts')
+        + '</h3>'
         + '<table><tbody>' + belts.map(function (name) {
             return '<tr><td>' + esc(name) + '</td><td class="num">'
               + num(g.materialBelts[name], 1) + '</td></tr>';
@@ -3312,6 +3524,7 @@
   function boot() {
     loadSaved();
     bind();
+    bindPopovers();
 
     GalaxyMap.init($('#map-canvas'), $('#map-tip'));
 

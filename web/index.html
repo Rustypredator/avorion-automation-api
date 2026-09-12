@@ -73,8 +73,7 @@
 
     <section id="ship-pane">
       <div id="ship-empty" class="empty">
-        <p>Select a craft.</p>
-        <p class="muted">Everything here reads the ship database, so it works while the sector is unloaded and while you are logged out. Writes need the owning player in game.</p>
+        <p>Select a craft. <button type="button" class="explain" data-explain="fleet-reads">i</button></p>
       </div>
 
       <div id="ship-detail" class="hidden">
@@ -185,6 +184,7 @@
   <div id="log-rows" class="log-rows"></div>
 </section>
 
+<div id="popover" class="hidden" role="tooltip"></div>
 <div id="toasts"></div>
 
 <script src="api.js"></script>
