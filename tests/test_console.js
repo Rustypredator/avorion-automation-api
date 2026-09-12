@@ -94,25 +94,42 @@ function listed(name, x, y, production) {
     };
 }
 
-function line(title, ingredients, results) {
+/* A line the way the mod rates it: `cycles` an hour across every slot, and each good's
+   perHour its amount times that. */
+function line(title, cycles, ingredients, results, garbage) {
+    const rate = (list) => list.map((item) => Object.assign({ perHour: item.amount * cycles }, item));
+    const worth = (list) => list.reduce((sum, item) => sum + item.amount * item.price * cycles, 0);
+    const ins = rate(ingredients), outs = rate(results), waste = rate(garbage || []);
+
     return {
-        title: title, style: 'Factory', mine: false, ingredients: ingredients, results: results,
-        garbage: [], slots: 1, running: [], active: 0, inputValue: 0, outputValue: 0, margin: 0
+        title: title, style: 'Factory', mine: false, ingredients: ins, results: outs,
+        garbage: waste, slots: 2, running: [], active: 0, inputValue: 0, outputValue: 0, margin: 0,
+        rate: { cycleSeconds: 7200 / cycles, cyclesPerHour: cycles, capacityKnown: true },
+        inputValuePerHour: worth(ins), outputValuePerHour: worth(outs) + worth(waste),
+        marginPerHour: worth(outs) + worth(waste) - worth(ins)
     };
 }
 
+/*
+ * Two stations share 12:-4 and one feeds the other, but not enough: the refinery uses 500
+ * Energy Cells an hour and the plant next door makes 400. Raw Oil is made nowhere in the
+ * sector, and a well elsewhere makes it.
+ *
+ *   sold   Oil 500 * 320 + Scrap Metal 100 * 8        = 160,800
+ *   bought Energy Cell 100 * 61 + Raw Oil 1,000 * 66  =  72,100
+ *   net                                                =  88,700 an hour
+ */
 const stationListing = {
     stations: [
-        listed('Rusty Refinery', 12, -4, Object.assign({}, refinery.economy.production, {
+        listed('Rusty Refinery', 12, -4, line('Oil Refinery', 100,
             // Out of Energy Cells, so the wire from the plant next door reads as starved.
-            ingredients: [
-                { name: 'Energy Cell', amount: 5, price: 61, stock: 0 },
-                { name: 'Raw Oil', amount: 10, price: 66, stock: 40 }
-            ]
-        })),
-        listed('Sun Farm', 12, -4, line('Solar Power Plant', [],
+            [{ name: 'Energy Cell', amount: 5, price: 61, stock: 0 },
+             { name: 'Raw Oil', amount: 10, price: 66, stock: 40 }],
+            [{ name: 'Oil', amount: 5, price: 320, stock: 900 }],
+            [{ name: 'Scrap Metal', amount: 1, price: 8, stock: 0 }])),
+        listed('Sun Farm', 12, -4, line('Solar Power Plant', 20, [],
             [{ name: 'Energy Cell', amount: 20, price: 61, stock: 3000 }])),
-        listed('Oil Well', 15, -2, line('Raw Oil Mine', [],
+        listed('Oil Well', 15, -2, line('Raw Oil Mine', 100, [],
             [{ name: 'Raw Oil', amount: 10, price: 66, stock: 800 }]))
     ],
     count: 3
@@ -177,9 +194,13 @@ const routes = {
     '/history/economy/series': {
         bucket: 'hour',
         points: [
-            { at: now - 10800, earned: 2000, spent: 500, tax: 10, net: 1510 },
-            { at: now - 7200, earned: 3000, spent: 400, tax: 10, net: 2610 },
-            { at: now - 3600, earned: 0, spent: 900, tax: 0, net: -900 }
+            // `ships` is what ?by=ship adds; the station's own chart ignores it.
+            { at: now - 10800, earned: 2000, spent: 500, tax: 10, net: 1510,
+              ships: [{ ship: 'Rusty Refinery', net: 1010 }, { ship: 'Sun Farm', net: 500 }] },
+            { at: now - 7200, earned: 3000, spent: 400, tax: 10, net: 2610,
+              ships: [{ ship: 'Rusty Refinery', net: 2110 }, { ship: 'Sun Farm', net: 500 }] },
+            { at: now - 3600, earned: 0, spent: 900, tax: 0, net: -900,
+              ships: [{ ship: 'Rusty Refinery', net: -1200 }, { ship: 'Sun Farm', net: 300 }] }
         ]
     },
     '/history/economy/goods': {
@@ -299,8 +320,11 @@ const ready = window.document.readyState === 'loading'
     check(economy.querySelectorAll('table tbody tr').length === 3,
           'the goods table has a row per traded good');
     check(/Over time/.test(text), 'the history card renders');
-    check(economy.querySelectorAll('svg.spark rect').length === 3,
-          'with a bar per bucket in the chart');
+    // One station over time is a trend, so it is lines; bars are for adding parts up.
+    check(economy.querySelectorAll('svg.lines path.series').length === 3,
+          'with earned, spent and net drawn as lines');
+    check(economy.querySelectorAll('svg.lines .hit').length === 3,
+          'and a hover column per bucket');
     // num() abbreviates anything over a thousand and keeps the exact figure in a title.
     check(/\+16\.2K ¢/.test(text), 'and the per-hour rate the bridge worked out');
     check(/title="16,200"/.test(economy.innerHTML), 'exact in its tooltip');
@@ -364,32 +388,48 @@ const ready = window.document.readyState === 'loading'
     const sectorRows = $$('#industry-rows [data-sector]');
     check(sectorRows.length === 2, 'the stations are grouped into one row per sector');
     check(sectorRows[0].dataset.sector === '12:-4', 'the sector with the most lines comes first');
-    check(/1 input missing/.test(sectorRows[0].textContent), 'and says what it is short of');
+    check(/2 inputs short/.test(sectorRows[0].textContent), 'and says what it is short of');
 
     const pane = $('#industry-pane');
     check(/Sector 12:-4/.test(pane.textContent), 'that sector is drawn by default');
     check(pane.querySelectorAll('.inode').length === 2, 'a node per producing station in it');
+
     const rusty = pane.querySelector('.inode[data-station="Rusty Refinery"]');
-    check(/Energy Cell/.test(rusty.textContent) && /Oil/.test(rusty.textContent),
-          'each station lists the goods it takes in and puts out');
-    check(pane.querySelectorAll('.pwire').length === 4,
-          'a wire per good passed between them, brought in or sent out');
-    check(pane.querySelectorAll('.pwire.bad').length === 2,
-          'red where the taker holds none of it or nothing here makes it');
-    check(pane.querySelectorAll('.pnode.bad').length === 1,
-          'an ingredient nothing here makes is drawn coming in');
-    check(pane.querySelectorAll('.pnode.good').length === 1
-          && pane.querySelectorAll('.pnode').length === 3,
-          'and what nothing here takes in going out');
-    check(/Brought in[\s\S]*Raw Oil[\s\S]*Oil Well[\s\S]*15:-2/.test(pane.textContent),
-          'the missing input names the station elsewhere that makes it');
+    check(/500\/h Energy Cell/.test(rusty.textContent) && /Oil 500\/h/.test(rusty.textContent),
+          'each station lists what it takes in and puts out an hour');
+
+    /* Energy Cell is made here, but 100 an hour fewer than the refinery uses - so it is
+       bought in for the difference as well as wired from the plant next door. */
+    check(pane.querySelectorAll('.pnode.bad').length === 2,
+          'a good made here too slowly is bought in like one made nowhere');
+    check(/Energy Cell-100\/h/.test(pane.querySelector('.pnode.bad').textContent)
+          || /Energy Cell-100\/h/.test(pane.querySelectorAll('.pnode.bad')[1].textContent),
+          'for the shortfall, not the whole demand');
+    check(pane.querySelectorAll('.pwire').length === 5,
+          'a wire per good passed between stations, brought in or sent out');
+    check(pane.querySelectorAll('.pwire.bad').length === 3,
+          'red where the taker holds none of it or it has to be bought in');
+
+    const balance = pane.textContent;
+    check(/Goods balance[\s\S]*Raw Oil[\s\S]*Oil Well[\s\S]*15:-2/.test(balance),
+          'the balance names the station elsewhere that makes a missing input');
+    check(/Projected revenue[\s\S]*net an hour\+88\.7K ¢/.test(balance),
+          'the sector is projected from its surpluses less its shortfalls');
+    check(/title="88,700"/.test(pane.innerHTML), 'exact in its tooltip');
+
+    check(pane.querySelectorAll('svg.stack .bucket').length === 3,
+          'what the sector earned is a bar per bucket');
+    check(pane.querySelectorAll('svg.stack .bucket rect:not(.hit)').length === 6,
+          'stacked out of a segment per station');
+    check(/Rusty Refinery[\s\S]*Sun Farm/.test(pane.querySelector('.chart-legend').textContent),
+          'with every station in the legend');
 
     click($('#industry-rows [data-sector="15:-2"]'));
     await settle(100);
 
     check(/Sector 15:-2/.test(pane.textContent), 'picking another sector draws that one');
     check(/self-supplied/.test(pane.textContent), 'a mine needs nothing brought in');
-    check(/Left over[\s\S]*Raw Oil[\s\S]*Rusty Refinery/.test(pane.textContent),
+    check(/Goods balance[\s\S]*Raw Oil[\s\S]*left over[\s\S]*Rusty Refinery/.test(pane.textContent),
           'and its output names the station elsewhere that takes it');
 
     click(pane.querySelector('[data-sector="12:-4"]'));

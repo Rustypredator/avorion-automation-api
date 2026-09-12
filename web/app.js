@@ -76,7 +76,7 @@
     /* Every station at once, off /stations, for the Industry view. `sector` is the
        "x:y" key of the sector being drawn. */
     view: 'fleet',
-    industry: { stations: null, error: null, sector: null },
+    industry: { stations: null, error: null, sector: null, history: {} },
 
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
     busy: {}
@@ -342,6 +342,17 @@
       + 'rather than what it will sell for &mdash; a sale is at the base price in '
       + '<b>Goods</b>, and then supply and demand.',
 
+    'production-rate':
+      '<p>Every slot running for an hour. A cycle lasts as long as the game makes it: the '
+      + 'base value of what it produces over the station\'s production capacity, faster for '
+      + 'higher-level goods, and never under 15 seconds.</p>'
+      + '<p>A ceiling rather than what the station is doing: a line out of an ingredient or '
+      + 'with a full bay runs no cycles at all.</p>',
+
+    'production-rate-unknown':
+      'The station\'s block plan could not be read, so the game\'s minimum production '
+      + 'capacity stands in for it. The real station is at least this fast.',
+
     'goods-stock':
       'A sold good at full stock has nowhere to put the next cycle; a bought good at '
       + 'zero is an ingredient the line is waiting on.',
@@ -431,13 +442,40 @@
       + 'goods actually move is up to the stations\' own trading settings &mdash; this is '
       + 'what could feed what, not a record of deliveries.</p>',
 
-    'industry-missing':
-      'Ingredients no station in this sector makes, with the nearest stations of yours '
-      + 'elsewhere that do. Distance is straight-line, in sectors.',
+    'industry-balance':
+      '<p>What the sector makes and uses of each good in an hour, with every production '
+      + 'slot running. A good used faster than it is made is <b>bought in</b> for the '
+      + 'difference, even when a station here makes some of it; one made faster than it is '
+      + 'used is <b>left over</b>.</p>'
+      + '<p>Rates come from the game\'s own cycle time for each line, which depends on the '
+      + 'value of what it makes and on the station\'s production capacity. Optional '
+      + 'ingredients are not counted as demand, since a line runs without them; supplied, '
+      + 'they make its cycles twice as fast. Worth is at the goods index\'s base price.</p>',
 
-    'industry-leaves':
-      'Results no station in this sector takes in, with the nearest stations of yours '
-      + 'elsewhere that would.'
+    'industry-no-rates':
+      'The mod on the server predates production rates. Update it, and the balance, the '
+      + 'amounts on the graph and the projected revenue appear.',
+
+    'industry-projection':
+      '<p>The sector at full throughput for an hour: every surplus sold and every shortfall '
+      + 'bought, at base prices. Goods passed between two stations here cancel out, so this '
+      + 'is also the sum of the stations\' own margins an hour &mdash; less what they spend '
+      + 'on optional ingredients, which a station\'s margin counts and the balance does '
+      + 'not.</p>'
+      + '<p>It is a ceiling, not a forecast. A shortfall nobody delivers stops the lines '
+      + 'waiting on it, a full bay stops a line producing, and a sale is at the base price '
+      + 'only before supply, demand and relations move it. <b>Earned over time</b> below '
+      + 'is what actually happened.</p>',
+
+    'industry-history':
+      'Net earnings per bucket out of the bridge\'s own samples, one colour per station: '
+      + 'what each earned stacks above the line and what each lost below it. Hover a bar '
+      + 'for the split.',
+
+    'industry-no-history':
+      'A sector\'s chart needs a bridge that can filter its samples by sector and split '
+      + 'them by station &mdash; run <code>docker compose up -d --build</code> on it. If the '
+      + 'history is turned off altogether, set HISTORY_DB_HOST back.'
   };
 
   /* `key` is either a name in EXPLAIN or the text itself. `tone` is a .info modifier, for
@@ -2774,43 +2812,81 @@
       + '</div>';
   }
 
-  /* A bar per bucket, drawn as inline SVG rather than a canvas: it has to survive an
-     innerHTML rewrite on every poll, and there are a few dozen bars at most. */
+  /* Earned, spent and net per bucket as three lines. One station's figures over time are
+     a trend to follow rather than parts to add up, which is what bars are for - the
+     Industry view stacks bars because there the parts are stations.
+
+     Stretched to the card through a viewBox with preserveAspectRatio="none", with the
+     strokes marked non-scaling so they stay 2px whatever the card's width. It has to
+     survive an innerHTML rewrite on every poll, which rules out a canvas. The hover layer
+     is a column per bucket carrying its own tooltip. */
+  var LINE_SERIES = [
+    { key: 'net', label: 'net', colour: '#3987e5' },
+    { key: 'earned', label: 'earned', colour: '#199e70' },
+    { key: 'spent', label: 'spent', colour: '#d95926' }
+  ];
+
   function seriesChart(points, bucket) {
     if (!points.length) { return ''; }
 
-    var width = 100, height = 34, gap = 0.6;
-    var peak = points.reduce(function (max, p) {
-      return Math.max(max, Math.abs(p.net), p.earned);
-    }, 0);
+    var high = 0, low = 0;
+    points.forEach(function (p) {
+      LINE_SERIES.forEach(function (series) {
+        high = Math.max(high, p[series.key] || 0);
+        low = Math.min(low, p[series.key] || 0);
+      });
+    });
 
-    if (!peak) {
+    if (!high && !low) {
       return '<div class="mute2">No movement in any bucket in this window.</div>';
     }
 
-    var step = width / points.length;
+    var W = 1000, H = 160, span = high - low;
+    var y = function (value) { return H - (value - low) / span * H; };
+    var x = function (index) {
+      return points.length === 1 ? W / 2 : index * W / (points.length - 1);
+    };
 
-    var bars = points.map(function (point, index) {
-      var value = Math.max(0, Math.min(1, Math.abs(point.net) / peak));
-      var h = Math.max(value * height, point.net ? 0.6 : 0);
-      var when = new Date(point.at * 1000);
+    var lines = LINE_SERIES.map(function (series) {
+      var d = points.map(function (p, index) {
+        return (index ? 'L' : 'M') + x(index).toFixed(1) + ' ' + y(p[series.key] || 0).toFixed(2);
+      }).join(' ');
+      return '<path class="series" stroke="' + series.colour + '" d="' + d + '"'
+        + ' vector-effect="non-scaling-stroke"/>';
+    }).join('');
 
-      return '<rect x="' + (index * step).toFixed(2) + '" y="' + (height - h).toFixed(2)
-        + '" width="' + Math.max(step - gap, 0.4).toFixed(2) + '" height="' + h.toFixed(2)
-        + '" class="' + (point.net < 0 ? 'bad' : 'good') + '">'
-        + '<title>' + esc(when.toLocaleString() + ' — '
-            + numText(point.net) + ' ¢ net, ' + numText(point.earned) + ' ¢ earned')
-        + '</title></rect>';
+    var step = W / points.length;
+    var hits = points.map(function (p, index) {
+      var when = new Date(p.at * 1000).toLocaleString();
+      var left = points.length === 1 ? 0 : x(index) - step / 2;
+      return '<rect class="hit" x="' + left.toFixed(1) + '" y="0" width="' + step.toFixed(1)
+        + '" height="' + H + '"><title>' + esc(when + '\n'
+          + LINE_SERIES.map(function (series) {
+              return series.label + ': ' + numText(p[series.key]) + ' ¢';
+            }).join('\n')) + '</title></rect>';
     }).join('');
 
     var first = new Date(points[0].at * 1000);
     var last = new Date(points[points.length - 1].at * 1000);
+    var latest = points[points.length - 1];
 
-    return '<svg class="spark" viewBox="0 0 ' + width + ' ' + height
-      + '" preserveAspectRatio="none" role="img">' + bars + '</svg>'
+    return '<div class="stack-chart">'
+      + '<div class="axis-y mute2"><span style="top:0">' + esc(numText(high)) + ' ¢</span>'
+        + (low < 0 && high > 0 ? '<span style="top:' + (100 * y(0) / H).toFixed(1) + '%">0</span>' : '')
+        + '<span style="top:100%">' + esc(numText(low)) + ' ¢</span></div>'
+      + '<svg class="stack lines" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none"'
+        + ' role="img" aria-label="earned, spent and net per ' + esc(bucket || 'hour') + '">'
+        + (low < 0 ? '<line class="zero" x1="0" x2="' + W + '" y1="' + y(0).toFixed(2)
+          + '" y2="' + y(0).toFixed(2) + '" vector-effect="non-scaling-stroke"/>' : '')
+        + lines + hits + '</svg></div>'
       + '<div class="mute2 spark-axis"><span>' + esc(first.toLocaleString()) + '</span>'
-      + '<span>per ' + esc(bucket || 'hour') + ', peak ' + numText(peak) + ' ¢</span>'
-      + '<span>' + esc(last.toLocaleString()) + '</span></div>';
+      + '<span>per ' + esc(bucket || 'hour') + '</span>'
+      + '<span>' + esc(last.toLocaleString()) + '</span></div>'
+      + '<div class="chart-legend">' + LINE_SERIES.map(function (series) {
+          return '<span><i class="line" style="background:' + series.colour + '"></i>'
+            + series.label + ' <span class="mute2">last ' + esc(numText(latest[series.key]))
+            + ' ¢</span></span>';
+        }).join('') + '</div>';
   }
 
   /* ============================== PRODUCTION ============================== */
@@ -2936,7 +3012,8 @@
     var node = function (x, entry) {
       var item = entry.item;
       var head = numText(item.amount) + '× ' + (item.name || '?');
-      var foot = numText(item.price) + ' ¢ · ' + numText(item.stock) + ' in bay';
+      var foot = (item.perHour != null ? rateText(item.perHour) : numText(item.price) + ' ¢')
+        + ' · ' + numText(item.stock) + ' in bay';
 
       return '<g class="pnode ' + entry.tone + '" transform="translate(' + x.toFixed(1)
         + ' ' + entry.y.toFixed(1) + ')">'
@@ -2973,8 +3050,10 @@
       + '<text class="pn-sub" x="10" y="38">' + esc(numText(production.active) + ' of '
         + numText(production.slots) + ' cycles running') + '</text>'
       + '<text class="pn-sub" x="10" y="54">'
-        + esc((production.margin > 0 ? '+' : '') + numText(production.margin)
-              + ' ¢ a cycle') + '</text>'
+        + esc(production.marginPerHour != null
+              ? (production.marginPerHour > 0 ? '+' : '') + numText(production.marginPerHour) + ' ¢ an hour'
+              : (production.margin > 0 ? '+' : '') + numText(production.margin) + ' ¢ a cycle')
+        + '</text>'
       + '</g>';
 
     return '<svg class="chain-graph" width="' + width + '" height="' + height.toFixed(0)
@@ -3008,7 +3087,9 @@
       return bar(cycle.progress, 'info');
     }).join('');
 
-    return '<div class="card"><h3>Per cycle '
+    var rate = production.rate;
+
+    var perCycle = '<div class="card"><h3>Per cycle '
       + explain('production-values') + '</h3>'
       + kv([
         ['cycles', num(production.active) + ' of ' + num(production.slots) + ' slots'],
@@ -3020,19 +3101,45 @@
       ])
       + cycles
       + '</div>';
+
+    if (!rate) { return perCycle; }
+
+    /* The same line at full throughput. A cycle's length is the game's own formula, which
+       is why this is the card to compare two stations by and the one above is not. */
+    return perCycle + '<div class="card"><h3>Per hour '
+      + explain(rate.capacityKnown === false ? 'production-rate-unknown' : 'production-rate',
+                rate.capacityKnown === false ? 'warn' : '') + '</h3>'
+      + kv([
+        ['one cycle', num(rate.cycleSeconds, 1) + ' s'],
+        ['cycles an hour', num(rate.cyclesPerHour, 1)],
+        ['production capacity', rate.productionCapacity != null
+          ? num(rate.productionCapacity) : '—'],
+        ['input value', credits(Math.round(production.inputValuePerHour))],
+        ['output value', credits(Math.round(production.outputValuePerHour))],
+        ['margin an hour', '<b>' + signedCredits(Math.round(production.marginPerHour)) + '</b>']
+      ])
+      + (rate.boost ? '<div class="mute2">twice that with its optional ingredients in stock</div>' : '')
+      + '</div>';
   }
 
   /* ================================ INDUSTRY =============================== */
   /*
    * The Production tab draws one station's line. This draws a sector's worth of them wired
-   * together: which station's results are another's ingredients, and what the sector as a
-   * whole still has to bring in or has left over.
+   * together: which station's results are another's ingredients, how much of each good the
+   * sector makes and uses in an hour, and what that leaves it buying in and selling on.
    *
-   * All of it comes out of one /stations call - the listing carries every station's
-   * production line and position - so nothing here costs a call per station. What it
-   * cannot say is whether the goods actually move: that is each station's trading settings
-   * and the game's own traders, and neither is part of a production line.
+   * The rates are the mod's: it reproduces the game's own cycle time for every line (see
+   * rateOf() in economy.lua), which is what makes two stations' amounts comparable at all -
+   * a cycle's length differs from one line to the next. They are every slot running,
+   * which is a station's ceiling rather than what it happens to be doing.
+   *
+   * All of it comes out of one /stations call. What it cannot say is whether the goods
+   * actually move: that is each station's trading settings and the game's own traders.
    */
+
+  // Under this many units an hour a good counts as balanced, so float dust in a rate does
+  // not list a good as both made and missing.
+  var BALANCED = 0.5;
 
   function loadIndustry(userInitiated) {
     if (!S.connected) { return Promise.resolve(); }
@@ -3046,12 +3153,55 @@
         S.industry.stations = body.stations || [];
         S.industry.error = null;
         renderIndustry();
+        loadSectorHistory(S.industry.sector);
       })
       .catch(function (error) {
         if (error.code === 'cancelled' || S.filters.owner !== owner) { return; }
         S.industry.error = error;
         renderIndustry();
       });
+  }
+
+  /* What the sector's stations earned, bucketed and split by station, off the bridge's
+     series. A bridge that predates the sector filter answers with the whole faction summed
+     and no split, which would be a wrong chart rather than a missing one - so a series
+     without `ships` is treated as no history at all. */
+  function loadSectorHistory(key) {
+    if (!S.connected || !key) { return Promise.resolve(); }
+
+    var at = key.split(':').map(Number);
+    var filter = { x: at[0], y: at[1], by: 'ship' };
+    if (S.filters.owner !== 'all') { filter.owner = S.filters.owner; }
+    if (S.economyWindow) { filter.from = Math.floor(Date.now() / 1000) - S.economyWindow; }
+
+    return Api.get('/history/economy/series', withBucket(filter),
+                   { priority: Api.P.POLL, label: 'sector series' })
+      .then(function (body) {
+        var points = body.points || [];
+        var split = points.every(function (point) { return Array.isArray(point.ships); });
+        S.industry.history[key] = split
+          ? { series: body }
+          : { unavailable: { code: 'no_split', message: 'bridge too old' } };
+        if (S.industry.sector === key) { renderIndustry(); }
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.industry.history[key] = { unavailable: error };
+        if (S.industry.sector === key) { renderIndustry(); }
+      });
+  }
+
+  function pickIndustrySector(key) {
+    S.industry.sector = key;
+    renderIndustry();
+    if (!S.industry.history[key]) { loadSectorHistory(key); }
+  }
+
+  function setSectorWindow(seconds) {
+    S.economyWindow = seconds;
+    S.industry.history = {};
+    renderIndustry();
+    loadSectorHistory(S.industry.sector);
   }
 
   function sectorKey(station) {
@@ -3084,57 +3234,136 @@
     (map[key] = map[key] || []).push(value);
   }
 
-  /* Which stations in a sector feed which, and what nothing in it covers.
-     A station never supplies itself: a line whose waste is also its own ingredient is
-     still short of that ingredient as far as the sector is concerned. */
+  // A mod older than the rates reports none; everything below then falls back to which
+  // goods are made and used at all, without saying how much.
+  function rated(station) {
+    var line = lineOf(station);
+    return !!(line && line.rate && line.rate.cyclesPerHour != null);
+  }
+
+  function hourly(item) {
+    return item.perHour != null ? Number(item.perHour) : 0;
+  }
+
+  /* Which stations in a sector feed which, and how the sector's goods balance.
+
+     `links` is the shape - who could supply whom - and is per good per pair of stations.
+     `balance` is the arithmetic: per good, what the sector makes and uses an hour. A good
+     used faster than it is made is bought in for the difference even when a station here
+     makes some; one made faster than it is used has the difference left over to sell.
+
+     Optional ingredients are not demand: a line runs without them. They are counted
+     separately, and a sector that makes none of one lists it as optionally bought in. */
   function analyseSector(key, all) {
     var here = all.filter(function (station) { return sectorKey(station) === key; });
     var lines = here.filter(lineOf);
+    var withRates = lines.length > 0 && lines.every(rated);
 
     var makers = {};
     var takers = {};
+    var balance = {};
+
+    var entry = function (item) {
+      if (!balance[item.name]) {
+        balance[item.name] = { good: item.name, price: Number(item.price) || 0,
+                               made: 0, used: 0, optional: 0 };
+      }
+      return balance[item.name];
+    };
 
     lines.forEach(function (station, index) {
       outputsOf(station).forEach(function (out) {
         push(makers, out.item.name, { at: index, item: out.item, waste: out.waste });
+        entry(out.item).made += hourly(out.item);
       });
       inputsOf(station).forEach(function (item) {
         push(takers, item.name, { at: index, item: item });
+        if (item.optional) { entry(item).optional += hourly(item); }
+        else { entry(item).used += hourly(item); }
       });
     });
 
     var links = [];
-    var missing = {};
-    var leaves = {};
-
     Object.keys(takers).forEach(function (good) {
       takers[good].forEach(function (taker) {
-        var suppliers = (makers[good] || []).filter(function (m) { return m.at !== taker.at; });
-        if (!suppliers.length) { push(missing, good, taker); return; }
-
-        suppliers.forEach(function (maker) {
+        (makers[good] || []).forEach(function (maker) {
+          if (maker.at === taker.at) { return; }
           links.push({ from: maker.at, to: taker.at, good: good,
                        made: maker.item, taken: taker.item, waste: maker.waste });
         });
       });
     });
 
-    Object.keys(makers).forEach(function (good) {
-      makers[good].forEach(function (maker) {
-        var used = (takers[good] || []).some(function (t) { return t.at !== maker.at; });
-        if (!used) { push(leaves, good, maker); }
-      });
+    var missing = {};
+    var leaves = {};
+
+    Object.keys(balance).forEach(function (good) {
+      var b = balance[good];
+      var local = function (list, other) {
+        return (list[good] || []).filter(function (x) {
+          return (other[good] || []).some(function (y) { return y.at !== x.at; });
+        });
+      };
+
+      if (withRates) {
+        b.net = b.made - b.used;
+        var required = (takers[good] || []).filter(function (t) { return !t.item.optional; });
+
+        if (b.net < -BALANCED) {
+          b.state = 'short';
+          missing[good] = required;
+        } else if (!b.made && (takers[good] || []).length) {
+          b.state = 'optional';
+          missing[good] = takers[good];
+        } else if (b.net > BALANCED) {
+          b.state = 'surplus';
+          leaves[good] = makers[good];
+        } else {
+          b.state = 'balanced';
+        }
+      } else {
+        // No rates: short means nothing here makes it, surplus that nothing here uses it.
+        b.net = null;
+        var fed = local(takers, makers);
+        var used = local(makers, takers);
+
+        if ((takers[good] || []).length > fed.length) {
+          var unfed = takers[good].filter(function (t) { return fed.indexOf(t) === -1; });
+          b.state = unfed.every(function (t) { return t.item.optional; }) ? 'optional' : 'short';
+          missing[good] = unfed;
+        } else if ((makers[good] || []).length > used.length) {
+          b.state = 'surplus';
+          leaves[good] = makers[good].filter(function (m) { return used.indexOf(m) === -1; });
+        } else {
+          b.state = 'balanced';
+        }
+      }
     });
 
-    // Optional ingredients are not a gap: the line runs without them.
     var gaps = Object.keys(missing).filter(function (good) {
-      return missing[good].some(function (taker) { return !taker.item.optional; });
+      return balance[good].state === 'short';
     });
+
+    /* The sector at full throughput, with every shortfall bought in and every surplus
+       sold, at the goods index's base prices. Trade between two stations of the same
+       sector cancels out of it, which is the point: this is what the sector as a whole
+       turns over, and it is the sum of its stations' own margins an hour. */
+    var projection = null;
+    if (withRates) {
+      projection = { sold: 0, bought: 0, optional: 0 };
+      Object.keys(balance).forEach(function (good) {
+        var b = balance[good];
+        if (b.net > BALANCED) { projection.sold += b.net * b.price; }
+        if (b.net < -BALANCED) { projection.bought += -b.net * b.price; }
+      });
+      projection.net = projection.sold - projection.bought;
+    }
 
     return {
-      key: key, stations: here, lines: lines,
+      key: key, stations: here, lines: lines, rated: withRates,
       idle: here.filter(function (station) { return !lineOf(station); }),
-      links: links, missing: missing, leaves: leaves, gaps: gaps
+      links: links, balance: balance, missing: missing, leaves: leaves, gaps: gaps,
+      projection: projection
     };
   }
 
@@ -3167,8 +3396,12 @@
         ? outputsOf(station).some(function (out) { return out.item.name === good; })
         : inputsOf(station).some(function (item) { return item.name === good; });
     }).map(function (station) {
+      var item = makes
+        ? outputsOf(station).filter(function (out) { return out.item.name === good; })[0].item
+        : inputsOf(station).filter(function (i) { return i.name === good; })[0];
       return {
         station: station,
+        perHour: item.perHour,
         distance: Math.sqrt(Math.pow(station.position.x - here[0], 2)
                             + Math.pow(station.position.y - here[1], 2))
       };
@@ -3224,6 +3457,15 @@
     });
   }
 
+  /* Units an hour, short: "1.2K/h". Plain text, for SVG and tooltips. */
+  function rateText(value, signed) {
+    if (value == null || isNaN(value)) { return '—'; }
+    var v = Number(value);
+    var magnitude = Math.abs(v);
+    var body = abbrev(v) || (magnitude < 10 && magnitude % 1 ? v.toFixed(1) : numText(v));
+    return (signed && v > 0 ? '+' : '') + body + '/h';
+  }
+
   function sectorGraph(analysis) {
     var lines = analysis.lines;
     var column = chainColumns(analysis);
@@ -3236,7 +3478,7 @@
        the right, and every wire lands on the row of the good it carries - so the goods
        are named once, on the stations, rather than on labels that collide wherever the
        wires bunch up. Monospace, so text budgets are arithmetic as in chainGraph(). */
-    var W = 320, HEAD = 40, ROW = 16, SGAP = 26, GW = 156, GH = 26, GGAP = 10;
+    var W = 340, HEAD = 40, ROW = 16, SGAP = 26, GW = 200, GH = 26, GGAP = 10;
     var SPAN = 120, GSPAN = 90, PAD = 30;
 
     var stack = function (sizes, gap) {
@@ -3405,9 +3647,12 @@
         + tone + ')" d="' + d + '"><title>' + esc(title) + '</title></path>';
     };
 
+    var amount = function (item) {
+      return analysis.rated ? rateText(item.perHour) : numText(item.amount) + ' a cycle';
+    };
+
     var holds = function (station, item) {
-      return station.name + ' takes ' + numText(item.amount) + ' a cycle and holds '
-        + numText(item.stock);
+      return station.name + ' takes ' + amount(item) + ' and holds ' + numText(item.stock);
     };
 
     var wires = [];
@@ -3425,50 +3670,66 @@
           ? loopBack(x1, y1, x2, y2)
           : route(x1, y1, column[link.from], x2, y2, column[link.to]),
         tone,
-        link.good + ': ' + from.name + ' makes ' + numText(link.made.amount) + ' a cycle; '
-          + holds(to, link.taken),
+        link.good + ': ' + from.name + ' makes ' + amount(link.made) + '; ' + holds(to, link.taken),
         link.back));
     });
 
-    var goodNode = function (x, y, tone, name, title) {
+    // The good's name on the left, the sector's net rate of it on the right.
+    var goodNode = function (x, y, tone, name, figure, title) {
       return '<g class="pnode ' + tone + '" transform="translate(' + f(x) + ' '
         + f(y - GH / 2) + ')"><title>' + esc(title) + '</title>'
         + '<rect width="' + GW + '" height="' + GH + '" rx="4"/>'
-        + '<text class="pn-name" x="10" y="17">' + esc(clip(name, 19)) + '</text></g>';
+        + '<text class="pn-name" x="10" y="17">'
+          + esc(clip(name, figure ? 17 : 27)) + '</text>'
+        + (figure ? '<text class="pn-figure" x="' + (GW - 10) + '" y="17">' + esc(figure) + '</text>' : '')
+        + '</g>';
     };
 
     imports.forEach(function (good, index) {
+      var b = analysis.balance[good];
       var takers = analysis.missing[good];
-      var optional = takers.every(function (t) { return t.item.optional; });
+      var optional = b.state === 'optional';
       var y = goodY(imports, index);
+      var short = analysis.rated && !optional ? -b.net : null;
 
-      nodes.push(goodNode(0, y, optional ? 'opt' : 'bad', good, good
-        + (optional ? ' (optional)' : '') + ' — nothing in this sector makes it; needed by '
-        + takers.map(function (t) { return lines[t.at].name; }).join(', ')));
+      nodes.push(goodNode(0, y, optional ? 'opt' : 'bad', good,
+        short != null ? rateText(-short, true) : '',
+        good + (optional ? ' (optional)' : '') + ' — '
+          + (short != null
+              ? 'the sector uses ' + rateText(b.used) + ' and makes ' + rateText(b.made)
+                + ', so ' + rateText(short) + ' has to be bought in'
+              : 'nothing in this sector makes it')
+          + '; needed by ' + takers.map(function (t) { return lines[t.at].name; }).join(', ')));
 
       takers.forEach(function (taker) {
         wires.push(wire(route(GW, y, -1, stationX(column[taker.at]), inPort(taker.at, good),
                               column[taker.at]),
           taker.item.optional ? 'opt' : 'bad',
-          good + ': made nowhere in this sector; ' + holds(lines[taker.at], taker.item)));
+          good + ': bought in; ' + holds(lines[taker.at], taker.item)));
       });
     });
 
     exports.forEach(function (good, index) {
+      var b = analysis.balance[good];
       var makers = analysis.leaves[good];
       var waste = makers.every(function (m) { return m.waste; });
       var y = goodY(exports, index);
 
-      nodes.push(goodNode(exportX, y, waste ? 'warn' : 'good', good, good
-        + (waste ? ' (waste)' : '') + ' — nothing in this sector takes it in; made by '
-        + makers.map(function (m) { return lines[m.at].name; }).join(', ')));
+      nodes.push(goodNode(exportX, y, waste ? 'warn' : 'good', good,
+        analysis.rated ? rateText(b.net, true) : '',
+        good + (waste ? ' (waste)' : '') + ' — '
+          + (analysis.rated
+              ? 'the sector makes ' + rateText(b.made) + ' and uses ' + rateText(b.used)
+                + ', leaving ' + rateText(b.net) + ' over'
+              : 'nothing in this sector takes it in')
+          + '; made by ' + makers.map(function (m) { return lines[m.at].name; }).join(', ')));
 
       makers.forEach(function (maker) {
         wires.push(wire(route(stationX(column[maker.at]) + W, outPort(maker.at, good),
                               column[maker.at], exportX, y, columns),
           maker.waste ? 'warn' : 'good',
-          good + ': ' + lines[maker.at].name + ' makes ' + numText(maker.item.amount)
-            + ' a cycle and holds ' + numText(maker.item.stock)));
+          good + ': ' + lines[maker.at].name + ' makes ' + amount(maker.item)
+            + ' and holds ' + numText(maker.item.stock)));
       });
     });
 
@@ -3476,31 +3737,40 @@
       var line = lineOf(station);
       var starved = starvedOf(station);
 
-      var sub = lineTitle(station) + ' · ' + numText(line.active) + '/' + numText(line.slots)
-        + ' cycles · ' + (line.margin > 0 ? '+' : '') + numText(line.margin) + ' ¢';
+      var sub = lineTitle(station) + ' · ' + numText(line.slots) + ' slots · '
+        + (analysis.rated
+            ? (line.marginPerHour > 0 ? '+' : '') + (abbrev(line.marginPerHour) || numText(line.marginPerHour)) + ' ¢/h'
+            : (line.margin > 0 ? '+' : '') + numText(line.margin) + ' ¢/cycle');
 
-      // 11px rows: 0.6em is 6.6px, and each side gets half the card less its padding.
-      var rows = inputsOf(station).map(function (item, row) {
+      /* 11px rows: 0.6em is 6.6px, so each half of the card holds 25 characters, and the
+         good's name takes what its figure leaves. */
+      var rows = inputsOf(station).map(function (item, r) {
         var tone = !item.optional && !item.stock ? ' bad' : (item.optional ? ' opt' : '');
-        return '<text class="port-in' + tone + '" x="10" y="' + f(rowY(index, row) - top[index] + 4)
-          + '">' + esc(clip(numText(item.amount) + '× ' + item.name, 22)) + '</text>';
-      }).concat(outputsOf(station).map(function (out, row) {
+        var figure = analysis.rated ? rateText(item.perHour) : numText(item.amount) + '×';
+        return '<text class="port-in' + tone + '" x="10" y="' + f(rowY(index, r) - top[index] + 4)
+          + '">' + esc(figure + ' ' + clip(item.name, 24 - figure.length)) + '</text>';
+      }).concat(outputsOf(station).map(function (out, r) {
+        var figure = analysis.rated ? rateText(out.item.perHour) : '×' + numText(out.item.amount);
         return '<text class="port-out' + (out.waste ? ' warn' : '') + '" x="' + (W - 10)
-          + '" y="' + f(rowY(index, row) - top[index] + 4) + '">'
-          + esc(clip(out.item.name + ' ×' + numText(out.item.amount), 22)) + '</text>';
+          + '" y="' + f(rowY(index, r) - top[index] + 4) + '">'
+          + esc(clip(out.item.name, 24 - figure.length) + ' ' + figure) + '</text>';
       }));
+
+      var cycle = line.rate && line.rate.cycleSeconds
+        ? '\none cycle every ' + numText(line.rate.cycleSeconds, 1) + ' s, '
+          + numText(line.slots) + ' at a time' : '';
 
       nodes.push('<g class="inode' + (starved.length ? ' starved' : '')
         + '" data-station="' + esc(station.name) + '" data-owner="'
         + esc((station.owner && station.owner.kind) || '') + '" transform="translate('
         + f(stationX(column[index])) + ' ' + f(top[index]) + ')">'
-        + '<title>' + esc(station.name + ' — ' + lineTitle(station)
+        + '<title>' + esc(station.name + ' — ' + lineTitle(station) + cycle
             + (starved.length
                 ? '\nout of ' + starved.map(function (i) { return i.name; }).join(', ') : '')
             + '\nopen in Fleet') + '</title>'
         + '<rect width="' + W + '" height="' + size[index] + '" rx="5"/>'
-        + '<text class="ph-name" x="10" y="17">' + esc(clip(station.name, 38)) + '</text>'
-        + '<text class="pn-sub" x="10" y="32">' + esc(clip(sub, 50)) + '</text>'
+        + '<text class="ph-name" x="10" y="17">' + esc(clip(station.name, 42)) + '</text>'
+        + '<text class="pn-sub" x="10" y="32">' + esc(clip(sub, 53)) + '</text>'
         + '<line class="in-rule" x1="0" y1="' + HEAD + '" x2="' + W + '" y2="' + HEAD + '"/>'
         + rows.join('')
         + '</g>');
@@ -3517,64 +3787,257 @@
       + esc((station.owner && station.owner.kind) || '') + '">' + esc(station.name) + '</a>';
   }
 
-  function elsewhereCell(found) {
+  function elsewhereCell(found, rated) {
     if (!found.length) { return '<span class="mute2">none of yours</span>'; }
 
     return found.map(function (hit) {
       return stationLink(hit.station) + ' <a href="#" class="mute2" data-sector="'
         + esc(sectorKey(hit.station)) + '">' + esc(sectorKey(hit.station)) + '</a>'
-        + ' <span class="mute2">' + numText(hit.distance, 1) + ' away</span>';
+        + ' <span class="mute2">' + numText(hit.distance, 1) + ' away'
+        + (rated && hit.perHour != null ? ' · ' + esc(rateText(hit.perHour)) : '') + '</span>';
     }).join('<br>');
   }
 
-  function missingCard(analysis, all) {
-    var goods = Object.keys(analysis.missing).sort();
+  var BALANCE_ORDER = { short: 0, optional: 1, surplus: 2, balanced: 3 };
+
+  /* Every good the sector touches, one row each: what it makes and uses an hour, the
+     difference, and what that difference is worth. Shortfalls first, since those are
+     what stop a line. */
+  function balanceCard(analysis, all) {
+    var goods = Object.keys(analysis.balance).sort(function (a, b) {
+      var ba = analysis.balance[a], bb = analysis.balance[b];
+      return (BALANCE_ORDER[ba.state] - BALANCE_ORDER[bb.state])
+        || (Math.abs((bb.net || 0) * bb.price) - Math.abs((ba.net || 0) * ba.price))
+        || (a < b ? -1 : 1);
+    });
     if (!goods.length) { return ''; }
 
-    return '<div class="card wide"><h3>Brought in ' + explain('industry-missing') + '</h3>'
-      + '<div class="scroll-x"><table><thead><tr><th>Good</th><th>Needed by</th>'
-      + '<th>Made elsewhere</th></tr></thead><tbody>'
-      + goods.map(function (good) {
-          var takers = analysis.missing[good];
-          var optional = takers.every(function (t) { return t.item.optional; });
+    var rated = analysis.rated;
 
-          return '<tr><td>' + esc(good)
-            + (optional ? ' <span class="badge">optional</span>' : '') + '</td>'
-            + '<td>' + takers.map(function (t) {
-                var station = analysis.lines[t.at];
-                return stationLink(station) + (t.item.stock ? '' : ' <span class="badge bad">out</span>');
-              }).join('<br>') + '</td>'
-            + '<td>' + elsewhereCell(nearestElsewhere(all, analysis.key, good, true)) + '</td></tr>';
+    return '<div class="card wide"><h3>Goods balance ' + explain('industry-balance') + '</h3>'
+      + (rated ? '' : '<div class="note warn" style="margin-bottom:6px">No production rates from '
+        + 'the mod, so only what is made and used here is shown, not how much '
+        + explain('industry-no-rates', 'warn') + '</div>')
+      + '<div class="scroll-x"><table><thead><tr><th>Good</th>'
+      + (rated ? '<th class="num">Made</th><th class="num">Used</th><th class="num">Balance</th>'
+               + '<th class="num">Worth</th>' : '')
+      + '<th>Stations</th><th>Elsewhere</th></tr></thead><tbody>'
+      + goods.map(function (good) {
+          var b = analysis.balance[good];
+          var badge = {
+            short: '<span class="badge bad">bought in</span>',
+            optional: '<span class="badge">optional</span>',
+            surplus: '<span class="badge good">left over</span>',
+            balanced: '<span class="badge info">balanced</span>'
+          }[b.state];
+
+          var makers = analysis.leaves[good] || [];
+          var takers = analysis.missing[good] || [];
+          var here = (b.state === 'short' || b.state === 'optional' ? takers : makers)
+            .map(function (x) {
+              var station = analysis.lines[x.at];
+              var out = b.state !== 'surplus' && !x.item.stock && !x.item.optional
+                ? ' <span class="badge bad">out</span>' : '';
+              return stationLink(station) + out;
+            });
+
+          var elsewhere = b.state === 'short' || b.state === 'optional'
+            ? elsewhereCell(nearestElsewhere(all, analysis.key, good, true), rated)
+            : b.state === 'surplus'
+              ? elsewhereCell(nearestElsewhere(all, analysis.key, good, false), rated)
+              : '<span class="mute2">—</span>';
+
+          return '<tr><td>' + esc(good) + ' ' + badge + '</td>'
+            + (rated
+                ? '<td class="num">' + esc(rateText(b.made)) + '</td>'
+                  + '<td class="num">' + esc(rateText(b.used))
+                    + (b.optional ? '<div class="mute2">+' + esc(rateText(b.optional)) + ' opt</div>' : '')
+                  + '</td>'
+                  + '<td class="num">' + (b.state === 'balanced' ? '<span class="mute2">0</span>'
+                      : '<span class="' + (b.net < 0 ? 'bad' : 'good') + '">'
+                        + esc(rateText(b.net, true)) + '</span>') + '</td>'
+                  + '<td class="num">' + (Math.abs(b.net) > BALANCED
+                      ? signedCredits(Math.round(b.net * b.price)) + '<span class="mute2">/h</span>'
+                      : '<span class="mute2">—</span>') + '</td>'
+                : '')
+            + '<td>' + (here.join('<br>') || '<span class="mute2">—</span>') + '</td>'
+            + '<td>' + elsewhere + '</td></tr>';
         }).join('')
       + '</tbody></table></div></div>';
   }
 
-  function leavesCard(analysis, all) {
-    var goods = Object.keys(analysis.leaves).sort();
-    if (!goods.length) { return ''; }
+  /* The sector's projected turnover next to what each station contributes to it. The two
+     totals agree by construction - goods passed between two stations here cancel - except
+     for optional ingredients, which a station's own margin counts and the sector's
+     balance does not. */
+  function projectionCard(analysis) {
+    var p = analysis.projection;
+    if (!p) { return ''; }
 
-    return '<div class="card wide"><h3>Left over ' + explain('industry-leaves') + '</h3>'
-      + '<div class="scroll-x"><table><thead><tr><th>Good</th><th>Made by</th>'
-      + '<th>Taken in elsewhere</th></tr></thead><tbody>'
-      + goods.map(function (good) {
-          var makers = analysis.leaves[good];
-          var waste = makers.every(function (m) { return m.waste; });
+    var stations = analysis.lines.slice().sort(function (a, b) {
+      return (lineOf(b).marginPerHour || 0) - (lineOf(a).marginPerHour || 0);
+    });
 
-          return '<tr><td>' + esc(good)
-            + (waste ? ' <span class="badge warn">waste</span>' : '') + '</td>'
-            + '<td>' + makers.map(function (m) {
-                return stationLink(analysis.lines[m.at]);
-              }).join('<br>') + '</td>'
-            + '<td>' + elsewhereCell(nearestElsewhere(all, analysis.key, good, false)) + '</td></tr>';
+    return '<div class="card wide"><h3>Projected revenue ' + explain('industry-projection') + '</h3>'
+      + '<div class="projection">'
+      + kv([
+        ['sold on', credits(Math.round(p.sold)) + '<span class="mute2">/h</span>'],
+        ['bought in', credits(Math.round(p.bought)) + '<span class="mute2">/h</span>'],
+        ['net an hour', '<b>' + signedCredits(Math.round(p.net)) + '</b>'],
+        ['net a day', signedCredits(Math.round(p.net * 24))]
+      ])
+      + '<div class="scroll-x"><table><thead><tr><th>Station</th><th>Line</th>'
+      + '<th class="num">Cycle</th><th class="num">Margin</th></tr></thead><tbody>'
+      + stations.map(function (station) {
+          var line = lineOf(station);
+          return '<tr><td>' + stationLink(station) + '</td>'
+            + '<td class="mute2">' + esc(lineTitle(station)) + '</td>'
+            + '<td class="num">' + num(line.rate.cycleSeconds, 1) + ' s × ' + num(line.slots) + '</td>'
+            + '<td class="num">' + signedCredits(Math.round(line.marginPerHour))
+            + '<span class="mute2">/h</span></td></tr>';
         }).join('')
-      + '</tbody></table></div></div>';
+      + '</tbody></table></div></div></div>';
+  }
+
+  /* ------------------------------ sector chart ------------------------------ */
+
+  /* Categorical slots for the stations of one sector, validated against this console's
+     card surface (#11161f) with the dataviz validator: seven hues in this order clear the
+     colour-vision checks for neighbouring pairs. An eighth station and beyond fold into
+     one grey "other". Slots go by station name, never by rank, so a station keeps its
+     colour when the window changes what it earned. */
+  var SERIES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9'];
+  var SERIES_OTHER = '#5a6779';
+
+  function stationColours(names) {
+    var colours = {};
+    names.slice().sort().forEach(function (name, index) {
+      colours[name] = index < SERIES.length ? SERIES[index] : SERIES_OTHER;
+    });
+    return colours;
+  }
+
+  /* Net per bucket, stacked by station: what each earned sits above the zero line and
+     what each lost below it, so a bucket's height either side is the sector's gross and
+     the gap between them its net. Stretched to the card like seriesChart, with the gaps
+     between segments drawn as a surface-coloured stroke that does not scale. */
+  function sectorChart(analysis) {
+    var recorded = S.industry.history[analysis.key];
+
+    var picker = '<div class="seg" id="sector-window" data-value="' + S.economyWindow + '">'
+      + [[3600, '1h'], [86400, '24h'], [604800, '7d'], [0, 'all']].map(function (w) {
+          return '<button data-v="' + w[0] + '"'
+            + (S.economyWindow === w[0] ? ' class="on"' : '') + '>' + w[1] + '</button>';
+        }).join('')
+      + '</div>';
+
+    var card = function (inner) {
+      return '<div class="card wide"><h3>Earned over time ' + explain('industry-history')
+        + '</h3>' + picker + inner + '</div>';
+    };
+
+    if (!recorded) { return card('<div class="mute2">loading…</div>'); }
+
+    if (recorded.unavailable) {
+      return card('<div class="note warn">This bridge keeps no per-sector economy history '
+        + explain('industry-no-history', 'warn') + '</div>');
+    }
+
+    var series = recorded.series || {};
+    var points = series.points || [];
+
+    // Only stations that can have earned anything take a colour; an idle trading post
+    // would otherwise spend a slot on a series that is never drawn.
+    var names = analysis.lines.map(function (station) { return station.name; });
+    points.forEach(function (point) {
+      point.ships.forEach(function (share) {
+        if (names.indexOf(share.ship) === -1) { names.push(share.ship); }
+      });
+    });
+    var colours = stationColours(names);
+    var order = names.slice().sort();
+
+    var up = 0, down = 0;
+    points.forEach(function (point) {
+      var pos = 0, neg = 0;
+      point.ships.forEach(function (share) {
+        if (share.net > 0) { pos += share.net; } else { neg -= share.net; }
+      });
+      up = Math.max(up, pos);
+      down = Math.max(down, neg);
+    });
+
+    if (!points.length || !(up || down)) {
+      return card('<div class="mute2">Nothing earned in this window yet '
+        + explain('economy-no-samples') + '</div>');
+    }
+
+    var W = 1000, H = 200, span = up + down;
+    var zero = H * up / span;
+    var step = W / points.length;
+    var bar = step * 0.5;
+
+    var marks = points.map(function (point, index) {
+      var x = index * step + (step - bar) / 2;
+      var above = 0, below = 0;
+      var when = new Date(point.at * 1000).toLocaleString();
+
+      var shares = order.map(function (name) {
+        return point.ships.filter(function (s) { return s.ship === name; })[0];
+      }).filter(Boolean);
+
+      var segments = shares.map(function (share) {
+        if (!share.net) { return ''; }
+        var h = H * Math.abs(share.net) / span;
+        var y;
+        if (share.net > 0) { above += h; y = zero - above; } else { y = zero + below; below += h; }
+
+        return '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(2) + '" width="' + bar.toFixed(1)
+          + '" height="' + h.toFixed(2) + '" fill="' + colours[share.ship] + '"/>';
+      }).join('');
+
+      var tip = when + ' — ' + numText(point.net) + ' ¢ net\n' + shares.map(function (share) {
+        return share.ship + ': ' + numText(share.net) + ' ¢';
+      }).join('\n');
+
+      // The hit target is the whole bucket, not the segments, so a thin one still answers.
+      return '<g class="bucket"><rect class="hit" x="' + (index * step).toFixed(1)
+        + '" y="0" width="' + step.toFixed(1) + '" height="' + H + '"/>' + segments
+        + '<title>' + esc(tip) + '</title></g>';
+    }).join('');
+
+    var totals = {};
+    points.forEach(function (point) {
+      point.ships.forEach(function (share) { totals[share.ship] = (totals[share.ship] || 0) + share.net; });
+    });
+
+    var first = new Date(points[0].at * 1000);
+    var last = new Date(points[points.length - 1].at * 1000);
+
+    return card('<div class="stack-chart">'
+      + '<div class="axis-y mute2"><span style="top:0">' + esc(numText(up)) + ' ¢</span>'
+        + '<span style="top:' + (100 * zero / H).toFixed(1) + '%">0</span>'
+        + (down ? '<span style="top:100%">-' + esc(numText(down)) + ' ¢</span>' : '') + '</div>'
+      + '<svg class="stack" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img"'
+        + ' aria-label="net earned per ' + esc(series.bucket || 'hour') + ', by station">'
+        + '<line class="zero" x1="0" x2="' + W + '" y1="' + zero.toFixed(2) + '" y2="' + zero.toFixed(2) + '"/>'
+        + marks + '</svg></div>'
+      + '<div class="mute2 spark-axis"><span>' + esc(first.toLocaleString()) + '</span>'
+        + '<span>net per ' + esc(series.bucket || 'hour') + '</span>'
+        + '<span>' + esc(last.toLocaleString()) + '</span></div>'
+      + '<div class="chart-legend">' + order.filter(function (name) {
+          return totals[name] != null;
+        }).map(function (name) {
+          return '<span><i style="background:' + colours[name] + '"></i>' + esc(name)
+            + ' <span class="mute2">' + esc(numText(totals[name])) + ' ¢</span></span>';
+        }).join('') + '</div>');
   }
 
   function sectorBadge(analysis) {
     if (!analysis.lines.length) { return '<span class="badge">no production</span>'; }
     if (analysis.gaps.length) {
       return '<span class="badge warn">' + analysis.gaps.length + ' input'
-        + (analysis.gaps.length === 1 ? '' : 's') + ' missing</span>';
+        + (analysis.gaps.length === 1 ? '' : 's') + ' short</span>';
     }
     return '<span class="badge good">self-supplied</span>';
   }
@@ -3624,17 +4087,22 @@
     if (!current && sectors.length) {
       current = sectors[0];
       state.sector = current.key;
+      if (!state.history[current.key]) { loadSectorHistory(current.key); }
     }
 
     paint(rows, 'rows', sectors.map(function (sector) {
       var titles = sector.lines.map(lineTitle).concat(sector.idle.map(function (station) {
         return (station.economy && station.economy.kind) || 'station';
       }));
+      var net = sector.projection
+        ? ' <span class="mute2">·</span> ' + signedCredits(Math.round(sector.projection.net))
+          + '<span class="mute2">/h</span>'
+        : '';
 
       return '<div class="ship-row' + (sector === current ? ' sel' : '') + '" data-sector="'
         + esc(sector.key) + '">'
         + '<div class="n">' + esc(sector.key) + ' <span class="mute2">· '
-          + numText(sector.stations.length) + '</span></div>'
+          + numText(sector.stations.length) + '</span>' + net + '</div>'
         + '<div class="badges">' + sectorBadge(sector) + '</div>'
         + '<div class="s">' + esc(titles.join(', ')) + '</div></div>';
     }).join('') || '<div class="empty muted">No stations with books.</div>');
@@ -3651,7 +4119,10 @@
     var head = '<div class="ship-head"><div><h1>Sector ' + esc(current.key) + '</h1>'
       + '<div class="muted">' + numText(current.stations.length) + ' stations · '
       + numText(current.lines.length) + ' producing · '
-      + numText(Object.keys(linked).length) + ' linked</div></div>'
+      + numText(Object.keys(linked).length) + ' linked'
+      + (current.projection
+          ? ' · projected ' + signedCredits(Math.round(current.projection.net)) + '/h' : '')
+      + '</div></div>'
       + '<div class="badges">' + sectorBadge(current) + '</div></div>';
 
     var graph = current.lines.length
@@ -3659,8 +4130,8 @@
         + '<div class="scroll-x sector-scroll">' + sectorGraph(current) + '</div>'
         + '<div class="chain-legend mute2">'
         + '<span class="lg station"></span>station'
-        + '<span class="lg bad"></span>missing / out of stock'
-        + '<span class="lg good"></span>leaves the sector'
+        + '<span class="lg bad"></span>bought in / out of stock'
+        + '<span class="lg good"></span>left over'
         + '<span class="lg warn"></span>waste'
         + '</div></div>'
       : '';
@@ -3674,7 +4145,7 @@
       : '';
 
     paint(pane, 'pane', head + '<div class="industry-body"><div class="cards">'
-      + graph + missingCard(current, all) + leavesCard(current, all) + idle
+      + graph + projectionCard(current) + balanceCard(current, all) + sectorChart(current) + idle
       + '</div></div>');
   }
 
@@ -4152,20 +4623,20 @@
 
     $('#industry-rows').addEventListener('click', function (e) {
       var row = e.target.closest('[data-sector]');
-      if (!row) { return; }
-      S.industry.sector = row.dataset.sector;
-      renderIndustry();
+      if (row) { pickIndustrySector(row.dataset.sector); }
     });
 
     $('#industry-pane').addEventListener('click', function (e) {
       var station = e.target.closest('[data-station]');
       if (station) { e.preventDefault(); openStation(station.dataset.station); return; }
 
+      var windowButton = e.target.closest('#sector-window button');
+      if (windowButton) { setSectorWindow(Number(windowButton.dataset.v)); return; }
+
       var sector = e.target.closest('[data-sector]');
       if (sector) {
         e.preventDefault();
-        S.industry.sector = sector.dataset.sector;
-        renderIndustry();
+        pickIndustrySector(sector.dataset.sector);
       }
     });
 
@@ -4176,6 +4647,7 @@
       e.preventDefault();
       S.industry.sector = link.dataset.sector;
       showView('industry');
+      loadSectorHistory(link.dataset.sector);
     });
 
     /* Typing is debounced before it reaches the sweep: the index is what costs a call

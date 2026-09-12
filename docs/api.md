@@ -448,14 +448,19 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
       "style": "Factory", "mine": false,
       "ingredients": [
         {"name": "Energy Cell", "amount": 5, "optional": null, "price": 61, "size": 1,
-         "value": 305, "stock": 1200},
-        {"name": "Raw Oil", "amount": 10, "price": 66, "size": 2, "value": 660, "stock": 40}
+         "value": 305, "stock": 1200, "perHour": 3408.75},
+        {"name": "Raw Oil", "amount": 10, "price": 66, "size": 2, "value": 660, "stock": 40,
+         "perHour": 6817.5}
       ],
       "results": [{"name": "Oil", "amount": 5, "price": 320, "size": 2,
-                   "value": 1600, "stock": 900}],
+                   "value": 1600, "stock": 900, "perHour": 3408.75}],
       "garbage": [],
       "slots": 3, "active": 2, "running": [{"progress": 0.25}, {"progress": 0.8}],
       "inputValue": 965, "outputValue": 1600, "margin": 635,
+      "rate": {"cycleSeconds": 15.84, "cyclesPerHour": 681.75,
+               "productionCapacity": 100, "capacityKnown": true},
+      "inputValuePerHour": 657888.75, "outputValuePerHour": 1090800,
+      "marginPerHour": 432911.25,
       "shuttleVolume": 20
     },
     "goods": {
@@ -504,6 +509,20 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
   chain is worth running; it is not revenue, since the result still has to be sold.
 - `optional` marks an ingredient the line will use if it has it, for a faster cycle, and
   will run without.
+- `rate` is how fast the line runs, reproduced from the game's own
+  `Factory.refreshProductionTime()`: one cycle takes
+  `max(15, value of results and waste / productionCapacity / (1 + average good level / 100))`
+  seconds, and `slots` of them run in parallel, so `cyclesPerHour` is
+  `slots * 3600 / cycleSeconds`. `perHour` on every ingredient, result and waste good, and
+  the three `...PerHour` values, are the per-cycle figures at that pace. **It is a ceiling**:
+  every slot busy, which a line out of an ingredient or with a full bay is not. It is also
+  the only way to compare two stations' amounts, since cycle length differs between lines.
+- `productionCapacity` comes from the station's block plan. Reading a plan loads it out of
+  the database, so it is cached per station until the plan's block count changes. When
+  the plan cannot be read, `capacityKnown` is false and the game's floor of 100 stands in -
+  the slowest the station could be. `boost` is `2` on a line with optional ingredients: a
+  cycle started with one in the bay runs twice as fast, which the rates above do not
+  assume.
 - `secured` is false when the engine has not written this craft's scripts to its database
   row yet - a station founded since the last save. Everything else is then empty rather
   than wrong, which otherwise reads exactly like a factory with no line and no income.
@@ -969,8 +988,17 @@ The same numbers bucketed, which is what a chart wants. Same query parameters, p
 }
 ```
 
+| `x`, `y` | one sector's stations; both or neither | |
+| `by` | `ship` - add each station's share to every point | |
+
+```json
+{"at": 1757631600, "earned": 20000, "spent": 4000, "tax": 200, "net": 16200,
+ "ships": [{"ship": "Rusty Refinery", "earned": 15000, "spent": 4000, "tax": 200, "net": 11200},
+           {"ship": "Sun Farm", "earned": 5000, "spent": 0, "tax": 0, "net": 5000}]}
+```
+
 Omit `station` and the points are every station summed; name one and they are that
-station's. A bucket is attributed to the **later** sample of each pair, so an interval
+station's. `ships` is only there with `by=ship`, and its shares add up to the point. A bucket is attributed to the **later** sample of each pair, so an interval
 straddling a boundary lands wholly in the bucket it ended in - a rounding error of at most
 one sampling interval, and the alternative is apportioning income across buckets on an
 assumption of evenness the data does not support.

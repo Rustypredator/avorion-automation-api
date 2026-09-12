@@ -178,12 +178,22 @@ Travel are not offered for a station: the game refuses both outright.
 
 The **Industry** tab puts those lines together, one sector at a time. Each station in the
 sector is a card with its ingredients down one edge and its results down the other, wired
-to the stations it feeds, so a sector reads as the production chain it actually is. Goods
-nothing in the sector makes come in from the left, goods nothing in it uses leave on the
-right, and both are listed underneath with the nearest of your stations elsewhere that
-would cover them. A red wire is an ingredient the receiving station has run out of. All of
-it comes from one `/stations` call; clicking a station opens it in the Fleet view, and a
-station's Production tab links back to its sector.
+to the stations it feeds, so a sector reads as the production chain it actually is.
+
+Amounts are per hour rather than per cycle, because a cycle's length differs from line to
+line: the mod reproduces the game's own cycle time for every station, from the value of
+what it makes and its plan's production capacity. So if one station makes 75 of a good an
+hour and another uses 60, the sector has 15 left over. Goods the sector uses faster than
+it makes come in from the left for the shortfall, goods left over leave on the right, and
+the **Goods balance** underneath lists every one with what the difference is worth and the
+nearest of your stations elsewhere that would cover it. **Projected revenue** adds that up:
+every surplus sold and every shortfall bought, at base prices and every slot running - a
+ceiling for the sector next to each station's own share. Under it the bridge's history
+draws what the sector actually earned, stacked by station per hour or day; the station's
+own **Economy** tab draws its history as earned, spent and net lines.
+
+All of it comes from one `/stations` call; clicking a station opens it in the Fleet view,
+and a station's Production tab links back to its sector.
 
 The heading on both is the station's real identity rather than its script. Every factory in
 the game - a Solar Power Plant, an Iron Mine, a Book Factory - runs the same `factory.lua`

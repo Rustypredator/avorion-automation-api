@@ -173,6 +173,13 @@ function M.install()
         function e:getSystems() return ship.systems or {} end
         function e:getLightweightHangar() return ship.hangar or {} end
         function e:getPlanValue() return ship.planValue or 0 end
+        -- Only the statistics are modelled, and each read is counted, so a test can pin
+        -- that a plan is not reloaded on every listing.
+        function e:getPlan()
+            ship.planReads = (ship.planReads or 0) + 1
+            if ship.productionCapacity == nil then error("no plan") end
+            return {getStats = function() return {productionCapacity = ship.productionCapacity} end}
+        end
         function e:getReconstructionValue() return ship.reconstructionValue or 0 end
         function e:getStatusMessage() return ship.status end
         function e:getTitle() return ship.title end

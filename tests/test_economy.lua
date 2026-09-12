@@ -45,6 +45,7 @@ end
 Mock.addShip(1, "Rusty Refinery",
 {
     type = EntityType.Station, x = 12, y = -4,
+    productionCapacity = 100, blocks = 900,
     usableError = 2, -- NotAShip, which is what the game answers for any station
     cargoCapacity = 12000, cargoFree = 5000,
     cargo =
@@ -192,6 +193,36 @@ check(production.inputValue == 5 * 61 + 10 * 66, "input value is price times amo
 check(production.outputValue == 5 * 320, "output value likewise")
 check(production.margin == production.outputValue - production.inputValue, "margin is the difference")
 check(production.results[1].stock == 900, "a chain entry carries what is in the bay")
+
+-- factory.lua: max(15, 5 Oil at 320 / capacity 100 / (1 + Oil's level 1 / 100)).
+local cycle = 1600 / 100 / 1.01
+local function near(a, b) return type(a) == "number" and math.abs(a - b) < 1e-6 end
+
+check(near(production.rate.cycleSeconds, cycle), "a cycle lasts as long as the game makes it")
+check(near(production.rate.cyclesPerHour, 3 * 3600 / cycle), "every slot runs one in parallel")
+check(production.rate.capacityKnown == true, "off the plan's own production capacity")
+check(near(production.results[1].perHour, 5 * 3 * 3600 / cycle), "results are rated per hour")
+check(near(production.ingredients[2].perHour, 10 * 3 * 3600 / cycle), "and so are ingredients")
+check(near(production.marginPerHour, production.margin * 3 * 3600 / cycle),
+      "the margin an hour is the margin a cycle at that pace")
+
+local refineryRow = Mock.getShip(1, "Rusty Refinery")
+local readsBefore = refineryRow.planReads
+call("GET", "/stations")
+check(refineryRow.planReads == readsBefore, "the plan is not reloaded while its block count stands")
+refineryRow.blocks = 901
+refineryRow.productionCapacity = 400
+local _, relisted = call("GET", "/stations")
+check(refineryRow.planReads == readsBefore + 1, "and is read again once the plan changes")
+check(near(relisted.stations[1].economy.production.rate.cycleSeconds, 15),
+      "no cycle is shorter than the game's 15 second floor")
+
+refineryRow.blocks = 902
+refineryRow.productionCapacity = nil
+_, relisted = call("GET", "/stations")
+local unread = relisted.stations[1].economy.production.rate
+check(unread.capacityKnown == false and near(unread.cycleSeconds, cycle),
+      "a plan that cannot be read falls back to the game's minimum capacity, and says so")
 
 local goods = refinery.economy.goods
 check(#goods.buys == 2 and #goods.sells == 1, "goods split into bought and sold")

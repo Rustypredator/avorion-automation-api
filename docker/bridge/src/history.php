@@ -745,6 +745,13 @@ final class History
             $sql .= ' AND owner = :o';
             $args[':o'] = (string) $filter['owner'];
         }
+        // One sector's stations. Both coordinates or neither: x alone is a column of the
+        // galaxy, which nothing asks for.
+        if (isset($filter['x'], $filter['y']) && $filter['x'] !== null && $filter['y'] !== null) {
+            $sql .= ' AND x = :x AND y = :y';
+            $args[':x'] = (int) $filter['x'];
+            $args[':y'] = (int) $filter['y'];
+        }
 
         $sql .= ' AND taken_at <= to_timestamp(:t)';
         $args[':t'] = $this->windowEnd($filter);
@@ -858,7 +865,7 @@ final class History
      * most one sample interval, and the alternative is apportioning income across buckets
      * on an assumption of evenness that the data does not support.
      */
-    public function economySeries(array $filter, string $bucket): array
+    public function economySeries(array $filter, string $bucket, bool $byShip = false): array
     {
         $bucket = $bucket === 'day' ? 'day' : 'hour';
         $from = $this->windowStart($filter);
@@ -879,7 +886,7 @@ final class History
                  FROM station_samples WHERE {$scope}
              ),
              diffs AS (
-                 SELECT taken_at,
+                 SELECT ship, taken_at,
                         GREATEST(gained - LAG(gained) OVER w, 0) AS d_gained,
                         GREATEST(spent  - LAG(spent)  OVER w, 0) AS d_spent,
                         GREATEST(tax    - LAG(tax)    OVER w, 0) AS d_tax
@@ -887,27 +894,43 @@ final class History
                  WINDOW w AS (PARTITION BY ship ORDER BY taken_at)
              )
              SELECT EXTRACT(EPOCH FROM date_trunc('{$bucket}', taken_at))::bigint AS at,
+                    ship,
                     COALESCE(SUM(d_gained), 0)::bigint AS gained,
                     COALESCE(SUM(d_spent), 0)::bigint  AS spent,
                     COALESCE(SUM(d_tax), 0)::bigint    AS tax
              FROM diffs
              WHERE taken_at >= to_timestamp(:f)
-             GROUP BY 1 ORDER BY 1",
+             GROUP BY 1, 2 ORDER BY 1, 2",
             $args
         );
 
-        $points = [];
+        // One row per station per bucket out of the query, folded into one point per
+        // bucket here - with each station's share kept alongside when asked for, which is
+        // what a stacked chart of a sector is drawn from.
+        $byAt = [];
         foreach ($rows as $row) {
+            $at = (int) $row['at'];
             $gained = (int) $row['gained'];
             $spent = (int) $row['spent'];
             $tax = (int) $row['tax'];
 
-            $points[] = ['at' => (int) $row['at'], 'earned' => $gained, 'spent' => $spent,
-                         'tax' => $tax, 'net' => $gained + $tax - $spent];
+            $byAt[$at] ??= ['at' => $at, 'earned' => 0, 'spent' => 0, 'tax' => 0, 'net' => 0]
+                + ($byShip ? ['ships' => []] : []);
+
+            $byAt[$at]['earned'] += $gained;
+            $byAt[$at]['spent'] += $spent;
+            $byAt[$at]['tax'] += $tax;
+            $byAt[$at]['net'] += $gained + $tax - $spent;
+
+            if ($byShip) {
+                $byAt[$at]['ships'][] = ['ship' => (string) $row['ship'], 'earned' => $gained,
+                                         'spent' => $spent, 'tax' => $tax,
+                                         'net' => $gained + $tax - $spent];
+            }
         }
 
         return ['bucket' => $bucket, 'window' => ['from' => $from ?: null, 'to' => $to],
-                'ship' => (string) ($filter['ship'] ?? ''), 'points' => $points];
+                'ship' => (string) ($filter['ship'] ?? ''), 'points' => array_values($byAt)];
     }
 
     /**

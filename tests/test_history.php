@@ -479,6 +479,27 @@ foreach ($series['points'] as $point) {
 }
 check($earned === 400, 'and the buckets add up to the same total the summary reports');
 
+$split = $economy->economySeries([], 'hour', true);
+$shares = 0;
+$totals = 0;
+$named = [];
+foreach ($split['points'] as $point) {
+    $totals += $point['net'];
+    foreach ($point['ships'] as $share) {
+        $shares += $share['net'];
+        $named[$share['ship']] = true;
+    }
+}
+check(isset($named['Rusty Refinery'], $named['Alliance Exchange']),
+      'split by ship, every station has its own share of the buckets');
+check($shares === $totals, 'and the shares add up to each bucket\'s total');
+check(!isset($series['points'][0]['ships']), 'the split is only there when asked for');
+
+check(count($economy->economySeries(['x' => 12, 'y' => -4], 'hour')['points']) >= 1,
+      'a sector filter keeps the stations in that sector');
+check($economy->economySeries(['x' => 99, 'y' => 99], 'hour')['points'] === [],
+      'and leaves out every other sector');
+
 check($economy->economySeries([], 'nonsense')['bucket'] === 'hour',
       'an unknown bucket falls back to the hour rather than reaching the query');
 

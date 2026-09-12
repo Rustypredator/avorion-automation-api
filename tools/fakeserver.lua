@@ -105,6 +105,8 @@ Mock.addShip(1, "Tug", {x = -3, y = 12, statusText = "Idle"})
 local refinery = Mock.addShip(1, "Home Base",
 {
     type = EntityType.Station, x = 0, y = 0, usableError = 2,
+    -- Read off the plan for the line's cycle time; see rateOf() in economy.lua.
+    productionCapacity = 250,
     cargoCapacity = 12000, cargoFree = 5000,
     cargo =
     {

@@ -355,17 +355,32 @@ td.num + td, th.num + th { padding-left: 12px; }
 td.fillcell { min-width: 70px; padding-top: 7px; }
 td.fillcell .bar { margin: 0; }
 
-/* Net per bucket. preserveAspectRatio="none" is what lets one viewBox stretch to
-   whatever width the card ended up with, so the bar count sets the resolution and the
-   layout sets the size. */
-.spark { width: 100%; height: 46px; display: block; margin: 8px 0 3px; }
-.spark rect { fill: var(--accent); }
-.spark rect.good { fill: var(--good); }
-.spark rect.bad { fill: var(--bad); }
-.spark-axis { display: flex; justify-content: space-between; gap: 10px; }
+/* Charts stretched to their card through a viewBox with preserveAspectRatio="none". Text
+   cannot live inside one without stretching too, so the value axis is HTML laid over the
+   left edge, positioned by percentage. */
+.stack-chart { position: relative; margin: 8px 0 3px; padding-left: 74px; }
+.stack { display: block; width: 100%; height: 160px; }
+.stack .zero { stroke: var(--line-2); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.stack .hit { fill: transparent; }
+.stack .bucket:hover .hit, .stack .hit:hover { fill: rgba(125, 140, 163, .08); }
+/* A surface-coloured edge between stacked segments, so neighbours read as two. */
+.stack .bucket rect:not(.hit) { stroke: var(--bg-2); stroke-width: 2px; vector-effect: non-scaling-stroke; }
+.stack.lines .series { fill: none; stroke-width: 2px; stroke-linejoin: round; stroke-linecap: round; }
+.axis-y { position: absolute; left: 0; top: 0; bottom: 0; width: 68px; font-size: 10px;
+          font-variant-numeric: tabular-nums; }
+.axis-y span { position: absolute; right: 0; transform: translateY(-50%); white-space: nowrap; }
+.spark-axis { display: flex; justify-content: space-between; gap: 10px; padding-left: 74px; }
+
+.projection { display: grid; grid-template-columns: minmax(200px, 280px) 1fr; gap: 10px 28px; align-items: start; }
+@media (max-width: 900px) { .projection { grid-template-columns: 1fr; } }
+
+.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12px; }
+.chart-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                  margin-right: 5px; vertical-align: -1px; }
+.chart-legend i.line { height: 2px; width: 14px; vertical-align: 3px; }
 
 /* The window picker sits under the card heading rather than beside it. */
-#economy-window { margin-bottom: 8px; }
+#economy-window, #sector-window { margin-bottom: 8px; }
 
 /* --------------------------- production graph ---------------------------- */
 
@@ -385,6 +400,7 @@ td.fillcell .bar { margin: 0; }
 .pn-name { fill: var(--text); font-size: 11.5px; }
 .ph-name { fill: var(--accent); font-size: 12px; font-weight: 600; }
 .pn-sub { fill: var(--text-mute); font-size: 10px; font-variant-numeric: tabular-nums; }
+.pn-figure { fill: var(--text-dim); font-size: 11px; text-anchor: end; font-variant-numeric: tabular-nums; }
 .pn-tag { fill: var(--text-mute); font-size: 9px; text-anchor: end;
           text-transform: uppercase; letter-spacing: .06em; }
 

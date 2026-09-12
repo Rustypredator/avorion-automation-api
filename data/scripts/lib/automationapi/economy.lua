@@ -265,7 +265,94 @@ local function factoryTitle(production, results)
     return (string.gsub(filled, "^%s*(.-)%s*$", "%1"))
 end
 
-local function productionOf(values, stock)
+-- #### PRODUCTION RATE #### --
+
+-- factory.lua's own constants: no cycle is shorter than 15 seconds, and a plan with less
+-- production capacity than 100 counts as 100.
+local MINIMUM_TIME_TO_PRODUCE = 15.0
+local MINIMUM_CAPACITY = 100
+
+-- "faction:name" -> {blocks, capacity}. Reading a plan's statistics means loading the
+-- whole plan out of the database row, which for a large station is thousands of blocks -
+-- and /stations is the endpoint the poller calls on every pass. Production capacity only
+-- changes when the plan does, so it is kept until the block count moves.
+local capacityCache = {}
+
+local function productionCapacityOf(entry)
+    local key = tostring(safe(function() return entry.faction end, "")) .. ":"
+        .. tostring(safe(function() return entry.name end, ""))
+    local blocks = safe(function() return entry.numBlocks end, 0)
+
+    local cached = capacityCache[key]
+    if cached and cached.blocks == blocks then return cached.capacity end
+
+    local capacity = safe(function() return entry:getPlan():getStats().productionCapacity end)
+    capacity = tonumber(capacity)
+
+    capacityCache[key] = {blocks = blocks, capacity = capacity}
+
+    return capacity
+end
+
+-- Factory.refreshProductionTime() from data/scripts/entity/merchants/factory.lua. A cycle
+-- takes longer the more its output is worth and the less production capacity the plan
+-- has, and runs faster for higher-level goods:
+--
+--   timeToProduce = max(15, value of results and waste / capacity / (1 + level / 100))
+--
+-- Every slot runs a cycle of that length in parallel, so what a station can turn over in an
+-- hour is slots * 3600 / timeToProduce - with every slot busy, which is the station's
+-- ceiling rather than what it is doing right now. A cycle started with an optional
+-- ingredient in the bay advances twice as fast, which is `boost`.
+local function rateOf(production, slots, capacity)
+    local value, level, samples = 0, 0, 0
+
+    for _, side in ipairs({production.results or {}, production.garbages or {}}) do
+        for _, item in pairs(side) do
+            local reference = goods and goods[item.name or ""] or nil
+            if reference then
+                value = value + Serialize.number(reference.price, 0) * Serialize.number(item.amount, 0)
+                level = level + (tonumber(reference.level) or 0)
+                samples = samples + 1
+            end
+        end
+    end
+
+    if samples > 0 then level = level / samples end
+
+    local known = capacity ~= nil
+    local effective = math.max(MINIMUM_CAPACITY, capacity or 0)
+    local cycle = math.max(MINIMUM_TIME_TO_PRODUCE, value / effective / (1 + level / 100))
+
+    local optional = false
+    for _, item in pairs(production.ingredients or {}) do
+        if item.optional ~= nil and item.optional ~= 0 then optional = true end
+    end
+
+    return
+    {
+        cycleSeconds = cycle,
+        cyclesPerHour = slots * 3600 / cycle,
+        productionCapacity = capacity,
+        -- False when the plan could not be read, in which case the game's own floor of
+        -- 100 stands in for it: the slowest the station could possibly be.
+        capacityKnown = known,
+        boost = optional and 2 or nil,
+    }
+end
+
+local function perHour(side, cyclesPerHour)
+    local total = 0
+
+    for _, item in ipairs(side) do
+        item.perHour = item.amount * cyclesPerHour
+        total = total + item.value * cyclesPerHour
+    end
+
+    return total
+end
+
+local function productionOf(values, stock, capacity)
     local production = values.production
     if type(production) ~= "table" then return nil end
 
@@ -284,6 +371,12 @@ local function productionOf(values, stock)
     local inputValue = valueOf(ingredients)
     local outputValue = valueOf(results) + valueOf(garbage)
 
+    local slots = Serialize.number(values.maxNumProductions, 0)
+    local rate = rateOf(production, slots, capacity)
+
+    local inputPerHour = perHour(ingredients, rate.cyclesPerHour)
+    local outputPerHour = perHour(results, rate.cyclesPerHour) + perHour(garbage, rate.cyclesPerHour)
+
     return
     {
         -- The template the game builds the station's title from, e.g. "${good} Mine ${size}",
@@ -296,7 +389,7 @@ local function productionOf(values, stock)
         results = results,
         garbage = garbage,
         -- How many cycles the station can have in flight, and how many it does.
-        slots = Serialize.number(values.maxNumProductions, 0),
+        slots = slots,
         running = running,
         active = #running,
         -- Base value in and out of one cycle, at the goods index's own prices. Not what
@@ -305,6 +398,12 @@ local function productionOf(values, stock)
         inputValue = inputValue,
         outputValue = outputValue,
         margin = outputValue - inputValue,
+        -- The same at full throughput for an hour, which is what makes two stations
+        -- comparable: a cycle's length differs from one line to the next.
+        rate = rate,
+        inputValuePerHour = inputPerHour,
+        outputValuePerHour = outputPerHour,
+        marginPerHour = outputPerHour - inputPerHour,
         shuttleVolume = Serialize.number(values.shuttleVolume),
     }
 end
@@ -334,6 +433,7 @@ function Economy.of(entry, cargos, capacity)
     local byBasename = {}
     local trading, production
     local anySecured = false
+    local planCapacity, capacityRead = nil, false
 
     for index, path in pairs(scripts) do
         local name = basename(path)
@@ -348,7 +448,10 @@ function Economy.of(entry, cargos, capacity)
         if type(values) == "table" then
             anySecured = true
             trading = trading or tradingIn(values)
-            production = production or productionOf(values, stock)
+            if not production and type(values.production) == "table" and not capacityRead then
+                planCapacity, capacityRead = productionCapacityOf(entry), true
+            end
+            production = production or productionOf(values, stock, planCapacity)
         end
     end
 

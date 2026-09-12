@@ -246,6 +246,8 @@ if (str_starts_with($path, '/history')) {
         'owner' => (string) ($query['owner'] ?? ''),
         'from' => (int) ($query['from'] ?? 0),
         'to' => (int) ($query['to'] ?? 0),
+        'x' => isset($query['x']) && $query['x'] !== '' ? (int) $query['x'] : null,
+        'y' => isset($query['y']) && $query['y'] !== '' ? (int) $query['y'] : null,
         'limit' => max(0, min(20000, (int) ($query['limit'] ?? 2000))),
     ];
 
@@ -276,7 +278,8 @@ if (str_starts_with($path, '/history')) {
     }
 
     if ($method === 'GET' && $what === '/economy/series') {
-        reply(200, $history->economySeries($filter, (string) ($query['bucket'] ?? 'hour')));
+        reply(200, $history->economySeries($filter, (string) ($query['bucket'] ?? 'hour'),
+                                           ($query['by'] ?? '') === 'ship'));
     }
 
     if ($method === 'GET' && $what === '/economy/goods') {
