@@ -1107,7 +1107,7 @@
       var hits = cargoMatches(ship.name);
       var people = peopleMatches(ship.name);
       var sub = [];
-      if (ship.status) { sub.push(esc(ship.status)); }
+      if (ship.status && !looksLikeJson(ship.status)) { sub.push(esc(ship.status)); }
       sub.push(coords(ship.position));
       if (ship.owner && ship.owner.kind === 'alliance') { sub.push('alliance'); }
       if (people.length) {
@@ -1233,7 +1233,7 @@
 
     var bits = [d.type || '', coords(d.position)];
     if (d.owner) { bits.push(d.owner.kind === 'alliance' ? 'alliance craft' : esc(d.owner.name)); }
-    if (d.status) { bits.push(esc(d.status)); }
+    if (d.status && !looksLikeJson(d.status)) { bits.push(esc(d.status)); }
     $('#ship-sub').innerHTML = bits.filter(Boolean).join(' · ');
 
     var badges = availabilityBadge(d) + usableBadge(d);
@@ -1417,14 +1417,76 @@
       ['icon', d.icon ? pathLabel(d.icon) : '—']
     ])));
 
+    /* orderInfo is only worth a line when it is prose. Chain state comes back parsed on
+       `orders`; a JSON string the server could not decode is still not for reading. */
     var statusMessage = message(d.statusMessage);
-    var header = statusMessage
-      ? '<div class="okbox"><b>' + esc(statusMessage) + '</b>'
-        + (d.orderInfo ? ' <span class="mute2">· ' + esc(d.orderInfo) + '</span>' : '')
+    var info = d.orders || looksLikeJson(d.orderInfo) ? '' : (d.orderInfo || '');
+    var header = statusMessage || info
+      ? '<div class="okbox"><b>' + esc(statusMessage || info) + '</b>'
+        + (statusMessage && info ? ' <span class="mute2">· ' + esc(info) + '</span>' : '')
         + '</div>'
       : '';
 
-    $('#sv-overview').innerHTML = header + '<div class="cards">' + cards.join('') + '</div>';
+    $('#sv-overview').innerHTML = header + ordersCard(d.orders)
+      + '<div class="cards">' + cards.join('') + '</div>';
+  }
+
+  function looksLikeJson(text) {
+    return typeof text === 'string' && /^\s*[\[{]/.test(text);
+  }
+
+  // "hullRatio" -> "hull ratio"
+  function words(key) {
+    return String(key).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+  }
+
+  function scalarText(value) {
+    if (typeof value === 'boolean') { return value ? 'yes' : 'no'; }
+    if (typeof value === 'number') { return num(value, value % 1 ? 2 : 0); }
+    return pathLabel(value);
+  }
+
+  /* The ship database's copy of the order chain: what is queued, which link is running
+     (activeIndex is the engine's 1-based index) and how the craft defends itself. */
+  function ordersCard(orders) {
+    if (!orders) { return ''; }
+
+    var chain = orders.chain || [];
+    var active = orders.finished ? 0 : (orders.activeIndex || 0);
+
+    var list = chain.length
+      ? '<ol class="order-list">' + chain.map(function (link, i) {
+          var state = active === 0 ? 'queued' : (i + 1 < active ? 'done' : (i + 1 === active ? 'running' : 'queued'));
+          var tags = [];
+          if (link.sector) { tags.push(esc(coords(link.sector))); }
+          if (link.gate === true) { tags.push('gate'); }
+          if (link.gate === false) { tags.push('wormhole'); }
+          return '<li class="' + state + '"><span class="order-name">'
+            + pathLabel(link.name || ('action ' + link.action)) + '</span>'
+            + (tags.length ? ' <span class="mute2">' + tags.join(' · ') + '</span>' : '')
+            + (state === 'running' ? ' <span class="badge info">running</span>' : '')
+            + '</li>';
+        }).join('') + '</ol>'
+      : '<div class="mute2">no orders queued</div>';
+
+    var progress = orders.finished
+      ? '<span class="badge good">finished</span>'
+      : (chain.length && active ? 'order ' + active + ' of ' + chain.length : '');
+
+    var rows = [];
+    if (orders.sector) { rows.push(['chain at', esc(coords(orders.sector))]); }
+    if (orders.defense) { rows.push(['defense', esc(orders.defense)]); }
+    [orders.autoAI, orders.extra].forEach(function (group) {
+      Object.keys(group || {}).sort().forEach(function (key) {
+        var value = group[key];
+        var shown = group === orders.autoAI && /ratio$/i.test(key) ? pct(value) : scalarText(value);
+        rows.push([esc(words(key)), shown]);
+      });
+    });
+
+    return '<div class="cards"><div class="card wide"><h3>Orders'
+      + (progress ? ' <span class="mute2">' + progress + '</span>' : '') + '</h3>'
+      + list + (rows.length ? kv(rows) : '') + '</div></div>';
   }
 
   /* ================================= CARGO ================================= */
@@ -2581,7 +2643,8 @@
   function chainHtml(chain, activeIndex) {
     if (!chain || !chain.length) { return '<span class="mute2">empty</span>'; }
     return chain.map(function (link, i) {
-      return '<span class="' + (i === activeIndex ? 'active' : 'dim') + '">'
+      // activeIndex is the engine's 1-based currentIndex.
+      return '<span class="' + (i + 1 === activeIndex ? 'active' : 'dim') + '">'
         + pathLabel(link.name || link.action) + '</span>';
     }).join(' <span class="dim">→</span> ');
   }

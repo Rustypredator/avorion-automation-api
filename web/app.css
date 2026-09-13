@@ -206,6 +206,14 @@ main { flex: 1 1 auto; overflow: hidden; min-height: 0; }
 .card { background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px; padding: 10px 12px; }
 .card h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); margin-bottom: 8px; }
 .card.wide { grid-column: 1 / -1; }
+.card h3 .mute2 { text-transform: none; letter-spacing: 0; margin-left: 6px; }
+.cards + .cards { margin-top: 10px; }
+
+.order-list { margin: 0 0 8px; padding-left: 22px; font-size: 12px; }
+.order-list li { padding: 1px 0; }
+.order-list li.done { color: var(--text-mute); }
+.order-list li.done .order-name { text-decoration: line-through; }
+.order-list li.running .order-name { color: var(--accent); font-weight: 600; }
 
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; font-size: 12px; }
 .kv dt { color: var(--text-dim); white-space: nowrap; }

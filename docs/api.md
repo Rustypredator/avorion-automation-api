@@ -80,6 +80,28 @@ Includes every field from the listing, plus:
 | `systems`, `hangar` | installed subsystems and fighter squads |
 | `requirements` | crew / turret slot / fighter start / fighter squad checks |
 | `blocks`, `planValue`, `reconstructionValue` | |
+| `orders` | the order chain's state, decoded from the engine's JSON; `null` when there is none. See below. |
+| `orderInfo` | the engine's order info string, verbatim. Prefer `orders`. |
+
+`orders` uses the same chain shape as the order events, plus where each link goes:
+
+```json
+{
+  "chain": [
+    {"name": "Jump", "action": 1, "sector": {"x": -309, "y": 258}},
+    {"name": "Fly Through", "action": 11, "gate": true, "sector": {"x": -308, "y": 249}}
+  ],
+  "activeIndex": 2,
+  "finished": false,
+  "sector": {"x": -309, "y": 258},
+  "defense": "Enemy ships seen: attack combat ships",
+  "autoAI": {"hullRatio": 0.8, "messages": 1}
+}
+```
+
+`activeIndex` is 1-based, `0` when nothing runs. `gate` is only present on fly-through
+links (`false` means a wormhole). `extra` holds any other top-level values a script put in
+the chain state, and is left out when there are none.
 
 Errors: `404 no_such_ship` when the caller does not own it, `404 no_ship_data` when it is
 owned but has no database row yet.

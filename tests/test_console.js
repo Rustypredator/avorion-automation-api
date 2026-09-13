@@ -140,7 +140,18 @@ const hound = {
     position: { x: 1, y: 2 }, usable: { ok: true }, availability: 'Available',
     cargo: { capacity: 100, free: 100, used: 0, goods: [] },
     durability: { max: 1, percentage: 1 }, shields: {}, energy: {}, turrets: [], systems: [],
-    hangar: { squads: [], fighters: 0 }, crew: { size: 0, maxSize: 0, byProfession: [], ideal: [] }
+    hangar: { squads: [], fighters: 0 }, crew: { size: 0, maxSize: 0, byProfession: [], ideal: [] },
+    // The engine's raw chain state rides along on orderInfo; the console reads `orders`.
+    orderInfo: '{"chain":[{"action":1.0,"name":"Jump"}],"currentIndex":2.0}',
+    orders: {
+        chain: [
+            { name: 'Jump', action: 1, sector: { x: -313, y: 259 } },
+            { name: 'Fly Through', action: 11, gate: true, sector: { x: -308, y: 249 } },
+            { name: 'Jump', action: 1, sector: { x: -312, y: 245 } }
+        ],
+        activeIndex: 2, finished: false, sector: { x: -313, y: 259 },
+        defense: 'Enemy ships seen: attack combat ships', autoAI: { hullRatio: 0.8 }
+    }
 };
 
 /*
@@ -364,6 +375,18 @@ const ready = window.document.readyState === 'loading'
 
     check(/Passengers \(1\)/.test($('#sv-overview').textContent), 'the overview lists passengers');
     check(/Oren Dask/.test($('#sv-overview').textContent), 'by name');
+
+    console.log('\norders');
+
+    const overview = $('#sv-overview');
+    check(!/currentIndex|"chain"/.test(overview.textContent), 'raw order JSON is never printed');
+    const links = overview.querySelectorAll('.order-list li');
+    check(links.length === 3, 'every chain link is listed');
+    check(links[1].classList.contains('running') && links[0].classList.contains('done'),
+          'the 1-based active index marks the second link as running');
+    check(/order 2 of 3/.test(overview.textContent), 'with its place in the chain');
+    check(/attack combat ships/.test(overview.textContent) && /80%/.test(overview.textContent),
+          'and the defensive AI settings');
 
     const search = $('#fleet-search');
     search.value = 'oren';
