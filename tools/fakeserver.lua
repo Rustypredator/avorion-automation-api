@@ -39,6 +39,10 @@ function crew:getWorkForce() return {[{value = 0}] = 3.5} end
 function crew:getNumMembersByProfession()
     return {[{value = 0}] = 8, [{value = 5}] = 120, [{value = 3}] = 52}
 end
+function crew:getPassengers()
+    return {name = "Oren", displayName = "Oren Dask", level = 4, tier = 1, primaryClass = 3,
+            salary = 1100, experiencePercentage = 0.2}
+end
 
 local function good(name, price, size, flags)
     local g = {name = name, plural = name, price = price, size = size}

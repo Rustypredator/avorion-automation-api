@@ -75,10 +75,7 @@ end
 
 -- #### COMPONENTS #### --
 
-local function captainOf(entry)
-    local captain = safe(function() return entry:getCaptain() end)
-    if not captain then return nil end
-
+local function describeCaptain(captain)
     local classes = Json.array({})
     for _, class in ipairs({captain.primaryClass, captain.secondaryClass}) do
         if class and class ~= 0 then
@@ -104,6 +101,29 @@ local function captainOf(entry)
         classes = classes,
         perks = perks,
     }
+end
+
+local function captainOf(entry)
+    local captain = safe(function() return entry:getCaptain() end)
+    if not captain then return nil end
+
+    return describeCaptain(captain)
+end
+
+-- Captains riding along rather than in command: bought at a station, or moved off another
+-- craft. They are Captain objects in the same shape, returned as varargs off the crew.
+local function passengersOf(entry)
+    local result = Json.array({})
+
+    local crew = safe(function() return entry:getCrew() end)
+    if not crew then return result end
+
+    for _, passenger in ipairs({safe(function() return crew:getPassengers() end)}) do
+        local ok, described = pcall(describeCaptain, passenger)
+        if ok then result[#result + 1] = described end
+    end
+
+    return result
 end
 
 local function crewBreakdown(crew)
@@ -340,6 +360,7 @@ function ShipData.detail(owner, name)
         Serialize.number(safe(function() return entry:getReconstructionValue() end), 0)
 
     result.captain = captainOf(entry)
+    result.passengers = passengersOf(entry)
     result.crew = crewOf(entry)
     result.cargo = cargoOf(entry)
     result.hyperspace = hyperspaceOf(entry)

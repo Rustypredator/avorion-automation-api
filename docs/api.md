@@ -65,6 +65,7 @@ Includes every field from the listing, plus:
 | field | notes |
 |---|---|
 | `captain` | `null` if none. `classes` resolve to names (`Miner`, `Merchant`, ...), `perks` are ints. |
+| `passengers` | captains aboard but not in command, each in the same shape as `captain`; empty array if none |
 | `crew` | `size`, `maxSize`, `requirementsFulfilled`, and `byProfession` / `ideal` breakdowns |
 | `cargo` | `capacity`, `free`, `used`, and `goods` flattened to an array |
 | `hyperspace` | `range`, `cooldown`, `canPassRifts`, `impaired` |

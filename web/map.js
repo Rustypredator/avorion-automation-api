@@ -27,6 +27,12 @@
     originX: 0,
     originY: 0,
 
+    /* Screen position of the pointer over the canvas, or null. Names are only drawn
+       near it: a whole galaxy of labels at once is unreadable. */
+    cursor: null,
+    labelRadius: 160,
+    pendingFrame: false,
+
     onPick: null,      // (x, y, sector|null) -> void
     onShipPick: null,  // (name) -> void
 
@@ -62,14 +68,25 @@
           Map2.originX += e.clientX - lastX;
           Map2.originY += e.clientY - lastY;
           lastX = e.clientX; lastY = e.clientY;
+          Map2.cursor = pointer(e);
           Map2.draw();
           return;
         }
-        if (e.target !== canvas) { Map2.hideTip(); return; }
-        Map2.hover(pointer(e), e);
+        if (e.target !== canvas) {
+          Map2.hideTip();
+          if (Map2.cursor) { Map2.cursor = null; Map2.drawSoon(); }
+          return;
+        }
+        Map2.cursor = pointer(e);
+        Map2.drawSoon();
+        Map2.hover(Map2.cursor, e);
       });
 
-      canvas.addEventListener('mouseleave', function () { Map2.hideTip(); });
+      canvas.addEventListener('mouseleave', function () {
+        Map2.hideTip();
+        Map2.cursor = null;
+        Map2.drawSoon();
+      });
 
       canvas.addEventListener('wheel', function (e) {
         e.preventDefault();
@@ -311,6 +328,14 @@
       if (Map2.tip) { Map2.tip.classList.add('hidden'); }
     },
 
+    /* Pointer moves arrive faster than frames; coalesce them into one redraw. */
+    drawSoon: function () {
+      if (Map2.pendingFrame) { return; }
+      if (typeof requestAnimationFrame !== 'function') { Map2.draw(); return; }
+      Map2.pendingFrame = true;
+      requestAnimationFrame(function () { Map2.pendingFrame = false; Map2.draw(); });
+    },
+
     draw: function () {
       var ctx = Map2.ctx;
       if (!ctx) { return; }
@@ -395,7 +420,8 @@
 
   function drawSectors(ctx) {
     var size = clamp(Map2.scale * 0.55, 1, 6);
-    var labels = Map2.scale > 5;
+    // Close enough in that names fit beside their dots; still only near the pointer.
+    var labels = Map2.scale > 2;
     // A full galaxy is a few hundred sectors redrawn on every pan frame, so the viewport
     // is measured once rather than per sector.
     var view = Map2.size();
@@ -425,8 +451,9 @@
         ctx.stroke();
       }
 
-      if (labels && sec.name) {
-        ctx.fillStyle = 'rgba(125,140,163,.8)';
+      var near = labels && sec.name ? labelAlpha(p) : 0;
+      if (near) {
+        ctx.fillStyle = 'rgba(125,140,163,' + (0.85 * near).toFixed(3) + ')';
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(sec.name, p.x + r + 3, p.y + 3);
       }
@@ -511,8 +538,9 @@
       ctx.arc(last.x, last.y, 5, 0, Math.PI * 2);
       ctx.stroke();
 
-      if (labels) {
-        ctx.fillStyle = color.replace('ALPHA', '0.85');
+      var nearTrack = labels ? labelAlpha(last) : 0;
+      if (nearTrack) {
+        ctx.fillStyle = color.replace('ALPHA', (0.85 * nearTrack).toFixed(3));
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(track.ship, last.x + 7, last.y - 5);
       }
@@ -588,8 +616,9 @@
         ctx.fill();
         ctx.stroke();
 
-        if (labels) {
-          ctx.fillStyle = 'rgba(204,214,228,.9)';
+        var nearShip = labels ? labelAlpha(p) : 0;
+        if (nearShip) {
+          ctx.fillStyle = 'rgba(204,214,228,' + (0.9 * nearShip).toFixed(3) + ')';
           ctx.font = '10px ui-monospace, monospace';
           ctx.fillText(s.name, p.x + 7, p.y + 3);
         }
@@ -609,6 +638,17 @@
     ctx.moveTo(p.x, p.y - r); ctx.lineTo(p.x, p.y - 3);
     ctx.moveTo(p.x, p.y + 3); ctx.lineTo(p.x, p.y + r);
     ctx.stroke();
+  }
+
+  /* How strongly to draw a label at screen point P: full near the pointer, fading out
+     towards the edge of the label radius, and nothing beyond it or with no pointer. */
+  function labelAlpha(p) {
+    var c = Map2.cursor;
+    if (!c) { return 0; }
+    var d = Math.sqrt((p.x - c.x) * (p.x - c.x) + (p.y - c.y) * (p.y - c.y));
+    var r = Map2.labelRadius;
+    if (d >= r) { return 0; }
+    return clamp((r - d) / (r * 0.4), 0, 1);
   }
 
   /* -------------------------------- colour -------------------------------- */

@@ -175,6 +175,10 @@ function escortShip(name, x, y) {
 const wingman = escortShip('Wingman', 1, 2);
 const farScout = escortShip('Far Scout', 40, 40);
 
+// Only Ore Hound carries anyone, so a search for her finds exactly one craft.
+hound.passengers = [{ name: 'Oren', displayName: 'Oren Dask', level: 4,
+                      classes: [{ value: 3, name: 'Merchant' }], perks: [] }];
+
 /*
  * A trade preview whose routes depend on the area, the way the game's do. Ore Hound sits
  * at 1:2. Oil sells at 15:2 - inside any area reaching 15 to the east. Gold sells at
@@ -344,6 +348,26 @@ const ready = window.document.readyState === 'loading'
     check(!tab('travel').hidden, 'and its Travel tab');
     check(tab('economy').hidden, 'and is offered no Economy tab');
     check(tab('production').hidden, 'nor a Production tab');
+
+    console.log('\npassengers');
+
+    check(/Passengers \(1\)/.test($('#sv-overview').textContent), 'the overview lists passengers');
+    check(/Oren Dask/.test($('#sv-overview').textContent), 'by name');
+
+    const search = $('#fleet-search');
+    search.value = 'oren';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(1200);
+
+    const found = $$('#fleet-rows [data-ship]');
+    check(found.length === 1 && found[0].dataset.ship === 'Ore Hound',
+          'searching a passenger finds the craft carrying them');
+    check(/passenger Oren Dask/.test(found[0] ? found[0].textContent : ''),
+          'and says who matched');
+
+    search.value = '';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(100);
 
     console.log('\nsubtabs for a station');
 

@@ -924,7 +924,20 @@
                coords(ship.position), ship.usable && ship.usable.code,
                ship.owner && ship.owner.name].join(' ').toLowerCase();
     if (hay.indexOf(S.search) !== -1) { return true; }
-    return cargoMatches(ship.name).length > 0;
+    return cargoMatches(ship.name).length > 0 || peopleMatches(ship.name).length > 0;
+  }
+
+  /* The captain and passengers aboard a craft that the search term names, off the same
+     per-craft index as the hold - it is the same detail read. */
+  function peopleMatches(name) {
+    if (!S.search) { return []; }
+
+    var entry = S.cargoIndex[name];
+    if (!entry || !entry.people) { return []; }
+
+    return entry.people.filter(function (p) {
+      return p.hay.indexOf(S.search) !== -1;
+    });
   }
 
   /* The goods in a craft's hold that the current search term names. Empty for anything
@@ -949,10 +962,22 @@
   var cargoPending = {};
 
   function indexCargo(name, detail) {
+    detail = detail || {};
+    var aboard = (detail.captain ? [{ role: 'captain', who: detail.captain }] : [])
+      .concat((detail.passengers || []).map(function (p) { return { role: 'passenger', who: p }; }));
+
     S.cargoIndex[name] = {
       at: Date.now(),
-      goods: cargoGoods(detail || {}).map(function (g) {
+      goods: cargoGoods(detail).map(function (g) {
         return { name: String(g.name || g.good || ''), amount: g.amount || 0 };
+      }),
+      people: aboard.map(function (a) {
+        var label = String(a.who.displayName || a.who.name || '');
+        return {
+          role: a.role,
+          name: label,
+          hay: [label, a.who.name, a.who.nickName].concat(names(a.who.classes)).join(' ').toLowerCase()
+        };
       })
     };
   }
@@ -1029,15 +1054,21 @@
     var html = rows.map(function (ship) {
       var last = lastEventFor(ship.name);
       var hits = cargoMatches(ship.name);
+      var people = peopleMatches(ship.name);
       var sub = [];
       if (ship.status) { sub.push(esc(ship.status)); }
       sub.push(coords(ship.position));
       if (ship.owner && ship.owner.kind === 'alliance') { sub.push('alliance'); }
+      if (people.length) {
+        sub.push('· <span class="hit-goods">' + people.map(function (p) {
+          return p.role + ' ' + esc(p.name);
+        }).join(', ') + '</span>');
+      }
       if (hits.length) {
         sub.push('· <span class="hit-goods">carrying ' + hits.map(function (g) {
           return esc(g.name) + ' ' + num(g.amount);
         }).join(', ') + '</span>');
-      } else if (last) { sub.push('· ' + esc(eventSummaryText(last))); }
+      } else if (last && !people.length) { sub.push('· ' + esc(eventSummaryText(last))); }
 
       return '<div class="ship-row' + (S.selected === ship.name ? ' sel' : '')
         + '" data-ship="' + esc(ship.name) + '">'
@@ -1245,6 +1276,17 @@
     } else {
       cards.push(meterCard('Captain',
         '<div class="note warn">No captain ' + explain('no-captain', 'warn') + '</div>'));
+    }
+
+    /* --- passengers --------------------------------------------------- */
+    var passengers = d.passengers || [];
+    if (passengers.length) {
+      cards.push(meterCard('Passengers (' + passengers.length + ')',
+        '<table><tbody>' + passengers.map(function (p) {
+          return '<tr><td>' + esc(p.displayName || p.name || '—') + '</td>'
+            + '<td class="mute2">' + esc(names(p.classes).join(', ') || '—') + '</td>'
+            + '<td class="num">L' + num(p.level) + '</td></tr>';
+        }).join('') + '</tbody></table>'));
     }
 
     /* --- crew --------------------------------------------------------- */

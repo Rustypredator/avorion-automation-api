@@ -32,6 +32,10 @@ end
 function crew:getNumMembersByProfession()
     return {[{value = CrewProfessionType.Pilot}] = 4, [{value = CrewProfessionType.Miner}] = 12}
 end
+function crew:getPassengers()
+    return {name = "Oren", displayName = "Oren Dask", level = 1, tier = 0, primaryClass = 3},
+           {name = "Ila", displayName = "Ila", level = 2, tier = 1}
+end
 
 Mock.addShip(1, "Ore Hound",
 {
@@ -151,6 +155,11 @@ check(#ship.captain.classes == 2, "both captain classes listed")
 check(ship.captain.classes[1].name == "Miner", "class int maps to its name")
 check(#ship.captain.perks == 2, "perks listed")
 
+check(#ship.passengers == 2, "every passenger listed")
+check(ship.passengers[1].displayName == "Oren Dask", "passenger identity")
+check(ship.passengers[1].classes[1].name == "Merchant", "passenger class maps to its name")
+check(#ship.passengers[2].classes == 0, "a classless passenger has an empty class list")
+
 check(ship.crew.size == 42, "crew size")
 check(ship.crew.requirementsFulfilled == true, "crew requirements")
 check(#ship.crew.byProfession == 2, "crew broken down by profession")
@@ -180,6 +189,7 @@ check(wreck.availability == "Destroyed", "destroyed availability")
 
 local _, scout = call("GET", "/ships/Little%20Scout")
 check(scout.captain == nil, "a captainless ship reports no captain")
+check(Json.isArray(scout.passengers) and #scout.passengers == 0, "no passengers is still an array")
 check(Json.isArray(scout.turrets) and #scout.turrets == 0, "empty turret list is still an array")
 
 -- everything must survive an encode/decode round trip
