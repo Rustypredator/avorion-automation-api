@@ -18,7 +18,8 @@
     remember: 'avoconsole.remember',
     filters: 'avoconsole.filters',
     dock: 'avoconsole.dock',
-    history: 'avoconsole.history'
+    history: 'avoconsole.history',
+    basis: 'avoconsole.basis'
   };
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
@@ -74,9 +75,12 @@
     economyWindow: 86400,
 
     /* Every station at once, off /stations, for the Industry view. `sector` is the
-       "x:y" key of the sector being drawn. */
+       "x:y" key of the sector being drawn. `observed` is what the bridge has measured of
+       each sector's stations, and `basis` whether the chain is worked out from that or
+       from the ceiling the mod computes out of each station's row. */
     view: 'fleet',
-    industry: { stations: null, error: null, sector: null, history: {} },
+    industry: { stations: null, error: null, sector: null, history: {}, observed: {},
+                basis: 'observed' },
 
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
     busy: {}
@@ -443,14 +447,36 @@
       + 'what could feed what, not a record of deliveries.</p>',
 
     'industry-balance':
-      '<p>What the sector makes and uses of each good in an hour, with every production '
-      + 'slot running. A good used faster than it is made is <b>bought in</b> for the '
+      '<p>What the sector makes and uses of each good in an hour, at the rates picked under '
+      + 'Projected revenue: as measured, or with every production slot running. A good used '
+      + 'faster than it is made is <b>bought in</b> for the '
       + 'difference, even when a station here makes some of it; one made faster than it is '
       + 'used is <b>left over</b>.</p>'
       + '<p>Rates come from the game\'s own cycle time for each line, which depends on the '
       + 'value of what it makes and on the station\'s production capacity. Optional '
       + 'ingredients are not counted as demand, since a line runs without them; supplied, '
-      + 'they make its cycles twice as fast. Worth is at the goods index\'s base price.</p>',
+      + 'they make its cycles twice as fast. Worth is at what the good actually traded for '
+      + 'here when it has, and at the goods index\'s base price when it has not.</p>',
+
+    'industry-basis':
+      '<p><b>Measured</b> works the chain out from what each station was recorded doing: the '
+      + 'production cycles it actually ran against its slot time, and the prices its goods '
+      + 'actually traded at. <b>Ceiling</b> is what the game\'s own formula says the line '
+      + 'could do with every slot busy and every sale at base price.</p>'
+      + '<p>Measurements are taken inside the stations while their sector is loaded, plus the '
+      + 'catch-up the game runs when an unloaded sector loads again. The window above picks '
+      + 'how far back they reach.</p>',
+
+    'industry-unmeasured':
+      'A station is measured once the bridge has at least ten minutes of its production '
+      + 'windows, or the mod has that much since the server started. A station whose sector '
+      + 'has not been loaded since, or a server running a mod older than the measurements, '
+      + 'has none &mdash; its ceiling is used instead.',
+
+    'industry-traded':
+      'Credits the measured stations actually took in from sales and population, less what '
+      + 'they paid for goods, per hour of measured time. Deliveries between your own '
+      + 'stations change hands for nothing and are not in it.',
 
     'industry-no-rates':
       'The mod on the server predates production rates. Update it, and the balance, the '
@@ -462,10 +488,11 @@
       + 'is also the sum of the stations\' own margins an hour &mdash; less what they spend '
       + 'on optional ingredients, which a station\'s margin counts and the balance does '
       + 'not.</p>'
-      + '<p>It is a ceiling, not a forecast. A shortfall nobody delivers stops the lines '
-      + 'waiting on it, a full bay stops a line producing, and a sale is at the base price '
-      + 'only before supply, demand and relations move it. <b>Earned over time</b> below '
-      + 'is what actually happened.</p>',
+      + '<p>On <b>ceiling</b> it is exactly that: every slot busy and every sale at the base '
+      + 'price. On <b>measured</b> each station runs at the rate it was recorded running, and '
+      + 'a good is priced at what it actually traded for here where it traded at all. '
+      + '<b>Busy</b> is the share of slot time a line had a cycle in, and says why when it '
+      + 'did not. <b>Earned over time</b> below is the station books\' own account.</p>',
 
     'industry-history':
       'Net earnings per bucket out of the bridge\'s own samples, one colour per station: '
@@ -619,6 +646,8 @@
        so leaving it open by default means every new session starts with a third of the
        map hidden behind a log nobody asked to read. */
     setDock(localStorage.getItem(LS.dock) === 'open');
+
+    if (localStorage.getItem(LS.basis) === 'ceiling') { S.industry.basis = 'ceiling'; }
   }
 
   function saveConnection() {
@@ -3174,6 +3203,34 @@
     if (S.filters.owner !== 'all') { filter.owner = S.filters.owner; }
     if (S.economyWindow) { filter.from = Math.floor(Date.now() / 1000) - S.economyWindow; }
 
+    return Promise.all([loadSectorSeries(key, filter), loadSectorObserved(key, filter)]);
+  }
+
+  /* What the sector's stations actually did over the window, measured from inside them:
+     cycles against slot time, units per good, trades at the prices they happened at. A
+     bridge or mod that predates the measurements answers 404 or an empty list, and the
+     chain then falls back to the ceiling station by station. */
+  function loadSectorObserved(key, filter) {
+    var measured = { x: filter.x, y: filter.y };
+    if (filter.owner) { measured.owner = filter.owner; }
+    if (filter.from) { measured.from = filter.from; }
+
+    return Api.get('/history/economy/observed', measured,
+                   { priority: Api.P.POLL, label: 'sector observed' })
+      .then(function (body) {
+        var byName = {};
+        (body.stations || []).forEach(function (row) { byName[row.ship] = row; });
+        S.industry.observed[key] = { stations: byName };
+        if (S.industry.sector === key) { renderIndustry(); }
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.industry.observed[key] = { unavailable: error };
+        if (S.industry.sector === key) { renderIndustry(); }
+      });
+  }
+
+  function loadSectorSeries(key, filter) {
     return Api.get('/history/economy/series', withBucket(filter),
                    { priority: Api.P.POLL, label: 'sector series' })
       .then(function (body) {
@@ -3200,8 +3257,15 @@
   function setSectorWindow(seconds) {
     S.economyWindow = seconds;
     S.industry.history = {};
+    S.industry.observed = {};
     renderIndustry();
     loadSectorHistory(S.industry.sector);
+  }
+
+  function setIndustryBasis(basis) {
+    S.industry.basis = basis === 'ceiling' ? 'ceiling' : 'observed';
+    try { localStorage.setItem(LS.basis, S.industry.basis); } catch (e) { /* not worth failing over */ }
+    renderIndustry();
   }
 
   function sectorKey(station) {
@@ -3245,6 +3309,128 @@
     return item.perHour != null ? Number(item.perHour) : 0;
   }
 
+  function extend(target) {
+    for (var i = 1; i < arguments.length; i++) {
+      for (var key in arguments[i]) {
+        if (Object.prototype.hasOwnProperty.call(arguments[i], key)) { target[key] = arguments[i][key]; }
+      }
+    }
+    return target;
+  }
+
+  /* ---------------------------- measured rates ---------------------------- */
+
+  /* Under this much measured time a rate says more about when recording started than
+     about the line: a factory caught between two windows, or one trade that happens to
+     be the only one. Ten minutes is ten production windows. */
+  var MIN_OBSERVED = 600;
+
+  function measurement(production, goods, span, tradedPerHour, source) {
+    var byGood = {};
+    var traded = 0;
+
+    (goods || []).forEach(function (good) {
+      byGood[good.good || good.name] = good;
+      traded += ((good.sold && good.sold.credits) || 0) + ((good.consumed && good.consumed.credits) || 0)
+        - ((good.bought && good.bought.credits) || 0);
+    });
+
+    var seconds = production.seconds || 0;
+
+    return {
+      source: source,
+      span: span,
+      cyclesPerHour: Number(production.cyclesPerHour) || 0,
+      utilization: production.utilization != null ? Number(production.utilization) : null,
+      starved: seconds ? (production.starvedSeconds || 0) / seconds : 0,
+      blocked: seconds ? (production.blockedSeconds || 0) / seconds : 0,
+      goods: byGood,
+      tradedPerHour: tradedPerHour != null ? Number(tradedPerHour)
+        : (span > 0 ? traded * 3600 / span : null)
+    };
+  }
+
+  /* What a station has been measured doing: the bridge's stored window for its sector
+     first, since that covers the window picked; the mod's own totals since the server
+     started otherwise. Null when neither has enough to go on. */
+  function measurementOf(station) {
+    var recorded = S.industry.observed[sectorKey(station)];
+    var row = recorded && recorded.stations && recorded.stations[station.name];
+
+    if (row && row.production && row.span >= MIN_OBSERVED) {
+      return measurement(row.production, row.goods, row.span,
+                         row.traded ? row.traded.perHour : null, 'recorded');
+    }
+
+    var live = station.economy && station.economy.observed;
+    var production = live && live.production;
+    if (production) {
+      var span = (production.seconds || 0) + (production.catchupSeconds || 0);
+      if (span >= MIN_OBSERVED) { return measurement(production, live.goods, span, null, 'live'); }
+    }
+
+    return null;
+  }
+
+  /* A copy of the station with its line re-rated from what it was measured doing, so
+     every card below works from real rates without knowing where they came from.
+
+     Units an hour come from the measured goods themselves, which already carry boosted
+     cycles and the catch-up after a reload. Each good also carries the price it actually
+     traded at, where it traded - a sale for what the line makes, a purchase for what it
+     takes in - which is what the balance and the projection price it at. */
+  function withMeasurement(station) {
+    var line = lineOf(station);
+    if (!line || !rated(station)) { return station; }
+
+    var m = measurementOf(station);
+    if (!m) { return station; }
+
+    var rate = function (item, side) {
+      var good = m.goods[item.name];
+      var measured = good && (side === 'in' ? good.usedPerHour : good.madePerHour);
+      if (measured != null) { return Number(measured); }
+      return side === 'in' && item.optional ? 0 : item.amount * m.cyclesPerHour;
+    };
+
+    var tradedAt = function (item, side) {
+      var good = m.goods[item.name];
+      var bucket = good && (side === 'in' ? good.bought : good.sold);
+      return bucket && bucket.units > 0 && bucket.unitPrice != null
+        ? { units: Number(bucket.units), price: Number(bucket.unitPrice) } : null;
+    };
+
+    var rerate = function (list, side) {
+      return (list || []).map(function (item) {
+        return extend({}, item, { perHour: rate(item, side), ceilingPerHour: item.perHour,
+                                  traded: tradedAt(item, side) });
+      });
+    };
+
+    var worth = function (list) {
+      return list.reduce(function (sum, item) { return sum + item.perHour * (Number(item.price) || 0); }, 0);
+    };
+
+    var ingredients = rerate(line.ingredients, 'in');
+    var results = rerate(line.results, 'out');
+    var garbage = rerate(line.garbage, 'out');
+
+    var measuredLine = extend({}, line, {
+      ingredients: ingredients,
+      results: results,
+      garbage: garbage,
+      rate: extend({}, line.rate, { cyclesPerHour: m.cyclesPerHour,
+                                    ceilingCyclesPerHour: line.rate.cyclesPerHour }),
+      inputValuePerHour: worth(ingredients),
+      outputValuePerHour: worth(results) + worth(garbage),
+      marginPerHour: worth(results) + worth(garbage) - worth(ingredients),
+      ceilingMarginPerHour: line.marginPerHour,
+      measured: m
+    });
+
+    return extend({}, station, { economy: extend({}, station.economy, { production: measuredLine }) });
+  }
+
   /* Which stations in a sector feed which, and how the sector's goods balance.
 
      `links` is the shape - who could supply whom - and is per good per pair of stations.
@@ -3266,21 +3452,37 @@
     var entry = function (item) {
       if (!balance[item.name]) {
         balance[item.name] = { good: item.name, price: Number(item.price) || 0,
-                               made: 0, used: 0, optional: 0 };
+                               made: 0, used: 0, optional: 0,
+                               sold: { units: 0, credits: 0 }, bought: { units: 0, credits: 0 } };
       }
       return balance[item.name];
+    };
+
+    // What a good actually traded at here, units-weighted across the stations that traded it.
+    var tally = function (bucket, item) {
+      if (!item.traded) { return; }
+      bucket.units += item.traded.units;
+      bucket.credits += item.traded.units * item.traded.price;
     };
 
     lines.forEach(function (station, index) {
       outputsOf(station).forEach(function (out) {
         push(makers, out.item.name, { at: index, item: out.item, waste: out.waste });
         entry(out.item).made += hourly(out.item);
+        tally(entry(out.item).sold, out.item);
       });
       inputsOf(station).forEach(function (item) {
         push(takers, item.name, { at: index, item: item });
         if (item.optional) { entry(item).optional += hourly(item); }
         else { entry(item).used += hourly(item); }
+        tally(entry(item).bought, item);
       });
+    });
+
+    Object.keys(balance).forEach(function (good) {
+      var b = balance[good];
+      b.sellPrice = b.sold.units ? b.sold.credits / b.sold.units : b.price;
+      b.buyPrice = b.bought.units ? b.bought.credits / b.bought.units : b.price;
     });
 
     var links = [];
@@ -3353,17 +3555,26 @@
       projection = { sold: 0, bought: 0, optional: 0 };
       Object.keys(balance).forEach(function (good) {
         var b = balance[good];
-        if (b.net > BALANCED) { projection.sold += b.net * b.price; }
-        if (b.net < -BALANCED) { projection.bought += -b.net * b.price; }
+        if (b.net > BALANCED) { projection.sold += b.net * b.sellPrice; }
+        if (b.net < -BALANCED) { projection.bought += -b.net * b.buyPrice; }
       });
       projection.net = projection.sold - projection.bought;
     }
+
+    /* How many of the lines are running on measured rates, and what the measured ones
+       actually traded an hour - money that changed hands, not a projection of it. */
+    var measuredLines = lines.filter(function (station) { return lineOf(station).measured; });
+    var traded = null;
+    measuredLines.forEach(function (station) {
+      var perHour = lineOf(station).measured.tradedPerHour;
+      if (perHour != null) { traded = (traded || 0) + perHour; }
+    });
 
     return {
       key: key, stations: here, lines: lines, rated: withRates,
       idle: here.filter(function (station) { return !lineOf(station); }),
       links: links, balance: balance, missing: missing, leaves: leaves, gaps: gaps,
-      projection: projection
+      projection: projection, measured: measuredLines.length, tradedPerHour: traded
     };
   }
 
@@ -3738,6 +3949,8 @@
       var starved = starvedOf(station);
 
       var sub = lineTitle(station) + ' · ' + numText(line.slots) + ' slots · '
+        + (line.measured && line.measured.utilization != null
+            ? Math.round(line.measured.utilization * 100) + '% busy · ' : '')
         + (analysis.rated
             ? (line.marginPerHour > 0 ? '+' : '') + (abbrev(line.marginPerHour) || numText(line.marginPerHour)) + ' ¢/h'
             : (line.margin > 0 ? '+' : '') + numText(line.margin) + ' ¢/cycle');
@@ -3759,6 +3972,14 @@
       var cycle = line.rate && line.rate.cycleSeconds
         ? '\none cycle every ' + numText(line.rate.cycleSeconds, 1) + ' s, '
           + numText(line.slots) + ' at a time' : '';
+
+      if (line.measured) {
+        cycle += '\nmeasured over ' + numText(line.measured.span / 3600, 1) + ' h: '
+          + numText(line.rate.cyclesPerHour, 1) + ' cycles/h of a possible '
+          + numText(line.rate.ceilingCyclesPerHour, 1)
+          + (line.measured.starved > 0.01 ? ', starved ' + Math.round(line.measured.starved * 100) + '% of the time' : '')
+          + (line.measured.blocked > 0.01 ? ', bay full ' + Math.round(line.measured.blocked * 100) + '% of the time' : '');
+      }
 
       nodes.push('<g class="inode' + (starved.length ? ' starved' : '')
         + '" data-station="' + esc(station.name) + '" data-owner="'
@@ -3857,7 +4078,11 @@
                       : '<span class="' + (b.net < 0 ? 'bad' : 'good') + '">'
                         + esc(rateText(b.net, true)) + '</span>') + '</td>'
                   + '<td class="num">' + (Math.abs(b.net) > BALANCED
-                      ? signedCredits(Math.round(b.net * b.price)) + '<span class="mute2">/h</span>'
+                      ? signedCredits(Math.round(b.net * (b.net > 0 ? b.sellPrice : b.buyPrice)))
+                        + '<span class="mute2">/h</span>'
+                        + ((b.net > 0 ? b.sold.units : b.bought.units)
+                            ? '<div class="mute2">at ' + num(b.net > 0 ? b.sellPrice : b.buyPrice, 1)
+                              + ' ¢ traded</div>' : '')
                       : '<span class="mute2">—</span>') + '</td>'
                 : '')
             + '<td>' + (here.join('<br>') || '<span class="mute2">—</span>') + '</td>'
@@ -3874,27 +4099,72 @@
     var p = analysis.projection;
     if (!p) { return ''; }
 
+    var observed = S.industry.basis === 'observed';
+
     var stations = analysis.lines.slice().sort(function (a, b) {
       return (lineOf(b).marginPerHour || 0) - (lineOf(a).marginPerHour || 0);
     });
 
+    var basis = '<div class="seg" id="industry-basis" data-value="' + S.industry.basis + '">'
+      + [['observed', 'measured'], ['ceiling', 'ceiling']].map(function (b) {
+          return '<button data-v="' + b[0] + '"' + (S.industry.basis === b[0] ? ' class="on"' : '')
+            + '>' + b[1] + '</button>';
+        }).join('')
+      + '</div>';
+
+    var unmeasured = analysis.lines.length - analysis.measured;
+    var note = observed && unmeasured
+      ? '<div class="note warn" style="margin:6px 0">' + numText(unmeasured) + ' of '
+        + numText(analysis.lines.length) + ' stations have no measurements yet, so their ceiling '
+        + 'stands in ' + explain('industry-unmeasured', 'warn') + '</div>'
+      : '';
+
+    var busy = function (line) {
+      var m = line.measured;
+      if (!m || m.utilization == null) { return '<span class="mute2">—</span>'; }
+
+      var tone = m.utilization >= 0.9 ? 'good' : (m.utilization >= 0.5 ? 'warn' : 'bad');
+      var why = [];
+      if (m.starved > 0.01) { why.push('starved ' + Math.round(m.starved * 100) + '%'); }
+      if (m.blocked > 0.01) { why.push('bay full ' + Math.round(m.blocked * 100) + '%'); }
+
+      return pct(m.utilization) + bar(m.utilization, tone)
+        + (why.length ? '<div class="mute2">' + esc(why.join(' · ')) + '</div>' : '');
+    };
+
+    var summary = [
+      ['sold on', credits(Math.round(p.sold)) + '<span class="mute2">/h</span>'],
+      ['bought in', credits(Math.round(p.bought)) + '<span class="mute2">/h</span>'],
+      ['net an hour', '<b>' + signedCredits(Math.round(p.net)) + '</b>'],
+      ['net a day', signedCredits(Math.round(p.net * 24))]
+    ];
+
+    if (analysis.tradedPerHour != null) {
+      summary.push(['traded an hour', signedCredits(Math.round(analysis.tradedPerHour))
+        + ' ' + explain('industry-traded')]);
+    }
+
     return '<div class="card wide"><h3>Projected revenue ' + explain('industry-projection') + '</h3>'
+      + basis + ' ' + explain('industry-basis') + note
       + '<div class="projection">'
-      + kv([
-        ['sold on', credits(Math.round(p.sold)) + '<span class="mute2">/h</span>'],
-        ['bought in', credits(Math.round(p.bought)) + '<span class="mute2">/h</span>'],
-        ['net an hour', '<b>' + signedCredits(Math.round(p.net)) + '</b>'],
-        ['net a day', signedCredits(Math.round(p.net * 24))]
-      ])
+      + kv(summary)
       + '<div class="scroll-x"><table><thead><tr><th>Station</th><th>Line</th>'
-      + '<th class="num">Cycle</th><th class="num">Margin</th></tr></thead><tbody>'
+      + '<th class="num">Cycle</th><th class="fillcell">Busy</th><th class="num">Margin</th>'
+      + '<th class="num">Traded</th></tr></thead><tbody>'
       + stations.map(function (station) {
           var line = lineOf(station);
+          var m = line.measured;
           return '<tr><td>' + stationLink(station) + '</td>'
             + '<td class="mute2">' + esc(lineTitle(station)) + '</td>'
-            + '<td class="num">' + num(line.rate.cycleSeconds, 1) + ' s × ' + num(line.slots) + '</td>'
+            + '<td class="num">' + num(line.rate.cycleSeconds, 1) + ' s × ' + num(line.slots)
+              + (m ? '<div class="mute2">' + num(line.rate.cyclesPerHour, 1) + ' of '
+                     + num(line.rate.ceilingCyclesPerHour, 1) + ' /h</div>' : '') + '</td>'
+            + '<td class="fillcell">' + busy(line) + '</td>'
             + '<td class="num">' + signedCredits(Math.round(line.marginPerHour))
-            + '<span class="mute2">/h</span></td></tr>';
+            + '<span class="mute2">/h</span></td>'
+            + '<td class="num">' + (m && m.tradedPerHour != null
+                ? signedCredits(Math.round(m.tradedPerHour)) + '<span class="mute2">/h</span>'
+                : '<span class="mute2">—</span>') + '</td></tr>';
         }).join('')
       + '</tbody></table></div></div></div>';
   }
@@ -4077,7 +4347,8 @@
       return;
     }
 
-    var all = state.stations;
+    // In measured mode every card works from re-rated copies; see withMeasurement().
+    var all = state.basis === 'observed' ? state.stations.map(withMeasurement) : state.stations;
     var sectors = sectorsOf(all);
 
     $('#industry-count').textContent = numText(all.length) + ' stations · '
@@ -4632,6 +4903,9 @@
 
       var windowButton = e.target.closest('#sector-window button');
       if (windowButton) { setSectorWindow(Number(windowButton.dataset.v)); return; }
+
+      var basisButton = e.target.closest('#industry-basis button');
+      if (basisButton) { setIndustryBasis(basisButton.dataset.v); return; }
 
       var sector = e.target.closest('[data-sector]');
       if (sector) {

@@ -203,6 +203,40 @@ const routes = {
               ships: [{ ship: 'Rusty Refinery', net: -1200 }, { ship: 'Sun Farm', net: 300 }] }
         ]
     },
+    /*
+     * What the bridge measured of the refinery: half its slot time busy, so 50 cycles an
+     * hour where the ceiling is 100, and its goods traded at real prices. Sun Farm has no
+     * measurements and keeps its ceiling. On the measured basis that makes 12:-4
+     *
+     *   sold   Oil 250 * 340 + Scrap Metal 50 * 8 + Energy Cell 150 * 61  =  94,550
+     *   bought Raw Oil 500 * 70                                           =  35,000
+     *   net                                                               =  59,550 an hour
+     */
+    '/history/economy/observed': {
+        window: { from: now - 86400, to: now },
+        stations: [{
+            ship: 'Rusty Refinery', owner: 'player', x: 12, y: -4, span: 7200, trades: 30,
+            production: {
+                windows: 120, seconds: 7200, slotSeconds: 21600, busySlotSeconds: 10800,
+                starvedSeconds: 1800, blockedSeconds: 0, idleSeconds: 0, cycles: 100, boosted: 0,
+                catchupSeconds: 0, catchupCycles: 0, slots: 3, cycleSeconds: 72,
+                utilization: 0.5, cyclesPerHour: 50
+            },
+            goods: [
+                { good: 'Energy Cell', made: 0, used: 500, madePerHour: 0, usedPerHour: 250,
+                  sold: { units: 0 }, bought: { units: 0 }, consumed: { units: 0 } },
+                { good: 'Oil', made: 500, used: 0, madePerHour: 250, usedPerHour: 0,
+                  sold: { units: 400, credits: 136000, trades: 10, unitPrice: 340 },
+                  bought: { units: 0 }, consumed: { units: 0 } },
+                { good: 'Raw Oil', made: 0, used: 1000, madePerHour: 0, usedPerHour: 500,
+                  sold: { units: 0 }, bought: { units: 1000, credits: 70000, trades: 20, unitPrice: 70 },
+                  consumed: { units: 0 } },
+                { good: 'Scrap Metal', made: 100, used: 0, madePerHour: 50, usedPerHour: 0,
+                  sold: { units: 0 }, bought: { units: 0 }, consumed: { units: 0 } }
+            ],
+            traded: { sold: 136000, bought: 70000, consumed: 0, net: 66000, perHour: 33000 }
+        }]
+    },
     '/history/economy/goods': {
         goods: [
             { ship: 'Rusty Refinery', good: 'Oil', in: 400, out: 380, net: 20, stock: 900 },
@@ -221,6 +255,10 @@ const dom = new JSDOM(fs.readFileSync(path.join(web, 'index.html'), 'utf8'), {
 });
 
 const { window } = dom;
+
+// The industry checks below start on the ceiling the mod computes, and switch to measured
+// rates part way through; a new visitor starts on measured.
+window.localStorage.setItem('avoconsole.basis', 'ceiling');
 
 // The galaxy map draws on a canvas jsdom has no backend for, and its getContext throws
 // rather than returning null. Nothing under test here touches what it draws.
@@ -416,6 +454,35 @@ const ready = window.document.readyState === 'loading'
     check(/Projected revenue[\s\S]*net an hour\+88\.7K ¢/.test(balance),
           'the sector is projected from its surpluses less its shortfalls');
     check(/title="88,700"/.test(pane.innerHTML), 'exact in its tooltip');
+
+    console.log('\nmeasured rates');
+
+    click(pane.querySelector('#industry-basis button[data-v="observed"]'));
+    await settle(100);
+
+    const measuredRusty = pane.querySelector('.inode[data-station="Rusty Refinery"]');
+    check(/250\/h Energy Cell/.test(measuredRusty.textContent) && /Oil 250\/h/.test(measuredRusty.textContent),
+          'a measured station is drawn at the rate it was recorded running');
+    check(/50% busy/.test(measuredRusty.textContent), 'and says how busy its slots were');
+    check(/400\/h/.test(pane.querySelector('.inode[data-station="Sun Farm"]').textContent),
+          'an unmeasured station keeps its ceiling');
+    check(/1 of 2 stations have no measurements yet/.test(pane.textContent),
+          'and the card says which basis stood in for it');
+    check(pane.querySelectorAll('.pnode.bad').length === 1,
+          'a line running at half speed no longer outruns its supplier');
+    check(/title="59,550"/.test(pane.innerHTML),
+          'the projection prices goods at what they traded for');
+    check(/traded an hour/.test(pane.textContent) && /title="33,000"/.test(pane.innerHTML),
+          'next to what the measured stations actually traded');
+    check(/Busy[\s\S]*50%[\s\S]*starved 25%/.test(pane.textContent),
+          'with each station\'s utilisation and why it idled');
+    check(/1 input short/.test($('#industry-rows [data-sector="12:-4"]').textContent),
+          'and the sector list follows the measured chain');
+    check(window.localStorage.getItem('avoconsole.basis') === 'observed', 'the choice is remembered');
+
+    click(pane.querySelector('#industry-basis button[data-v="ceiling"]'));
+    await settle(100);
+    check(/title="88,700"/.test(pane.innerHTML), 'and switching back restores the ceiling');
 
     check(pane.querySelectorAll('svg.stack .bucket').length === 3,
           'what the sector earned is a bar per bucket');

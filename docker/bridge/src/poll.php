@@ -22,7 +22,7 @@ declare(strict_types=1);
  *   POLL_INTERVAL   seconds between passes (default 30)
  *   POLL_EVENTS     "0" to record movement only and skip the per-ship event calls
  *   POLL_ECONOMY    "0" to skip the station and faction calls the economy series is
- *                   built from
+ *                   built from, and the stations' trade and production feed
  *   POLL_URL        base URL of the bridge (default http://api:80)
  *   POLL_TIMEOUT    seconds to allow one call (default 30)
  *
@@ -163,10 +163,72 @@ function pass(string $base, string $key, int $timeout, bool $wantEvents, bool $w
         }
 
         fetch($base . '/economy?owner=all', $key, $timeout);
+
+        $activity = collectStationEvents($base, $key, $timeout);
     }
 
     return ['ok' => true, 'status' => 200, 'ships' => count($ships), 'events' => $polled,
-            'stations' => $stations];
+            'stations' => $stations, 'activity' => $activity ?? null];
+}
+
+/** Largest page the mod hands out; see Config.maxStationEventsPerRead. */
+const STATION_EVENT_PAGE = 1000;
+
+/**
+ * Drains the mod's station feed - every trade and production window since the last pass -
+ * into the history store.
+ *
+ * This is the one collection that cannot be a snapshot. The mod keeps the feed in a ring
+ * buffer, so whatever is not collected before the buffer comes round is gone, and a pass
+ * pages forward from where the last one stopped until the mod says there is no more. The
+ * bridge records each page on the way past and moves the stored cursor; this only has to
+ * keep asking.
+ *
+ * A server restart numbers the feed from zero again under a new `boot`. The stored cursor
+ * then points past everything the new run has produced, so the pass starts over from zero
+ * for the new run instead of waiting for the counter to climb back.
+ *
+ * @return array{events: int, gap: bool}
+ */
+function collectStationEvents(string $base, string $key, int $timeout): array
+{
+    $state = (new History($key))->stationEventCursor();
+    $since = $state['cursor'];
+    $boot = $state['boot'];
+
+    $events = 0;
+    $gap = false;
+
+    // Bounded, so a feed that somehow never reports the end cannot hold the loop forever.
+    for ($page = 0; $page < 50; $page++) {
+        $answer = fetch(sprintf('%s/economy/events?owner=all&limit=%d&since=%d',
+            $base, STATION_EVENT_PAGE, $since), $key, $timeout);
+
+        if ($answer['status'] !== 200 || !is_object($answer['body'])) {
+            break;
+        }
+
+        $body = $answer['body'];
+        $answerBoot = (string) ($body->boot ?? '');
+
+        if ($boot !== null && $answerBoot !== $boot && $since > 0) {
+            $boot = $answerBoot;
+            $since = 0;
+            continue;
+        }
+
+        $boot = $answerBoot;
+        $events += is_array($body->events ?? null) ? count($body->events) : 0;
+        $gap = $gap || ($body->gap ?? false) === true;
+
+        if (($body->more ?? false) !== true || !is_numeric($body->cursor ?? null)) {
+            break;
+        }
+
+        $since = (int) $body->cursor;
+    }
+
+    return ['events' => $events, 'gap' => $gap];
 }
 
 function detail(array $answer): string
@@ -221,6 +283,13 @@ while (true) {
         }
 
         if ($result['ok']) {
+            // Events that fell out of the mod's buffer before anyone collected them. Worth one
+            // line each time, since it means the interval is too long for the industry.
+            if (($result['activity']['gap'] ?? false) === true) {
+                say(sprintf('%s: the mod dropped station events before they were collected; '
+                    . 'shorten POLL_INTERVAL or raise Config.stationEventsPerFaction', $label));
+            }
+
             if (($complained[$label] ?? null) !== null) {
                 say(sprintf('%s is answering again (%d craft)', $label, $result['ships']));
                 unset($complained[$label]);

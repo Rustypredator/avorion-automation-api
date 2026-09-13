@@ -29,6 +29,8 @@ galaxy map.
 - query known sectors, and predict unvisited ones straight from the galaxy seed
 - read your stations' books - production chain, stock, and what each one has earned - and
   keep a series of them, so a lifetime total becomes credits an hour
+- record what your stations actually do, from inside them: every trade at the price it
+  settled at, and every production cycle against the slot time it had
 
 ## How it talks to the outside world
 
@@ -187,12 +189,19 @@ hour and another uses 60, the sector has 15 left over. Goods the sector uses fas
 it makes come in from the left for the shortfall, goods left over leave on the right, and
 the **Goods balance** underneath lists every one with what the difference is worth and the
 nearest of your stations elsewhere that would cover it. **Projected revenue** adds that up:
-every surplus sold and every shortfall bought, at base prices and every slot running - a
-ceiling for the sector next to each station's own share. Under it the bridge's history
+every surplus sold and every shortfall bought, for the sector and for each station's share.
+
+It does that on one of two bases. **Measured** runs each station at the rate it was recorded
+running - its real cycles against its slot time, with how busy each line was and whether it
+idled for want of an ingredient or of room - and prices each good at what it actually
+traded for. **Ceiling** is every slot busy and every sale at base price, which is what the
+game's own formula says the line could do. A station with nothing recorded yet keeps its
+ceiling either way, and the card says so. Under it the bridge's history
 draws what the sector actually earned, stacked by station per hour or day; the station's
 own **Economy** tab draws its history as earned, spent and net lines.
 
-All of it comes from one `/stations` call; clicking a station opens it in the Fleet view,
+All of it comes from `/stations` and the bridge's `/history/economy/observed`; clicking a
+station opens it in the Fleet view,
 and a station's Production tab links back to its sector.
 
 The heading on both is the station's real identity rather than its script. Every factory in
@@ -258,13 +267,15 @@ everything the store needs:
 | `GET /ships/{name}/events` | the mod's own events, past the 200 and past a restart |
 | `GET /stations` | each station's running earnings totals and its stock per good |
 | `GET /economy` | the faction's money and resources |
+| `GET /economy/events` | every trade and production window the stations recorded, paged forward with a cursor |
 
 Positions come from the ship database, which reads fine **with every player logged out**, so
 the travel record keeps filling whether or not anyone is flying. So do the station books:
 they are read out of the same database rows, not off a loaded sector.
 
 Read it at `/history/summary`, `/history/visits`, `/history/heatmap`, `/history/events`,
-`/history/economy/summary`, `/history/economy/series` and `/history/economy/goods` - full
+`/history/economy/summary`, `/history/economy/series`, `/history/economy/goods`,
+`/history/economy/observed` and `/history/economy/events` - full
 reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
 travel overlays on the map and the economy ones on the station's Economy tab.
 
@@ -308,6 +319,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
+| `GET /stations/{name}/events`, `GET /economy/events` | what stations actually did: trades at real prices, production cycles, reload catch-up |
 | `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and the game's own pathfinder |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
@@ -357,17 +369,27 @@ call is legal, executes it and reports back.
 Everything else is pure Lua under `data/scripts/lib/automationapi/`: the JSON codec, router,
 auth, serializers and the per-endpoint handlers.
 
-Both vanilla overlays exist only to add one `addScriptOnce` line each:
-`data/scripts/galaxy/init.lua` attaches the bridge, `data/scripts/player/init.lua` attaches
-the agent. They are the only vanilla files this mod replaces, and they need re-checking
-against the game's copies after an Avorion update.
+Four files share a path with the game's own, and Avorion inserts a mod's copy of such a file
+into the vanilla one, ahead of its final `return`, rather than replacing it:
+
+- `data/scripts/galaxy/init.lua` attaches the bridge, and `data/scripts/player/init.lua` the
+  agent, with one `addScriptOnce` line each.
+- `data/scripts/lib/tradingmanager.lua` and `data/scripts/entity/merchants/factory.lua` hand
+  the vanilla file's locals to `automationapi/stationhooks.lua`, which wraps the trade and
+  production functions to record what player and alliance stations actually do. The game's
+  economy log has no read API; these are the calls that write it.
+
+All four depend on vanilla names - `TradingManager`, `production`, `newProductionError`,
+`currentProductions`, and the functions they wrap - and need re-checking against the game's
+copies after an Avorion update. A renamed one turns recording off rather than breaking a
+station: every hook checks what it wraps and records inside `pcall`.
 
 ## Development
 
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-for t in bridge ships missions movement map shipevents economy; do lua5.4 tests/test_$t.lua; done
+for t in bridge ships missions movement map shipevents economy stationevents; do lua5.4 tests/test_$t.lua; done
 ```
 
 The bridge's history store is PHP over Postgres, so it is tested against a throwaway

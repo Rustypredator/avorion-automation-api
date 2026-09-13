@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 2;
+    private const SCHEMA = 3;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -319,6 +319,66 @@ final class Db
 
             'CREATE INDEX IF NOT EXISTS faction_samples_window_idx
                  ON faction_samples (key_id, owner, taken_at)',
+
+            /*
+             * What stations actually did, from inside the stations: trades with the good,
+             * units and price they happened at, production windows with the cycles a line
+             * really ran and why its idle slots were idle, and reload catch-ups. See the
+             * mod's automationapi/stationhooks.lua for how it is captured.
+             *
+             * The mod keeps these in a ring buffer that starts over with every server run,
+             * and numbers them from zero each time, so (boot, seq) is what identifies one -
+             * `boot` is the mod's own id for the run, and replaces the guesswork recordEvents
+             * has to do for ship events.
+             *
+             * good, direction, units and credits are columns because the reads group and sum
+             * on them; the rest of a trade, and every field of a production window, is in
+             * `data`, where the mod can add to it without a migration.
+             */
+            'CREATE TABLE IF NOT EXISTS station_events (
+                 id          BIGSERIAL PRIMARY KEY,
+                 key_id      BIGINT      NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+                 station     TEXT        NOT NULL,
+                 owner       TEXT        NOT NULL DEFAULT \'\',
+                 x           INTEGER     NOT NULL DEFAULT 0,
+                 y           INTEGER     NOT NULL DEFAULT 0,
+                 boot        TEXT        NOT NULL,
+                 seq         BIGINT      NOT NULL,
+                 kind        TEXT        NOT NULL,
+                 happened_at TIMESTAMPTZ NOT NULL,
+                 good        TEXT,
+                 direction   TEXT,
+                 internal    BOOLEAN     NOT NULL DEFAULT FALSE,
+                 units       DOUBLE PRECISION NOT NULL DEFAULT 0,
+                 credits     DOUBLE PRECISION NOT NULL DEFAULT 0,
+                 data        JSONB       NOT NULL DEFAULT \'{}\'::jsonb
+             )',
+
+            // Idempotent recording: the poller and an open console collect the same page.
+            'CREATE UNIQUE INDEX IF NOT EXISTS station_events_dedupe_idx
+                 ON station_events (key_id, boot, seq)',
+
+            'CREATE INDEX IF NOT EXISTS station_events_window_idx
+                 ON station_events (key_id, happened_at DESC)',
+
+            'CREATE INDEX IF NOT EXISTS station_events_station_idx
+                 ON station_events (key_id, station, kind, happened_at)',
+
+            /*
+             * How far the collector has read the mod's station feed, per key.
+             *
+             * Not derivable from station_events: a console opening one station's newest
+             * events stores rows far ahead of anything collected in order, and a cursor taken
+             * from the highest stored seq would skip everything in between. Only a complete,
+             * in-order page of GET /economy/events?owner=all moves this - see
+             * History::recordStationEvents.
+             */
+            'CREATE TABLE IF NOT EXISTS station_feed_state (
+                 key_id     BIGINT      PRIMARY KEY REFERENCES api_keys(id) ON DELETE CASCADE,
+                 boot       TEXT        NOT NULL,
+                 cursor     BIGINT      NOT NULL DEFAULT 0,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             )',
 
             'DELETE FROM api_schema',
             'INSERT INTO api_schema (version) VALUES (' . self::SCHEMA . ')',

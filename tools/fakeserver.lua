@@ -203,6 +203,27 @@ local function trade()
     end
 
     Mock.player(1).money = Mock.player(1).money + sold * 352
+
+    -- What the station hooks would have pushed from inside the refinery for the same trade,
+    -- so the stations' activity feed and the bridge's collector of it have something to move.
+    Bridge.pushStationEvent(1, "Home Base", "trade",
+    {
+        direction = "sold", channel = "docked", good = "Oil", units = sold,
+        price = sold * 352, ownerAmount = sold * 352, tax = sold, internal = false,
+        counterparty = {index = 900, name = "The Xsotan Traders", kind = "ai"},
+        ship = "Oil Barge", x = 0, y = 0,
+    })
+
+    Bridge.pushStationEvent(1, "Home Base", "production",
+    {
+        seconds = WANDER_EVERY, slotSeconds = 3 * WANDER_EVERY,
+        busySlotSeconds = 2 * WANDER_EVERY, starvedSeconds = WANDER_EVERY,
+        blockedSeconds = 0, idleSeconds = 0, cycles = 1, boosted = 0, slots = 3,
+        cycleSeconds = 30, x = 0, y = 0,
+        results = {{name = "Oil", amount = 5}},
+        ingredients = {{name = "Energy Cell", amount = 5}, {name = "Raw Oil", amount = 10}},
+        garbage = {},
+    })
 end
 
 while true do

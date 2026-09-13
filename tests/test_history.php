@@ -555,6 +555,175 @@ check($shape['economy']['interval'] === 300, 'and the interval it is sampling at
 $economy->clear(null);
 check($economy->economySummary([])['stations'] === [], 'clearing takes the samples with it');
 
+echo "\nstation activity\n";
+
+/*
+ * The mod's station feed, as GET /economy/events answers it: pages of trades, production
+ * windows and reload catch-ups, numbered per server run.
+ */
+$activityKey = freshKey();
+$madeKeys[] = $activityKey;
+$activity = new History($activityKey);
+
+function feedPage(string $boot, float $now, int $cursor, bool $more, array $events): stdClass
+{
+    return (object) ['boot' => $boot, 'now' => $now, 'cursor' => $cursor, 'more' => $more,
+                     'gap' => false, 'events' => $events];
+}
+
+function tradeEvent(int $seq, float $at, string $station, string $direction, string $good,
+                    float $units, float $price, bool $internal = false): stdClass
+{
+    return (object) [
+        'seq' => $seq, 'at' => $at, 'kind' => 'trade', 'station' => $station,
+        'owner' => (object) ['kind' => 'player', 'index' => 1, 'name' => 'Rusty'],
+        'sector' => (object) ['x' => 12, 'y' => -4],
+        'direction' => $direction, 'good' => $good, 'units' => $units, 'price' => $price,
+        'unitPrice' => $units > 0 ? $price / $units : 0, 'internal' => $internal,
+        'channel' => 'docked',
+    ];
+}
+
+function recipeOf(): array
+{
+    return [
+        'results' => [(object) ['name' => 'Oil', 'amount' => 5]],
+        'ingredients' => [(object) ['name' => 'Raw Oil', 'amount' => 10],
+                          (object) ['name' => 'Fuel', 'amount' => 2, 'optional' => true]],
+        'garbage' => [],
+    ];
+}
+
+$window = (object) ([
+    'seq' => 3, 'at' => 1000.0, 'kind' => 'production', 'station' => 'Rusty Refinery',
+    'owner' => (object) ['kind' => 'player'], 'sector' => (object) ['x' => 12, 'y' => -4],
+    'seconds' => 60, 'slotSeconds' => 180, 'busySlotSeconds' => 80, 'starvedSeconds' => 40,
+    'blockedSeconds' => 20, 'idleSeconds' => 0, 'cycles' => 2, 'boosted' => 1, 'slots' => 3,
+    'cycleSeconds' => 30,
+] + recipeOf());
+
+check($activity->stationEventCursor() === ['boot' => null, 'cursor' => 0],
+      'a key that has never collected starts from zero');
+
+$first = feedPage('boot-A', 1000.0, 3, true, [
+    tradeEvent(1, 400.0, 'Rusty Refinery', 'bought', 'Raw Oil', 200, 14000),
+    tradeEvent(2, 700.0, 'Rusty Refinery', 'sold', 'Oil', 50, 17000),
+    $window,
+]);
+
+$activity->recordStationEvents($first, true, 0);
+$log = $activity->stationEvents([]);
+
+check(count($log) === 3, 'a page of the feed is stored event by event');
+check(abs($log[0]['t'] - (time() - 600)) <= 2,
+      'dated off the server clock the page carries, not the time it arrived');
+check($log[0]['direction'] === 'bought' && $log[0]['good'] === 'Raw Oil',
+      'with the trade itself kept');
+check($activity->stationEventCursor() === ['boot' => 'boot-A', 'cursor' => 3],
+      'and an in-order page moves the collector\'s cursor');
+
+$activity->recordStationEvents($first, true, 0);
+check(count($activity->stationEvents([])) === 3, 'collecting the same page twice stores nothing new');
+
+$catchup = (object) ([
+    'seq' => 4, 'at' => 1500.0, 'kind' => 'catchup', 'station' => 'Rusty Refinery',
+    'owner' => (object) ['kind' => 'player'], 'sector' => (object) ['x' => 12, 'y' => -4],
+    'seconds' => 3600, 'cycles' => 120,
+] + recipeOf());
+
+$activity->recordStationEvents(feedPage('boot-A', 1600.0, 5, false, [
+    $catchup,
+    tradeEvent(5, 1550.0, 'Rusty Refinery', 'bought', 'Raw Oil', 25, 0, true),
+]), true, 3);
+check($activity->stationEventCursor()['cursor'] === 5, 'the next page continues it');
+
+// A console opening one station's newest events: stored, but no continuation.
+$newest = (object) ['boot' => 'boot-A', 'now' => 2000.0, 'cursor' => 9, 'more' => false,
+                    'station' => 'Rusty Refinery', 'owner' => (object) ['kind' => 'player'],
+                    'events' => [(object) ['seq' => 9, 'at' => 1990.0, 'kind' => 'trade',
+                                           'direction' => 'sold', 'good' => 'Oil', 'units' => 40,
+                                           'price' => 13600, 'internal' => false]]];
+$activity->recordStationEvents($newest);
+check($activity->stationEventCursor()['cursor'] === 5,
+      'a page that is not an in-order continuation leaves the cursor alone');
+check(count($activity->stationEvents(['ship' => 'Rusty Refinery'])) === 6,
+      'while the events on it are still kept, station and owner taken off the page');
+
+// The server restarts: boot-B numbers from zero again.
+$restarted = feedPage('boot-B', 50.0, 2, false, [
+    (object) ['seq' => 1, 'at' => 40.0, 'kind' => 'trade', 'station' => 'Alliance Exchange',
+              'owner' => (object) ['kind' => 'alliance'], 'sector' => (object) ['x' => 30, 'y' => 30],
+              'direction' => 'sold', 'good' => 'Ore', 'units' => 100, 'price' => 3000,
+              'internal' => false],
+]);
+
+$activity->recordStationEvents($restarted, true, 5);
+check($activity->stationEventCursor() === ['boot' => 'boot-A', 'cursor' => 5],
+      'a page from another server run does not move a cursor it was not asked from');
+
+$activity->recordStationEvents($restarted, true, 0);
+check($activity->stationEventCursor() === ['boot' => 'boot-B', 'cursor' => 2],
+      'starting that run over from zero does');
+check(count($activity->stationEvents(['ship' => 'Alliance Exchange'])) === 1,
+      'and the same seq under a new run is a new event, stored once');
+
+echo "\nobserved economy\n";
+
+$observed = $activity->economyObserved(['ship' => 'Rusty Refinery']);
+check(count($observed['stations']) === 1, 'one row per station');
+
+$refinery = $observed['stations'][0];
+$production = $refinery['production'];
+
+check($production['cycles'] == 2 && $production['catchupCycles'] == 120,
+      'live and catch-up cycles are counted apart');
+check(abs($production['utilization'] - 80 / 180) < 0.001, 'utilisation is busy slot time over slot time');
+check($production['starvedSeconds'] == 40 && $production['blockedSeconds'] == 20,
+      'with the reasons for idle slots summed');
+check(abs($production['cyclesPerHour'] - 122 * 3600 / 3660) < 0.01,
+      'and a rate over running and catch-up time together');
+check($production['slots'] === 3 && $production['cycleSeconds'] == 30,
+      'and the line described as its latest window reports it');
+check($refinery['span'] == 3660, 'span is that same running time');
+
+$byGood = [];
+foreach ($refinery['goods'] as $row) {
+    $byGood[$row['good']] = $row;
+}
+
+check($byGood['Oil']['made'] == 610, 'units made are cycles times the recipe each window carried');
+check($byGood['Raw Oil']['used'] == 1220, 'and so are units used');
+check($byGood['Fuel']['used'] == 2, 'an optional ingredient only on boosted cycles, and never on catch-up');
+check($byGood['Raw Oil']['bought']['units'] == 200 && $byGood['Raw Oil']['bought']['unitPrice'] == 70,
+      'trades are summed per good with the price they happened at');
+check($byGood['Raw Oil']['internalIn'] == 25, 'an internal delivery is movement and not a price');
+check($byGood['Oil']['sold']['units'] == 90 && $byGood['Oil']['sold']['unitPrice'] == 340,
+      'every recorded sale counts, however it was collected');
+check(abs($byGood['Oil']['madePerHour'] - 610 * 3600 / 3660) < 0.01, 'and made per hour of span');
+
+check($refinery['traded']['net'] == 30600 - 14000, 'traded net is sales less purchases');
+
+check(count($activity->economyObserved(['x' => 30, 'y' => 30])['stations']) === 1,
+      'a sector filter reads one sector');
+check($activity->economyObserved(['owner' => 'alliance'])['stations'][0]['ship'] === 'Alliance Exchange',
+      'and an owner filter one owner');
+check($activity->economyObserved(['ship' => 'Rusty Refinery', 'from' => time() + 60])['stations'] === [],
+      'a window after everything reads empty');
+
+check(count($activity->stationEvents(['kind' => 'production'])) === 1, 'the log can be narrowed to one kind');
+
+$shape = $activity->summary();
+check($shape['economy']['events'] === 7 && $shape['economy']['recordedStations'] === 2,
+      'the summary says how much activity is stored');
+
+$activity->clear('Alliance Exchange');
+check($activity->economyObserved(['ship' => 'Alliance Exchange'])['stations'] === [],
+      'clearing a station takes its activity with it');
+
+$activity->clear(null);
+check($activity->stationEvents([]) === [] && $activity->stationEventCursor()['cursor'] === 0,
+      'and clearing the key takes the feed and its cursor');
+
 echo "\nclearing\n";
 
 $history->clear('Tug');

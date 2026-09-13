@@ -270,6 +270,22 @@ done
 check "$([ "${seen:-0}" -gt 0 ] && echo 0 || echo 1)" \
     "it records the fleet with nothing else calling the API" "saw ${seen:-0} craft"
 
+# The stations' own trade and production feed is the one collection that is not a snapshot:
+# it lives in a ring buffer in the mod, and only the poller paging through it keeps it.
+for _ in $(seq 1 40); do
+    get "$KEY" /history/economy/observed >/dev/null
+    traded="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(sum(s["trades"] for s in b["stations"]))')"
+    [ "${traded:-0}" -gt 0 ] && break
+    sleep 1
+done
+
+check "$([ "${traded:-0}" -gt 0 ] && echo 0 || echo 1)" \
+    "it collects the stations' trade feed on its own" "saw ${traded:-0} trades"
+
+utilization="$(json 'import json,sys;b=json.load(open(sys.argv[1]));p=b["stations"][0]["production"] if b["stations"] else None;print(p["utilization"] if p else "")')"
+check "$([ "$utilization" = "0.6667" ] && echo 0 || echo 1)" \
+    "and the production windows become a measured utilisation" "got '$utilization'"
+
 logs="$("${COMPOSE[@]}" logs poller 2>&1 | tail -20)"
 check "$(echo "$logs" | grep -q 'polling 1 key' && echo 0 || echo 1)" \
     "and says what it is polling on startup" "$(echo "$logs" | tail -3)"

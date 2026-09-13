@@ -16,6 +16,8 @@ local Owner = include("automationapi/owner")
 local Serialize = include("automationapi/serialize")
 local ShipData = include("automationapi/shipdata")
 local EconomyData = include("automationapi/economy")
+local StationEvents = include("automationapi/stationevents")
+local Config = include("automationapi/config")
 
 local Economy = {}
 
@@ -74,6 +76,12 @@ local function stationOf(owner, name, full)
 
     local cargos, capacity = safe(function() return entry:getCargo() end)
     result.economy = EconomyData.of(entry, cargos, capacity)
+
+    -- What the station has actually done since the server started, as recorded from inside
+    -- it: the database row says what the line could do, this says what it did.
+    if result.economy then
+        result.economy.observed = StationEvents.observed(owner.index, name)
+    end
 
     if result.position then
         result.sectorLoaded = sectorLoaded(result.position.x, result.position.y)
@@ -143,6 +151,44 @@ local function stationsOf(owner)
     return result
 end
 
+-- `since` and `limit` for the two activity feeds, validated the way /ships/{name}/events
+-- validates them.
+local function pageOf(ctx)
+    local since
+    if ctx.query.since ~= nil then
+        since = tonumber(ctx.query.since)
+        if since == nil or since < 0 or since ~= math.floor(since) then
+            Router.fail(400, "bad_since", "'since' is a sequence number from a previous response.")
+        end
+    end
+
+    local limit = Config.maxStationEventsPerRead
+    if ctx.query.limit ~= nil then
+        limit = tonumber(ctx.query.limit)
+        if limit == nil or limit < 1 or limit ~= math.floor(limit) then
+            Router.fail(400, "bad_limit", "'limit' is a positive whole number.")
+        end
+        limit = math.min(limit, Config.maxStationEventsPerRead)
+    end
+
+    return since, limit
+end
+
+-- The envelope both feeds share. `now` is the server's runtime clock at the moment of the
+-- answer, the same clock every event's `at` is on, so a reader can date an event without
+-- knowing when the server started.
+local function feedOf(events, page)
+    return
+    {
+        events = events,
+        cursor = page.cursor,
+        more = page.more,
+        gap = page.gap,
+        boot = StationEvents.boot(),
+        now = Serialize.number(safe(function() return Server().unpausedRuntime end), 0),
+    }
+end
+
 function Economy.register(router)
 
     -- Every station the caller owns, each with its books.
@@ -179,6 +225,68 @@ function Economy.register(router)
         end
 
         return station
+    end)
+
+    -- What one station has done: its trades, its production windows and its reload
+    -- catch-ups, recorded from inside the station. See automationapi/stationevents.lua.
+    --
+    -- Poll with `since` set to the last cursor; without it, the newest events.
+    router:get("/stations/{name}/events", function(ctx, params)
+        local owner = Owner.findShip(ctx, params.name)
+        local since, limit = pageOf(ctx)
+
+        local events, page = StationEvents.read({owner.index}, params.name, since, limit)
+        local body = feedOf(events, page)
+
+        body.station = params.name
+        body.owner = Owner.describe(owner)
+        body.observed = StationEvents.observed(owner.index, params.name)
+
+        -- Recording needs the station's sector loaded, not its owner online.
+        local position = safe(function()
+            local x, y = owner.faction:getShipPosition(params.name)
+            return {x = x, y = y}
+        end)
+        if position and position.x then body.recording = sectorLoaded(position.x, position.y) end
+
+        return body
+    end)
+
+    -- Every station's activity for the caller's factions in one feed, oldest first from
+    -- `since`. This is what the bridge's collector reads: one call per pass however large
+    -- the industry is, and a cursor that pages forward without missing anything.
+    --
+    -- Registered as /economy/events rather than under /stations so it cannot shadow a
+    -- station that happens to be called "events".
+    router:get("/economy/events", function(ctx)
+        local owners = ownersFor(ctx)
+        local since, limit = pageOf(ctx)
+
+        local indices, described = {}, Json.array({})
+        for _, owner in ipairs(owners) do
+            indices[#indices + 1] = owner.index
+            described[#described + 1] = Owner.describe(owner)
+        end
+
+        local events, page = StationEvents.read(indices, nil, since, limit)
+
+        -- Which faction each event belongs to, spelled the way the rest of the API spells
+        -- an owner, since one feed carries the player and their alliance together. Copied
+        -- rather than written into the stored event, which other readers share.
+        local byIndex = {}
+        for _, owner in ipairs(owners) do byIndex[owner.index] = Owner.describe(owner) end
+
+        local out = Json.array({})
+        for _, event in ipairs(events) do
+            local copy = {owner = byIndex[event.faction]}
+            for field, value in pairs(event) do copy[field] = value end
+            out[#out + 1] = copy
+        end
+
+        local body = feedOf(out, page)
+        body.owners = described
+
+        return body
     end)
 
     -- The faction ledger: what the caller holds, and what their stations have made.

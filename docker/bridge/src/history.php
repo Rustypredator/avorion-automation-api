@@ -496,6 +496,160 @@ final class History
     }
 
     /**
+     * Fold one page of the mod's station feed into station_events.
+     *
+     * Both feeds land here: GET /economy/events, which carries an owner on every event, and
+     * GET /stations/{name}/events, which carries one for the whole page. Recording is
+     * idempotent on (boot, seq), so the same page collected twice stores nothing new.
+     *
+     * Dating is exact rather than anchored to the newest event the way recordEvents has to
+     * do it: the feed carries the server's runtime clock at the moment it answered (`now`)
+     * next to each event's own (`at`), so an event happened `now - at` seconds before this
+     * process received the page.
+     *
+     * `$advance` is for the collector: the page came from ?owner=all&since=$since, so it
+     * is a complete, in-order continuation and the cursor may move to the end of it. It
+     * only moves when the page belongs to the run of the server the cursor was for, or
+     * starts from zero - a restarted server numbers from zero again, and a cursor carried
+     * over from the previous run would skip everything up to the old number.
+     */
+    public function recordStationEvents(object $body, bool $advance = false, int $since = 0): void
+    {
+        $events = $body->events ?? null;
+        $boot = $body->boot ?? null;
+
+        if (!is_array($events) || !is_scalar($boot) || (string) $boot === '') {
+            return;
+        }
+        $boot = (string) $boot;
+
+        if ($events === [] && !$advance) {
+            return;
+        }
+
+        $pdo = $this->db();
+        $keyId = $this->keyId(true);
+        if ($keyId === null) {
+            return;
+        }
+
+        $received = time();
+        $serverNow = is_numeric($body->now ?? null) ? (float) $body->now : null;
+        $pageOwner = is_object($body->owner ?? null) ? (string) ($body->owner->kind ?? '') : '';
+        $pageStation = is_string($body->station ?? null) ? $body->station : '';
+
+        $happenedAt = static function (object $event) use ($received, $serverNow): int {
+            if ($serverNow === null || !is_numeric($event->at ?? null)) {
+                return $received;
+            }
+
+            $offset = $serverNow - (float) $event->at;
+
+            return $offset >= 0 && $offset <= 30 * 86400 ? $received - (int) round($offset) : $received;
+        };
+
+        $insert = $pdo->prepare(
+            'INSERT INTO station_events
+                 (key_id, station, owner, x, y, boot, seq, kind, happened_at,
+                  good, direction, internal, units, credits, data)
+             VALUES (:k, :s, :o, :x, :y, :b, :q, :kind, to_timestamp(:t),
+                     :g, :dir, :i, :u, :c, CAST(:d AS jsonb))
+             ON CONFLICT (key_id, boot, seq) DO NOTHING'
+        );
+
+        $pdo->beginTransaction();
+
+        try {
+            foreach ($events as $event) {
+                if (!is_object($event) || !is_numeric($event->seq ?? null)) {
+                    continue;
+                }
+
+                $station = is_string($event->station ?? null) ? $event->station : $pageStation;
+                $kind = (string) ($event->kind ?? '');
+                if ($station === '' || $kind === '') {
+                    continue;
+                }
+
+                $owner = is_object($event->owner ?? null) ? (string) ($event->owner->kind ?? '') : $pageOwner;
+                $sector = is_object($event->sector ?? null) ? $event->sector : null;
+                $isTrade = $kind === 'trade';
+
+                // Everything but what became a column or is the same on every row.
+                $data = get_object_vars($event);
+                unset($data['seq'], $data['station'], $data['owner'], $data['sector'], $data['faction']);
+
+                $insert->execute([
+                    ':k' => $keyId,
+                    ':s' => $station,
+                    ':o' => $owner,
+                    ':x' => $sector !== null ? (int) ($sector->x ?? 0) : 0,
+                    ':y' => $sector !== null ? (int) ($sector->y ?? 0) : 0,
+                    ':b' => $boot,
+                    ':q' => (int) $event->seq,
+                    ':kind' => $kind,
+                    ':t' => $happenedAt($event),
+                    ':g' => $isTrade && is_string($event->good ?? null) ? $event->good : null,
+                    ':dir' => $isTrade && is_string($event->direction ?? null) ? $event->direction : null,
+                    ':i' => $isTrade && ($event->internal ?? false) === true ? 'true' : 'false',
+                    ':u' => $isTrade ? (float) ($event->units ?? 0) : 0,
+                    ':c' => $isTrade ? (float) ($event->price ?? 0) : 0,
+                    ':d' => $this->encode($data),
+                ]);
+            }
+
+            if ($advance && is_numeric($body->cursor ?? null)) {
+                $state = $this->one(
+                    $pdo,
+                    'SELECT boot FROM station_feed_state WHERE key_id = :k FOR UPDATE',
+                    [':k' => $keyId]
+                );
+
+                if ($state === [] || $since === 0 || (string) $state['boot'] === $boot) {
+                    $pdo->prepare(
+                        'INSERT INTO station_feed_state (key_id, boot, cursor, updated_at)
+                         VALUES (:k, :b, :c, now())
+                         ON CONFLICT (key_id) DO UPDATE
+                             SET boot = EXCLUDED.boot, cursor = EXCLUDED.cursor, updated_at = now()'
+                    )->execute([':k' => $keyId, ':b' => $boot, ':c' => (int) $body->cursor]);
+                }
+            }
+
+            $pdo->commit();
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
+
+        $this->maybePrune();
+    }
+
+    /**
+     * Where the collector left off in the station feed: the server run it was reading and
+     * the sequence number to continue after. A key that has never collected reads as run
+     * unknown, sequence zero, which is "everything the mod still holds".
+     *
+     * @return array{boot: ?string, cursor: int}
+     */
+    public function stationEventCursor(): array
+    {
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return ['boot' => null, 'cursor' => 0];
+        }
+
+        $row = $this->one(
+            $this->db(),
+            'SELECT boot, cursor FROM station_feed_state WHERE key_id = :k',
+            [':k' => $keyId]
+        );
+
+        return $row === []
+            ? ['boot' => null, 'cursor' => 0]
+            : ['boot' => (string) $row['boot'], 'cursor' => (int) $row['cursor']];
+    }
+
+    /**
      * The slow-moving description of a station, kept alongside each sample.
      *
      * Denormalised on purpose. A station can be rebuilt into a different factory, and a
@@ -1001,6 +1155,300 @@ final class History
         return ['goods' => $goods, 'window' => ['from' => $from ?: null, 'to' => $to]];
     }
 
+    /**
+     * What each station actually did over the window, out of station_events: production
+     * against its slot time, units made and used per good, and trades per good at the
+     * prices they happened at.
+     *
+     * This is the measured counterpart of the rates the mod computes from a station's
+     * database row, which are a ceiling - every slot busy, every sale at base price.
+     *
+     * ### The hour it is per
+     *
+     * `span` is running time plus reload catch-up time: the seconds a factory's production
+     * windows cover while its sector was loaded, and the unloaded stretches the game
+     * credited it for on reload. That is wall-clock time for a factory, without counting the
+     * gaps nobody was collecting - the mod buffers those - and it is what `perHour` divides
+     * by. A sector still unloaded when the window ends has not been caught up yet, and its
+     * tail is missing from both sides of the division rather than from one.
+     *
+     * A station with no production windows (a trading post) has no running time to go by,
+     * so its span is the time between its first and last recorded event.
+     */
+    public function economyObserved(array $filter): array
+    {
+        $from = $this->windowStart($filter);
+        $to = $this->windowEnd($filter);
+        $window = ['from' => $from ?: null, 'to' => $to];
+
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return ['stations' => [], 'window' => $window];
+        }
+
+        [$scope, $args] = $this->stationEventScope($keyId, $filter);
+        $pdo = $this->db();
+
+        $number = static fn (string $field, string $kind): string =>
+            "COALESCE(SUM((data->>'{$field}')::float) FILTER (WHERE kind = '{$kind}'), 0)";
+
+        $rows = $this->all(
+            $pdo,
+            'SELECT station,
+                    MAX(owner) AS owner, MAX(x)::int AS x, MAX(y)::int AS y,
+                    ' . $number('seconds', 'production') . ' AS seconds,
+                    ' . $number('slotSeconds', 'production') . ' AS slot_seconds,
+                    ' . $number('busySlotSeconds', 'production') . ' AS busy_slot_seconds,
+                    ' . $number('starvedSeconds', 'production') . ' AS starved_seconds,
+                    ' . $number('blockedSeconds', 'production') . ' AS blocked_seconds,
+                    ' . $number('idleSeconds', 'production') . ' AS idle_seconds,
+                    ' . $number('cycles', 'production') . ' AS cycles,
+                    ' . $number('boosted', 'production') . ' AS boosted,
+                    ' . $number('seconds', 'catchup') . ' AS catchup_seconds,
+                    ' . $number('cycles', 'catchup') . " AS catchup_cycles,
+                    COUNT(*) FILTER (WHERE kind = 'production')::bigint AS windows,
+                    COUNT(*) FILTER (WHERE kind = 'trade')::bigint AS trades,
+                    (array_agg(data ORDER BY happened_at DESC) FILTER (WHERE kind = 'production'))[1] AS latest,
+                    EXTRACT(EPOCH FROM MIN(happened_at))::bigint AS first_at,
+                    EXTRACT(EPOCH FROM MAX(happened_at))::bigint AS last_at
+             FROM station_events WHERE {$scope}
+             GROUP BY station ORDER BY station",
+            $args
+        );
+
+        $stations = [];
+        foreach ($rows as $row) {
+            $latest = json_decode((string) ($row['latest'] ?? 'null'), true);
+            $production = [
+                'windows' => (int) $row['windows'],
+                'seconds' => (float) $row['seconds'],
+                'slotSeconds' => (float) $row['slot_seconds'],
+                'busySlotSeconds' => (float) $row['busy_slot_seconds'],
+                'starvedSeconds' => (float) $row['starved_seconds'],
+                'blockedSeconds' => (float) $row['blocked_seconds'],
+                'idleSeconds' => (float) $row['idle_seconds'],
+                'cycles' => (float) $row['cycles'],
+                'boosted' => (float) $row['boosted'],
+                'catchupSeconds' => (float) $row['catchup_seconds'],
+                'catchupCycles' => (float) $row['catchup_cycles'],
+                'slots' => is_array($latest) ? (int) ($latest['slots'] ?? 0) : null,
+                'cycleSeconds' => is_array($latest) ? (float) ($latest['cycleSeconds'] ?? 0) : null,
+            ];
+
+            $running = $production['seconds'] + $production['catchupSeconds'];
+            $span = $running > 0 ? $running : max(0, (int) $row['last_at'] - (int) $row['first_at']);
+
+            $production['utilization'] = $production['slotSeconds'] > 0
+                ? round($production['busySlotSeconds'] / $production['slotSeconds'], 4) : null;
+            $production['cyclesPerHour'] = $running > 0
+                ? round(($production['cycles'] + $production['catchupCycles']) * 3600 / $running, 3) : null;
+
+            $stations[(string) $row['station']] = [
+                'ship' => (string) $row['station'],
+                'owner' => (string) $row['owner'],
+                'x' => (int) $row['x'],
+                'y' => (int) $row['y'],
+                'first' => (int) $row['first_at'],
+                'last' => (int) $row['last_at'],
+                'span' => $span,
+                'production' => $production['windows'] > 0 || $production['catchupSeconds'] > 0 ? $production : null,
+                'trades' => (int) $row['trades'],
+                'goods' => [],
+                'traded' => ['sold' => 0.0, 'bought' => 0.0, 'consumed' => 0.0, 'net' => 0.0,
+                             'perHour' => null],
+            ];
+        }
+
+        $good = static function (array &$station, string $name): array {
+            $station['goods'][$name] ??= [
+                'good' => $name, 'made' => 0.0, 'used' => 0.0,
+                'madePerHour' => null, 'usedPerHour' => null,
+                'sold' => ['units' => 0.0, 'credits' => 0.0, 'trades' => 0, 'unitPrice' => null],
+                'bought' => ['units' => 0.0, 'credits' => 0.0, 'trades' => 0, 'unitPrice' => null],
+                'consumed' => ['units' => 0.0, 'credits' => 0.0, 'trades' => 0, 'unitPrice' => null],
+                'internalIn' => 0.0, 'internalOut' => 0.0,
+            ];
+
+            return $station['goods'][$name];
+        };
+
+        /*
+         * Units per good, out of the recipe every window carries with it. A window records
+         * cycles, not goods, and the recipe travels with it so that a station rebuilt into a
+         * different factory does not rewrite what its old windows made. Optional ingredients
+         * go in on boosted cycles only; the reload catch-up boosts nothing.
+         */
+        $recipes = $this->all(
+            $pdo,
+            "SELECT station, item->>'name' AS good,
+                    COALESCE(SUM((data->>'cycles')::float * (item->>'amount')::float)
+                        FILTER (WHERE side <> 'ingredients'), 0) AS made,
+                    COALESCE(SUM(CASE WHEN item->>'optional' = 'true'
+                                      THEN COALESCE((data->>'boosted')::float, 0)
+                                      ELSE (data->>'cycles')::float END
+                                 * (item->>'amount')::float)
+                        FILTER (WHERE side = 'ingredients'), 0) AS used
+             FROM station_events,
+                  LATERAL (
+                      SELECT 'results' AS side, el AS item
+                          FROM jsonb_array_elements(COALESCE(data->'results', '[]'::jsonb)) el
+                      UNION ALL
+                      SELECT 'garbage', el FROM jsonb_array_elements(COALESCE(data->'garbage', '[]'::jsonb)) el
+                      UNION ALL
+                      SELECT 'ingredients', el FROM jsonb_array_elements(COALESCE(data->'ingredients', '[]'::jsonb)) el
+                  ) recipe
+             WHERE {$scope} AND kind IN ('production', 'catchup')
+             GROUP BY station, item->>'name'",
+            $args
+        );
+
+        foreach ($recipes as $row) {
+            $name = (string) $row['station'];
+            if (!isset($stations[$name]) || (string) $row['good'] === '') {
+                continue;
+            }
+
+            $entry = $good($stations[$name], (string) $row['good']);
+            $entry['made'] += (float) $row['made'];
+            $entry['used'] += (float) $row['used'];
+            $stations[$name]['goods'][(string) $row['good']] = $entry;
+        }
+
+        $trades = $this->all(
+            $pdo,
+            "SELECT station, good, direction, internal,
+                    SUM(units) AS units, SUM(credits) AS credits, COUNT(*)::bigint AS trades
+             FROM station_events
+             WHERE {$scope} AND kind = 'trade' AND good IS NOT NULL
+             GROUP BY station, good, direction, internal",
+            $args
+        );
+
+        foreach ($trades as $row) {
+            $name = (string) $row['station'];
+            $direction = (string) $row['direction'];
+            if (!isset($stations[$name]) || !in_array($direction, ['sold', 'bought', 'consumed'], true)) {
+                continue;
+            }
+
+            $entry = $good($stations[$name], (string) $row['good']);
+            $units = (float) $row['units'];
+
+            if ($this->truthy($row['internal'])) {
+                // Moved inside the faction for nothing: movement, never a price.
+                $entry[$direction === 'bought' ? 'internalIn' : 'internalOut'] += $units;
+            } else {
+                $entry[$direction]['units'] += $units;
+                $entry[$direction]['credits'] += (float) $row['credits'];
+                $entry[$direction]['trades'] += (int) $row['trades'];
+                $stations[$name]['traded'][$direction] += (float) $row['credits'];
+            }
+
+            $stations[$name]['goods'][(string) $row['good']] = $entry;
+        }
+
+        foreach ($stations as &$station) {
+            $span = $station['span'];
+
+            foreach ($station['goods'] as &$entry) {
+                foreach (['sold', 'bought', 'consumed'] as $direction) {
+                    $bucket = &$entry[$direction];
+                    $bucket['unitPrice'] = $bucket['units'] > 0 ? round($bucket['credits'] / $bucket['units'], 2) : null;
+                    unset($bucket);
+                }
+                if ($span > 0) {
+                    $entry['madePerHour'] = round($entry['made'] * 3600 / $span, 3);
+                    $entry['usedPerHour'] = round($entry['used'] * 3600 / $span, 3);
+                }
+            }
+            unset($entry);
+
+            ksort($station['goods']);
+            $station['goods'] = array_values($station['goods']);
+
+            $traded = &$station['traded'];
+            $traded['net'] = $traded['sold'] + $traded['consumed'] - $traded['bought'];
+            $traded['perHour'] = $span > 0 ? round($traded['net'] * 3600 / $span, 2) : null;
+            unset($traded);
+        }
+        unset($station);
+
+        return ['stations' => array_values($stations), 'window' => $window];
+    }
+
+    /**
+     * Stored station events, newest `limit` of them in time order - the trade log.
+     * `kind` narrows to one of trade, production and catchup.
+     */
+    public function stationEvents(array $filter): array
+    {
+        $keyId = $this->keyId(false);
+        if ($keyId === null) {
+            return [];
+        }
+
+        [$scope, $args] = $this->stationEventScope($keyId, $filter);
+
+        if (isset($filter['kind']) && $filter['kind'] !== '') {
+            $scope .= ' AND kind = :kind';
+            $args[':kind'] = (string) $filter['kind'];
+        }
+
+        $limit = max(1, (int) ($filter['limit'] ?? 500));
+
+        $rows = $this->all(
+            $this->db(),
+            "SELECT station, owner, x, y, seq, kind, data,
+                    EXTRACT(EPOCH FROM happened_at)::bigint AS t
+             FROM station_events WHERE {$scope}
+             ORDER BY happened_at DESC, id DESC LIMIT {$limit}",
+            $args
+        );
+
+        $out = [];
+        foreach (array_reverse($rows) as $row) {
+            $event = ['t' => (int) $row['t'], 'station' => (string) $row['station'],
+                      'owner' => (string) $row['owner'], 'x' => (int) $row['x'], 'y' => (int) $row['y'],
+                      'q' => (int) $row['seq']];
+
+            $data = json_decode((string) $row['data'], true);
+            if (is_array($data)) {
+                $event += $data;
+            }
+
+            $out[] = $event;
+        }
+
+        return $out;
+    }
+
+    /** The WHERE behind both station event reads: key, station, owner, sector, window. */
+    private function stationEventScope(int $keyId, array $filter): array
+    {
+        $sql = 'key_id = :k';
+        $args = [':k' => $keyId];
+
+        if (isset($filter['ship']) && $filter['ship'] !== '') {
+            $sql .= ' AND station = :s';
+            $args[':s'] = (string) $filter['ship'];
+        }
+        if (isset($filter['owner']) && $filter['owner'] !== '') {
+            $sql .= ' AND owner = :o';
+            $args[':o'] = (string) $filter['owner'];
+        }
+        if (isset($filter['x'], $filter['y']) && $filter['x'] !== null && $filter['y'] !== null) {
+            $sql .= ' AND x = :x AND y = :y';
+            $args[':x'] = (int) $filter['x'];
+            $args[':y'] = (int) $filter['y'];
+        }
+
+        $sql .= ' AND happened_at <= to_timestamp(:t) AND happened_at >= to_timestamp(:f)';
+        $args[':t'] = $this->windowEnd($filter);
+        $args[':f'] = $this->windowStart($filter);
+
+        return [$sql, $args];
+    }
+
     /** One row of economySummary's station list. */
     private function stationRow(array $row): array
     {
@@ -1203,9 +1651,20 @@ final class History
             [':k' => $keyId]
         );
 
+        // The measured half of the economy: what stations recorded from inside themselves.
+        // Zero on a bridge collecting from a mod that predates the station hooks.
+        $activity = $this->one(
+            $this->db(),
+            "SELECT COUNT(*)::bigint AS n, COUNT(DISTINCT station)::bigint AS stations,
+                    COUNT(*) FILTER (WHERE kind = 'trade')::bigint AS trades,
+                    EXTRACT(EPOCH FROM MIN(happened_at))::bigint AS f
+             FROM station_events WHERE key_id = :k",
+            [':k' => $keyId]
+        );
+
         return [
             'ships' => array_values($ships),
-            'rows' => $total,
+            'rows' => $total + (int) ($activity['n'] ?? 0),
             'retentionDays' => $this->retentionDays,
             'recording' => true,
             'economy' => [
@@ -1213,6 +1672,10 @@ final class History
                 'stations' => (int) ($economy['stations'] ?? 0),
                 'since' => isset($economy['f']) ? (int) $economy['f'] : null,
                 'interval' => $this->economyInterval,
+                'events' => (int) ($activity['n'] ?? 0),
+                'trades' => (int) ($activity['trades'] ?? 0),
+                'recordedStations' => (int) ($activity['stations'] ?? 0),
+                'eventsSince' => isset($activity['f']) ? (int) $activity['f'] : null,
             ],
         ];
     }
@@ -1232,7 +1695,7 @@ final class History
             // ON DELETE CASCADE takes visits, events and ship_state with it, and forgetting
             // the key row means the next write starts over as if nothing had been recorded.
             $removed = 0;
-            foreach (['visits', 'events', 'station_samples', 'faction_samples'] as $table) {
+            foreach (['visits', 'events', 'station_samples', 'faction_samples', 'station_events'] as $table) {
                 $removed += (int) $this->one(
                     $pdo,
                     "SELECT COUNT(*)::bigint AS n FROM {$table} WHERE key_id = :k",
@@ -1254,6 +1717,10 @@ final class History
             }
         }
 
+        $statement = $pdo->prepare('DELETE FROM station_events WHERE key_id = :k AND station = :s');
+        $statement->execute([':k' => $keyId, ':s' => $ship]);
+        $removed += $statement->rowCount();
+
         return ['cleared' => true, 'ship' => $ship, 'removed' => $removed];
     }
 
@@ -1274,7 +1741,8 @@ final class History
         $removed = 0;
 
         foreach ([['visits', 'left_at'], ['events', 'happened_at'],
-                  ['station_samples', 'taken_at'], ['faction_samples', 'taken_at']] as [$table, $column]) {
+                  ['station_samples', 'taken_at'], ['faction_samples', 'taken_at'],
+                  ['station_events', 'happened_at']] as [$table, $column]) {
             $statement = $pdo->prepare(
                 "DELETE FROM {$table} WHERE key_id = :k AND {$column} < to_timestamp(:c) AND NOT "
                 . ($table === 'visits' ? 'open' : 'FALSE')

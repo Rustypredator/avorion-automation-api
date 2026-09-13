@@ -86,6 +86,13 @@ Config.orderConfirmWindow = 3
 Config.shipEventsPerShip = 200
 Config.maxShipEventsPerRead = 200
 
+-- Station activity feed, one ring buffer per owning faction. Stations push trades as they
+-- happen and a production window a minute per factory, so this has to hold what a busy
+-- industry generates between two polls of the bridge's collector - a few hundred events on
+-- a 30s poller for a large one. The margin is for a collector that is briefly down.
+Config.stationEventsPerFaction = 5000
+Config.maxStationEventsPerRead = 1000
+
 -- Default and maximum page sizes for list endpoints.
 Config.defaultPageSize = 100
 Config.maxPageSize = 1000

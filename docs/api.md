@@ -500,7 +500,8 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
   station's own price factor, which is what the game's own trade UI shows as the base.
   **Neither is what a trade will actually settle at.** The real price also carries a
   supply/demand factor that lives in the sector's `economyupdater` script and a relations
-  factor for the counterparty, and neither is in the ship database.
+  factor for the counterparty, and neither is in the ship database. What trades actually
+  settled at is in `observed`, below.
 - `maxStock` is the cap the station itself uses to decide it has no room to produce. The
   cargo bay is split evenly between every good traded, so adding a good lowers the cap on
   all the others. `fill` is `stock / maxStock`: a **sold** good at 1 has nowhere to put the
@@ -526,6 +527,38 @@ Answers `409 not_a_station` for a craft that runs no merchant script.
 - `secured` is false when the engine has not written this craft's scripts to its database
   row yet - a station founded since the last save. Everything else is then empty rather
   than wrong, which otherwise reads exactly like a factory with no line and no income.
+- `observed` is what the station has **actually done** since the server started, recorded
+  from inside it - see [Recorded from inside the station](#recorded-from-inside-the-station).
+  It is on the listing too, and absent for a station nothing has been recorded for yet.
+
+```json
+"observed": {
+  "since": 120.5, "last": 7320.5, "trades": 30,
+  "production": {
+    "seconds": 7200, "slotSeconds": 21600, "busySlotSeconds": 10800,
+    "starvedSeconds": 1800, "blockedSeconds": 0, "idleSeconds": 0,
+    "cycles": 100, "boosted": 0, "catchupSeconds": 0, "catchupCycles": 0,
+    "slots": 3, "cycleSeconds": 72, "utilization": 0.5, "cyclesPerHour": 50
+  },
+  "goods": [
+    {"name": "Oil", "made": 500, "used": 0, "madePerHour": 250, "usedPerHour": 0,
+     "sold": {"units": 400, "credits": 136000, "trades": 10, "unitPrice": 340},
+     "bought": {"units": 0, "credits": 0, "trades": 0},
+     "consumed": {"units": 0, "credits": 0, "trades": 0},
+     "internalIn": 0, "internalOut": 0}
+  ]
+}
+```
+
+  `utilization` is busy slot time over slot time. `starvedSeconds` and `blockedSeconds` are
+  the seconds in which at least one slot sat idle for want of an ingredient or of room for
+  the result, and `idleSeconds` those with no reason given. `cyclesPerHour` is over
+  `seconds + catchupSeconds`, running time plus the unloaded stretches the game caught the
+  factory up for - its real rate, where `production.rate.cyclesPerHour` is its ceiling.
+  `made` and `used` are cycles times the recipe, optional ingredients counted on boosted
+  cycles only. `unitPrice` is the average a good actually traded at. `internalIn` and
+  `internalOut` are units moved between your own stations or to an alliance member, which
+  change hands for nothing and so are never counted as a price.
 
 ### Where these numbers come from, and how fresh they are
 
@@ -544,6 +577,100 @@ on unload, and on the server's regular saves.
   when it went quiet. Which is also all that has happened to it.
 - **true** - the sector is resident, and the figures can trail the live entity by up to
   one save interval.
+
+### Recorded from inside the station
+
+The game writes every station trade into its owner's economy log, and nothing reads that log
+back - there is no getter and no callback. So the mod does not read it. It extends the two
+scripts that write it: `data/scripts/lib/tradingmanager.lua`, behind every merchant script,
+and `data/scripts/entity/merchants/factory.lua`, the production loop. Both of the mod's copies
+are appended to the game's own, and wrap the vanilla functions without changing what they do.
+
+What that records, per player and alliance station:
+
+- **trades** - the good, the units, the price the counterparty actually paid, the owner's
+  share, the transaction tax, who the counterparty was and which ship docked. Docked ships
+  buying and selling, other stations' shuttles, and a population consuming what a habitat
+  bought.
+- **production windows** - once a minute per factory: the cycles started and how many were
+  boosted, busy slot time, and why idle slots were idle, with the recipe it ran.
+- **catch-up** - the production the game runs in one step when an unloaded sector loads
+  again, as cycles over the seconds it covers.
+
+It records **with every player logged out**, and only while the station's sector is loaded:
+nothing runs in an unloaded sector. That loses no money - a player station makes no trades
+while unloaded, and production is caught up on reload - but a sector that has not been
+loaded since has nothing recorded yet. AI stations are not recorded.
+
+The mod holds this in memory: running totals per station (`observed`, above) and a feed per
+owning faction of the last 5000 events (`Config.stationEventsPerFaction`), both empty after a
+restart. The bridge's poller collects the feed into its history store; see
+[`/history/economy/observed`](#get-historyeconomyobserved).
+
+## GET /stations/{name}/events
+
+One station's recorded activity, oldest first. With `since` the page runs forward from it;
+without, it is the newest `limit` events.
+
+| query | values | default |
+|---|---|---|
+| `since` | a `cursor` from a previous response | - |
+| `limit` | 1 - 1000 | 1000 |
+| `owner` | `player`, `alliance`, `all` | `player` |
+
+```json
+{
+  "station": "Rusty Refinery",
+  "owner": {"kind": "player", "index": 1, "name": "..."},
+  "boot": "1757716400", "now": 7320.5,
+  "cursor": 482, "more": false, "gap": false,
+  "recording": true,
+  "observed": {"...": "as on /stations/{name}"},
+  "events": [
+    {"seq": 480, "at": 7250.1, "kind": "trade", "station": "Rusty Refinery", "faction": 1,
+     "sector": {"x": 12, "y": -4},
+     "direction": "sold", "channel": "docked", "good": "Oil", "units": 50,
+     "price": 17000, "unitPrice": 340, "ownerAmount": 17000, "tax": 340,
+     "internal": false, "ship": "Oil Barge",
+     "counterparty": {"index": 900, "name": "The Xsotan Traders", "kind": "ai"}},
+    {"seq": 481, "at": 7260.0, "kind": "production", "station": "Rusty Refinery",
+     "seconds": 60, "slotSeconds": 180, "busySlotSeconds": 120, "starvedSeconds": 30,
+     "blockedSeconds": 0, "idleSeconds": 0, "cycles": 2, "boosted": 0, "utilization": 0.667,
+     "slots": 3, "cycleSeconds": 72,
+     "results": [{"name": "Oil", "amount": 5}],
+     "ingredients": [{"name": "Raw Oil", "amount": 10}], "garbage": []},
+    {"seq": 482, "at": 7300.0, "kind": "catchup", "station": "Rusty Refinery",
+     "seconds": 3600, "cycles": 50, "results": ["..."], "ingredients": ["..."], "garbage": []}
+  ]
+}
+```
+
+- `direction` is the station's side: `sold`, `bought`, or `consumed` (a population eating
+  what it bought, and paying for it). `channel` is `docked`, `direct` (another station, or a
+  trader that never docks) or `population`.
+- `at` and `now` are the server's uptime clock, so an event happened `now - at` seconds
+  before the answer. `boot` changes when the server restarts, and `seq` starts again from
+  zero with it.
+- `recording` is whether the station's sector is loaded right now.
+
+## GET /economy/events
+
+Every recorded event for the caller's stations in one feed - the call a collector makes.
+
+| query | values | default |
+|---|---|---|
+| `owner` | `player`, `alliance`, `all` | `player` |
+| `since` | a `cursor` from a previous response | - |
+| `limit` | 1 - 1000 | 1000 |
+
+The same envelope as above, plus `owners`, with an `owner` on every event. With `since` a
+page runs **forward** from it: `more: true` means ask again with the `cursor` returned, until
+`more` is false. `gap: true` means events after `since` had already fallen out of the buffer
+before they were collected - poll more often. A different `boot` than last time means the
+server restarted, and the collector should start again from `since=0`.
+
+Registered as `/economy/events` rather than under `/stations/` so it cannot shadow a station
+that happens to be called "events".
 
 ## GET /economy
 
@@ -807,6 +934,7 @@ written only when a craft changes sector, so a parked fleet costs nothing.
 | `GET /ships/{name}/events` | the mod's own order and status events, kept past the 200 and past a restart |
 | `GET /stations` | each station's running earnings totals and its stock per good, as a **sample** |
 | `GET /economy` | the faction's money and resources, likewise |
+| `GET /economy/events`, `GET /stations/{name}/events` | the stations' recorded trades, production windows and catch-ups, as **station events** |
 
 Positions come from the ship database, which the mod reads **with every player logged out**,
 so the travel record keeps filling whether or not anything is online to fly.
@@ -816,6 +944,11 @@ and the mod's event log is a 200-entry ring buffer that drops its oldest entry w
 not anyone collected it. The compose stack runs a `poller` service for exactly this - set
 `POLL_KEYS` to the keys whose fleets should be recorded and it calls these endpoints
 every `POLL_INTERVAL` seconds (default 30), which is also the accuracy of a travel track.
+
+The station events are the one collection that is not a snapshot at all: they sit in the
+mod's buffer until something pages through `/economy/events`, and the poller does that on
+every pass with `POLL_ECONOMY` on, carrying a cursor from pass to pass so nothing between two
+passes is skipped. It logs a line if the mod dropped events before they were collected.
 
 Without a poller the record covers only the moments a console or a script happened to be
 running, and a gap in it is a gap in who was looking rather than a gap in what happened.
@@ -1029,6 +1162,62 @@ actually measure.
 
 `stock` is the latest reading in the window, so a good with a large `in`, a small `out` and
 a high `stock` is a line filling its own bay - which is what stops it producing.
+
+## GET /history/economy/observed
+
+What each station **actually did** over the window, out of the station events the bridge
+collected: production against slot time, units per good, and trades at the prices they
+happened at. It is the measured counterpart of the `rate` on `/stations/{name}`, which is a
+ceiling.
+
+Takes `station` (or `ship`), `owner`, `x` and `y` together, `from` and `to`.
+
+```json
+{
+  "window": {"from": 1757630000, "to": 1757716400},
+  "stations": [{
+    "ship": "Rusty Refinery", "owner": "player", "x": 12, "y": -4,
+    "first": 1757630120, "last": 1757716380, "span": 7200, "trades": 30,
+    "production": {
+      "windows": 120, "seconds": 7200, "slotSeconds": 21600, "busySlotSeconds": 10800,
+      "starvedSeconds": 1800, "blockedSeconds": 0, "idleSeconds": 0,
+      "cycles": 100, "boosted": 0, "catchupSeconds": 0, "catchupCycles": 0,
+      "slots": 3, "cycleSeconds": 72, "utilization": 0.5, "cyclesPerHour": 50
+    },
+    "goods": [
+      {"good": "Oil", "made": 500, "used": 0, "madePerHour": 250, "usedPerHour": 0,
+       "sold": {"units": 400, "credits": 136000, "trades": 10, "unitPrice": 340},
+       "bought": {"units": 0, "credits": 0, "trades": 0, "unitPrice": null},
+       "consumed": {"units": 0, "credits": 0, "trades": 0, "unitPrice": null},
+       "internalIn": 0, "internalOut": 0}
+    ],
+    "traded": {"sold": 136000, "bought": 70000, "consumed": 0, "net": 66000, "perHour": 33000}
+  }]
+}
+```
+
+`span` is what the per-hour figures divide by: the seconds the station's production windows
+cover while loaded plus the unloaded stretches the game caught it up for on reload. For a
+factory that is wall-clock time without the gaps nobody was collecting, since the mod buffers
+those. A sector still unloaded at the end of the window has not been caught up yet, and its
+tail is missing from both sides of the division. A station with no production windows - a
+trading post - has no running time to go by, so its span is the time between its first and
+last event.
+
+The fields are those of [`observed`](#get-stationsname) on the mod's own station detail,
+over the window rather than since the server started.
+
+## GET /history/economy/events
+
+The stored station events themselves, newest `limit` in time order: the trade log. Takes
+the same filters as above, plus `kind` - `trade`, `production` or `catchup`.
+
+```json
+{"events": [
+  {"t": 1757716200, "station": "Rusty Refinery", "owner": "player", "x": 12, "y": -4, "q": 480,
+   "kind": "trade", "direction": "sold", "good": "Oil", "units": 50, "price": 17000, "...": "..."}
+]}
+```
 
 ## POST /history/clear
 

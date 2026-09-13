@@ -21,6 +21,7 @@ local ShipsHandler = include("automationapi/handlers/ships")
 local MissionsHandler = include("automationapi/handlers/missions")
 local MovementHandler = include("automationapi/handlers/movement")
 local ShipEvents = include("automationapi/shipevents")
+local StationEvents = include("automationapi/stationevents")
 local MapHandler = include("automationapi/handlers/map")
 local EconomyHandler = include("automationapi/handlers/economy")
 
@@ -596,6 +597,20 @@ function AutomationApiBridge.pushShipEvent(ownerIndex, shipName, kind, payload)
     end
 
     -- false means the event was a duplicate or malformed, not that the call failed
+    return stored == true
+end
+
+-- Called from inside player and alliance stations, by the trading and factory hooks in
+-- automationapi/stationhooks.lua. Those run in the stations' own scripts, so a failure is
+-- logged here and never travels back into the trade that raised it.
+function AutomationApiBridge.pushStationEvent(factionIndex, stationName, kind, payload)
+    local ok, stored = pcall(StationEvents.push, factionIndex, stationName, kind, payload)
+
+    if not ok then
+        logError("pushStationEvent failed for %s: %s", tostring(stationName), tostring(stored))
+        return false
+    end
+
     return stored == true
 end
 

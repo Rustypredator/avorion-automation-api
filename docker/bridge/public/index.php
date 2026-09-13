@@ -98,13 +98,14 @@ function fail(int $status, string $code, string $message): never
  * Folds one relayed answer into the history store, if it is one the store is built from:
  * the fleet listing, which carries every craft's position and keeps working with everyone
  * logged out; a ship's event feed; the station listing, which carries each station's
- * running earnings totals and stock; and the faction ledger.
+ * running earnings totals and stock; the faction ledger; and the stations' own trade and
+ * production feed.
  *
  * Wrapped whole in a try/catch. A history that cannot be written is a lost overlay; a
  * history that takes the API call down with it is an outage. The caller's answer has
  * already been decided by the time this runs and must reach them either way.
  */
-function record(History $history, string $path, stdClass $answer): void
+function record(History $history, string $path, array $query, stdClass $answer): void
 {
     try {
         if ($path === '/ships') {
@@ -130,6 +131,22 @@ function record(History $history, string $path, stdClass $answer): void
 
         if ($path === '/economy') {
             $history->recordFactions($answer);
+            return;
+        }
+
+        /*
+         * The stations' own activity feed. Only a page read in order across every owner -
+         * owner=all with a since - is a continuation the collector's cursor may move past;
+         * a console reading one owner, or the newest page, is stored and nothing more.
+         */
+        if ($path === '/economy/events') {
+            $inOrder = ($query['owner'] ?? '') === 'all' && isset($query['since']);
+            $history->recordStationEvents($answer, $inOrder, (int) ($query['since'] ?? 0));
+            return;
+        }
+
+        if (preg_match('#^/stations/[^/]+/events$#', $path) === 1) {
+            $history->recordStationEvents($answer);
         }
     } catch (Throwable $e) {
         error_log('AutomationAPI bridge: history write failed: ' . $e->getMessage());
@@ -249,6 +266,7 @@ if (str_starts_with($path, '/history')) {
         'x' => isset($query['x']) && $query['x'] !== '' ? (int) $query['x'] : null,
         'y' => isset($query['y']) && $query['y'] !== '' ? (int) $query['y'] : null,
         'limit' => max(0, min(20000, (int) ($query['limit'] ?? 2000))),
+        'kind' => (string) ($query['kind'] ?? ''),
     ];
 
     if ($method === 'GET' && ($what === '' || $what === '/' || $what === '/summary')) {
@@ -286,14 +304,28 @@ if (str_starts_with($path, '/history')) {
         reply(200, $history->economyGoods($filter));
     }
 
+    /*
+     * The measured economy, out of what stations recorded from inside themselves: real
+     * cycles against slot time, units per good, and trades at the prices they happened at.
+     * See History::economyObserved.
+     */
+    if ($method === 'GET' && $what === '/economy/observed') {
+        reply(200, $history->economyObserved($filter));
+    }
+
+    if ($method === 'GET' && $what === '/economy/events') {
+        reply(200, ['events' => $history->stationEvents($filter)]);
+    }
+
     if ($method === 'POST' && $what === '/clear') {
         reply(200, $history->clear($filter['ship'] !== '' ? $filter['ship'] : null));
     }
 
     fail(404, 'no_such_route', sprintf(
         'The bridge serves GET /history/summary, /history/visits, /history/heatmap, '
-        . '/history/events, /history/economy/summary, /history/economy/series and '
-        . '/history/economy/goods, and POST /history/clear. It does not serve %s %s.',
+        . '/history/events, /history/economy/summary, /history/economy/series, '
+        . '/history/economy/goods, /history/economy/observed and /history/economy/events, '
+        . 'and POST /history/clear. It does not serve %s %s.',
         $method, $what === '' ? '/history' : '/history' . $what));
 }
 
@@ -377,7 +409,7 @@ while (microtime(true) < $deadline) {
     // the store gets - and the reason nothing is written before this line.
     if ($keepHistory && $method === 'GET' && $status >= 200 && $status < 300
         && $answer instanceof stdClass) {
-        record(new History($key), $path, $answer);
+        record(new History($key), $path, $query, $answer);
     }
 
     reply($status, $answer);
