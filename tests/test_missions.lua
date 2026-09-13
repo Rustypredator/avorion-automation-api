@@ -140,6 +140,83 @@ local _, explicit = call("POST", "/ships/Prospector/missions/mine/preview",
                          {area = {lower = {x = 0, y = 0}, upper = {x = 14, y = 14}}})
 check(explicit.area.lower.x == 0 and explicit.area.upper.x == 14, "an explicit area is used as given")
 
+-- #### TRADE ROUTES #### --
+
+print("\ntrade routes")
+
+-- What TradeCommand:onAreaAnalysisFinished leaves behind: up to four routes, best first.
+local tradeAnalysis =
+{
+    sectors = 289, reachable = 280, unreachable = 9,
+    sectorsByFaction = {[0] = 120}, reachableCoordinates = {}, biggestFactionInArea = 0,
+    routes =
+    {
+        {name = "Oil", lowest = -0.2, highest = 0.15, profit = 112, profitPerSize = 56,
+         from = {x = -310, y = 318}, to = {x = -300, y = 322}},
+        {name = "Ore", lowest = -0.1, highest = 0.2, profit = 9, profitPerSize = 9,
+         from = {x = -312, y = 320}, to = {x = -305, y = 311}},
+    },
+}
+
+-- Stands in for TradeCommand:calculatePrediction: 400 Oil or 1000 Ore on offer, 20% more
+-- per unit than the analysis figure after perks, and the deposit caps a flight's load.
+Mock.predictionFor = function(config)
+    local prediction = {attackChance = {value = 0.05}, flightTime = {value = 1200},
+                        flights = {from = 0, to = 0}, profitPerFlight = {from = 0, to = 0},
+                        maxAvailable = {value = 0}, transportedPerFlight = 0}
+
+    local route
+    for _, r in ipairs(tradeAnalysis.routes) do
+        if r.name == config.goodName then route = r end
+    end
+    if not route then prediction.error = "No route selected."; return prediction end
+
+    local good = goods[route.name]
+    local available = route.name == "Oil" and 400 or 1000
+    local buyPrice = math.floor(good.price * (1 + route.lowest))
+    local perFlight = math.min(math.floor(768 / good.size), math.floor(config.deposit / buyPrice),
+                               available)
+    if perFlight == 0 then prediction.error = "Not enough cargo space!"; return prediction end
+
+    prediction.maxAvailable.value = available
+    prediction.transportedPerFlight = perFlight
+    prediction.flights = {from = math.ceil(available / perFlight), to = math.ceil(available / perFlight)}
+    prediction.profitPerFlight = {from = 0, to = perFlight * route.profit * 1.2}
+    return prediction
+end
+
+local function callWith(results, method, path, body)
+    local read = send(method, path, body)
+    Mock.flushAsync(results)
+    Bridge.update(Config.pollInterval)
+    return read()
+end
+
+local status, trade = callWith(tradeAnalysis, "POST", "/ships/Prospector/missions/trade/preview", {})
+check(status == 200, "a trade preview with no route chosen still answers")
+check(trade.canStart == false, "and cannot start without a route")
+check(Json.isArray(trade.routes) and #trade.routes == 2, "every route the analysis found is listed")
+
+local oil = trade.routes[1]
+check(oil.good == "Oil" and oil.margin == 0.35, "a route carries its good and price margin")
+check(oil.from.x == -310 and oil.to.y == 322, "and where it buys and sells")
+check(oil.maxAvailable == 400 and oil.perFlight == 384, "predicted at the cargo bay's limit")
+check(oil.flights.to == 2, "which sets the number of flights")
+check(oil.deposit == 384 * 256, "the deposit is the order window's slider maximum")
+check(oil.contractProfit.to == math.floor(400 * 112 * 1.2),
+      "the contract's profit is every unit on offer at the perk-adjusted margin")
+check(oil.selected == false, "nothing is selected until goodName says so")
+
+local _, chosen = callWith(tradeAnalysis, "POST", "/ships/Prospector/missions/trade/preview",
+                           {config = {goodName = "Ore", deposit = oil.deposit}})
+check(chosen.routes[2].selected == true and chosen.routes[1].selected == false,
+      "goodName marks the chosen route")
+
+local _, plain = call("POST", "/ships/Prospector/missions/mine/preview", {})
+check(plain.routes == nil, "other missions carry no routes")
+
+Mock.predictionFor = nil
+
 -- #### VALIDATION #### --
 
 print("\nvalidation gating")

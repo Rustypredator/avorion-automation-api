@@ -154,6 +154,49 @@ with the game's own wording:
 Duration and other numeric config are clamped to the command's own limits, exactly as the
 game clamps them, and the clamped values are echoed back.
 
+### Trade routes
+
+A trade preview also carries `routes`: every route the area analysis found (up to four),
+in the game's order. A trade mission flies one of them, picked by `config.goodName`, and
+needs a `config.deposit` - the down payment the captain buys with. Without a `goodName`
+the preview still answers, with `errors.prediction` saying no route is selected, so a
+first preview with an empty config is how you learn which goods an area offers.
+
+```jsonc
+"routes": [{
+  "good": "Oil", "price": 320, "size": 2,
+  "lowest": -0.2, "highest": 0.15,
+  "margin": 0.35,                         // the order window's "%" column
+  "profitPerUnit": 112,                   // its "¢/u" column, before captain perks
+  "from": {"x": -310, "y": 318}, "to": {"x": -300, "y": 322},
+  "deposit": 98304,                       // the order window's slider maximum
+  "maxAvailable": 400, "perFlight": 200,  // the game spreads a contract evenly over its flights
+  "flights": {"from": 2, "to": 2},
+  "profitPerFlight": {"from": 25200, "to": 28000},
+  "contractProfit": {"from": 50400, "to": 56000},
+  "flightTime": 1500, "attackChance": 0.08,
+  "selected": false                       // true for the route config.goodName names
+}]
+```
+
+Every figure after `to` is the game's own `calculatePrediction` run for that route at
+`deposit`, which is what the order window offers at most: every unit on offer, or as many
+as the free cargo space holds, at the pre-perk purchase price. `contractProfit` is all of
+`maxAvailable` at the perk-adjusted margin; each flight pays out 90-100% of its figure,
+hence the range. A route the ship cannot fly at all has `error` in place of the
+predicted figures.
+
+Sending a route's `good` as `goodName` and its `deposit` as `deposit` (and `maxDeposit`)
+reproduces what the game would start at full down payment.
+
+Which routes an area offers depends on which stations fall inside it, and the ship only
+has to be somewhere in the area, not in its middle. Finding the best contract means
+previewing the area at several placements around the ship: the console's **Scan
+placements** does this, trying each of the three shapes with the ship in every corner, the
+middle of every side and the centre. Each placement is a separate area analysis, so run
+them one after another - a second analysis for the same ship answers
+`409 analysis_in_progress`.
+
 ## POST /ships/{name}/missions/{mission}/start
 
 Same request body as preview. Validates first and refuses with `422` and the full preview

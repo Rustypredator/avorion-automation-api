@@ -167,10 +167,64 @@ const storedEvents = {
     ]
 };
 
+/* Escort candidates: one shares Ore Hound's sector, one is far off. */
+function escortShip(name, x, y) {
+    return Object.assign({}, hound, { name: name, position: { x: x, y: y } });
+}
+
+const wingman = escortShip('Wingman', 1, 2);
+const farScout = escortShip('Far Scout', 40, 40);
+
+/*
+ * A trade preview whose routes depend on the area, the way the game's do. Ore Hound sits
+ * at 1:2. Oil sells at 15:2 - inside any area reaching 15 to the east. Gold sells at
+ * -20:2, reachable only by the wide 29x11 shape with the ship on its eastern edge; it has
+ * the better margin and the smaller contract.
+ */
+const tradeCatalog = {
+    ship: 'Ore Hound', usable: { ok: true },
+    missions: [{
+        mission: 'trade', areaFixed: false, shipRequiredInArea: true, configurable: {},
+        areaSizes: [{ x: 17, y: 17 }, { x: 29, y: 11 }, { x: 11, y: 29 }]
+    }]
+};
+
+function tradeRoute(good, margin, contract, sellX) {
+    return {
+        good: good, margin: margin, lowest: -0.1, highest: margin - 0.1, profitPerUnit: 50,
+        from: { x: 1, y: 2 }, to: { x: sellX, y: 2 }, deposit: 40000, maxAvailable: 800,
+        perFlight: 100, flights: { from: 3, to: 8 }, flightTime: 1500, attackChance: 0.1,
+        profitPerFlight: { from: 9000, to: 10000 },
+        contractProfit: { from: Math.ceil(contract * 0.9), to: contract }
+    };
+}
+
+function tradePreview(body) {
+    const area = body.area;
+    const holds = (x, y) => x >= area.lower.x && x <= area.upper.x
+                            && y >= area.lower.y && y <= area.upper.y;
+    const found = [];
+    if (holds(15, 2)) { found.push(tradeRoute('Oil', 0.25, 80000, 15)); }
+    if (holds(-20, 2)) { found.push(tradeRoute('Gold', 0.4, 30000, -20)); }
+
+    return {
+        mission: 'trade', ship: 'Ore Hound', canStart: !!body.config.goodName,
+        area: { lower: area.lower, upper: area.upper }, config: body.config,
+        prediction: {}, assessment: [], errors: {}, routes: found
+    };
+}
+
+const posts = [];
+
+const dynamic = {
+    '/ships/Ore%20Hound/missions/trade/preview': tradePreview
+};
+
 const routes = {
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
-    '/ships': { ships: [refinery, hound], count: 2 },
+    '/ships': { ships: [refinery, hound, wingman, farScout], count: 4 },
+    '/ships/Ore%20Hound/missions': tradeCatalog,
     '/ships/Rusty%20Refinery': refinery,
     '/ships/Ore%20Hound': hound,
     '/ships/Ore%20Hound/events': liveEvents,
@@ -231,9 +285,16 @@ window.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, {
 window.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 
 // api.js reads response.text() and parses it itself, so json() is never called.
-window.fetch = function (url) {
+window.fetch = function (url, init) {
     const parsed = new window.URL(url, 'http://api.test');
-    const body = routes[parsed.pathname];
+    let body = routes[parsed.pathname];
+
+    if (init && init.method === 'POST') {
+        const sent = JSON.parse(init.body || '{}');
+        posts.push({ path: parsed.pathname, body: sent });
+        if (dynamic[parsed.pathname]) { body = dynamic[parsed.pathname](sent); }
+    }
+
     const payload = body !== undefined
         ? body
         : { error: { code: 'no_such_route', message: parsed.pathname } };
@@ -272,7 +333,7 @@ const ready = window.document.readyState === 'loading'
     // does not exist until it has run.
     await settle(4800);
 
-    check($$('#fleet-rows [data-ship]').length === 2, 'the fleet lists both craft');
+    check($$('#fleet-rows [data-ship]').length === 4, 'the fleet lists every craft');
 
     console.log('\nsubtabs for a ship');
 
@@ -455,6 +516,69 @@ const ready = window.document.readyState === 'loading'
     $('[data-ship="Ore Hound"]').click();
     await settle(400);
 
+    console.log('\nthe mission planner');
+
+    tab('mission').click();
+    await settle(600);
+
+    const planner = $('#sv-mission');
+    const escortChips = $$('#sv-mission [data-escort]');
+
+    check(escortChips.length === 2, 'every other available ship is offered as an escort');
+    check(escortChips[0].dataset.escort === 'Wingman' && escortChips[0].classList.contains('near'),
+          'one in the same sector comes first, marked');
+    check(!escortChips[1].classList.contains('near'), 'one elsewhere is not marked');
+
+    click(planner.querySelector('[data-act="escorts-near"]'));
+    await settle(50);
+    check($('#sv-mission [data-escort="Wingman"]').classList.contains('on'),
+          'the same-sector shortcut selects it');
+    check(!$('#sv-mission [data-escort="Far Scout"]').classList.contains('on'),
+          'and leaves the far one alone');
+
+    console.log('\nthe trade placement scan');
+
+    posts.length = 0;
+    click(planner.querySelector('[data-act="scan"]'));
+    await settle(4000);
+
+    const scanned = posts.filter((p) => /trade\/preview$/.test(p.path));
+    check(scanned.length === 27, 'every shape is previewed at nine placements (got ' + scanned.length + ')');
+
+    const areas = scanned.map((p) => p.body.area);
+    check(areas.every((a) => a.lower.x <= 1 && a.upper.x >= 1 && a.lower.y <= 2 && a.upper.y >= 2),
+          'every placement keeps the ship inside the area');
+    check(areas[0].lower.x === 1 && areas[0].lower.y === 2 && areas[0].upper.x === 17,
+          'the first puts the ship in the top-left corner of the square');
+    check(areas.some((a) => a.lower.x === -27 && a.upper.x === 1 && a.upper.y - a.lower.y === 10),
+          'the wide shape is tried with the ship on its eastern edge');
+    check(scanned.every((p) => p.body.escorts.indexOf('Wingman') !== -1),
+          'the chosen escorts go with every preview');
+
+    let rows = $$('#sv-mission .scan-table tbody tr');
+    check(rows.length === 2, 'a route found in several placements is listed once');
+    check(/Gold/.test(rows[0].textContent) && /\+40%/.test(rows[0].textContent),
+          'ranked by margin, the best margin comes first');
+
+    click(planner.querySelector('[data-scan-rank="contract"]'));
+    await settle(50);
+    rows = $$('#sv-mission .scan-table tbody tr');
+    check(/Oil/.test(rows[0].textContent), 'ranked by total profit, the bigger contract does');
+
+    posts.length = 0;
+    click(rows[0].querySelector('[data-scan-use]'));
+    await settle(400);
+
+    const used = posts.filter((p) => /trade\/preview$/.test(p.path)).pop();
+    check(used && used.body.config.goodName === 'Oil' && used.body.config.deposit === 40000,
+          'using a row previews that route at its deposit');
+    check(used && used.body.area.lower.x === 1 && used.body.area.lower.y === 2
+          && used.body.area.upper.x === 17,
+          'in the placement that found it');
+    check(/Trade routes/.test(planner.textContent)
+          && planner.querySelector('tr.sel') && /Oil/.test(planner.querySelector('tr.sel').textContent),
+          'and the preview marks it as the chosen route');
+
     console.log('\nexplanations behind a mark');
 
     tab('overview').click();
@@ -483,9 +607,12 @@ const ready = window.document.readyState === 'loading'
      * the key itself - a slug where a sentence should be. So open every mark currently
      * rendered and insist none of them answers with its own key back.
      */
+    // Only slugs count: a mark carrying a sentence of its own answers with that sentence by
+    // design, as the mission area's rules do.
     const unresolved = $$('.explain').filter((mark) => {
         mark.click();
-        return popover.textContent.trim() === mark.dataset.explain;
+        return /^[a-z0-9-]+$/.test(mark.dataset.explain)
+            && popover.textContent.trim() === mark.dataset.explain;
     }).map((mark) => mark.dataset.explain);
 
     check(unresolved.length === 0,

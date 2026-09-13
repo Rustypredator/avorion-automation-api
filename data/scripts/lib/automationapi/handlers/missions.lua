@@ -21,6 +21,9 @@ local FactionScope = include("automationapi/factionscope")
 
 local SimulationUtility = include("simulationutility")
 
+-- Pure data defining the `goods` global; trade routes are priced off it.
+include("goods")
+
 local Missions = {}
 
 -- #### HELPERS #### --
@@ -144,6 +147,114 @@ local function describeMission(key, ownerIndex, shipName)
     return described
 end
 
+-- #### TRADE ROUTES #### --
+
+-- Trade is the one mission whose analysis offers a choice: up to four routes, of which
+-- config.goodName picks one. The order window lists them; preview never did, so a caller
+-- had no way to learn what goodName could even be, let alone compare two areas.
+--
+-- Each route is predicted the way the order window would at its deposit slider's maximum:
+-- the whole contract, in as few flights as the cargo bay allows. The window's slider tops
+-- out at min(goods available, cargo space) units at the pre-perk purchase price, and the
+-- goods available only come out of a prediction - so the route is predicted twice, once
+-- with a deposit big enough never to be the limit, then again at the window's figure.
+local UNLIMITED_DEPOSIT = 1e15
+
+local function round2(value)
+    return math.floor(value * 100 + 0.5) / 100
+end
+
+local function describeTradeRoutes(command, owner, shipName, area, config)
+    local routes = Json.array({})
+
+    local analysis = area.analysis
+    if type(analysis) ~= "table" or type(analysis.routes) ~= "table" then return routes end
+
+    local freeCargo = 0
+    local entry = ShipDatabaseEntry(owner.index, shipName)
+    if entry then
+        local ok, free = pcall(function() return entry:getFreeCargoSpace() end)
+        if ok and type(free) == "number" then freeCargo = free end
+    end
+
+    local function predict(goodName, deposit)
+        local routeConfig = {}
+        for field, value in pairs(config or {}) do routeConfig[field] = value end
+        routeConfig.goodName = goodName
+        routeConfig.deposit = deposit
+
+        local ok, predicted = pcall(function()
+            return FactionScope.with(owner.faction, function()
+                return command:calculatePrediction(owner.index, shipName, area, routeConfig)
+            end)
+        end)
+
+        if not ok then return {error = tostring(predicted)} end
+        return type(predicted) == "table" and predicted or {}
+    end
+
+    for _, route in ipairs(analysis.routes) do
+        local lowest = Serialize.number(route.lowest, 0)
+        local highest = Serialize.number(route.highest, 0)
+
+        local described =
+        {
+            good = Serialize.string(route.name),
+            lowest = lowest,
+            highest = highest,
+            -- the order window's "%" column: the spread between buying and selling
+            margin = round2(highest - lowest),
+            -- the window's "¢/u" column, before captain perks
+            profitPerUnit = Serialize.number(route.profit),
+            from = route.from and Serialize.vec2(route.from.x, route.from.y) or nil,
+            to = route.to and Serialize.vec2(route.to.x, route.to.y) or nil,
+            selected = config and config.goodName == route.name or false,
+        }
+
+        local reference = goods and goods[route.name or ""] or nil
+        if reference then
+            described.price = Serialize.number(reference.price)
+            described.size = Serialize.number(reference.size)
+        end
+
+        local open = predict(route.name, UNLIMITED_DEPOSIT)
+        local maxAvailable = open.maxAvailable and Serialize.number(open.maxAvailable.value)
+        local transported = Serialize.number(open.transportedPerFlight, 0)
+
+        if open.error or not maxAvailable or transported <= 0 or not reference then
+            described.error = Serialize.message(open.error or "Not enough cargo space!", open.errorArgs)
+        else
+            -- what a unit actually earns, captain perks included
+            local unitProfit = Serialize.number(open.profitPerFlight.to, 0) / transported
+
+            local carriable = math.min(maxAvailable, math.floor(freeCargo / reference.size))
+            local minPrice = math.ceil(reference.price * (1 + lowest))
+            local deposit = carriable * minPrice
+
+            local full = predict(route.name, deposit)
+            if full.error then full = open end
+
+            described.deposit = deposit
+            described.maxAvailable = maxAvailable
+            described.perFlight = Serialize.number(full.transportedPerFlight)
+            described.flights = full.flights and
+                {from = Serialize.number(full.flights.from), to = Serialize.number(full.flights.to)}
+            described.profitPerFlight = full.profitPerFlight and
+                {from = Serialize.number(full.profitPerFlight.from),
+                 to = Serialize.number(full.profitPerFlight.to)}
+            -- each flight pays out 90-100% of its figure, as the command rolls it
+            local contract = math.floor(maxAvailable * unitProfit)
+            described.contractProfit = {from = math.ceil(contract * 0.9), to = contract}
+            described.flightTime = full.flightTime and Serialize.number(full.flightTime.value)
+            described.attackChance = full.attackChance and Serialize.number(full.attackChance.value)
+        end
+
+        routes[#routes + 1] = described
+    end
+
+    return routes
+end
+
 -- #### PREVIEW AND START #### --
 
 -- Validates and predicts against a completed analysis. Shared by preview and start so the
@@ -257,12 +368,18 @@ local function assess(owner, shipName, key, missionType, area, results, config)
     local okStats, stats = pcall(function() return SimulationUtility.getAreaStats(area) end)
     if okStats then areaStats = Serialize.value(stats) end
 
+    local routes
+    if key == "trade" then
+        routes = describeTradeRoutes(command, owner, shipName, area, command.config)
+    end
+
     return
     {
         command = command,
         body =
         {
             mission = key,
+            routes = routes,
             ship = shipName,
             owner = Owner.describe(owner),
             area =

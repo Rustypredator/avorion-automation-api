@@ -245,6 +245,16 @@ td.num + td, th.num + th { padding-left: 12px; }
 .chip:hover { color: var(--text); }
 .chip.on { background: var(--accent-2); border-color: var(--accent); color: #eaf9fc; }
 .chip.off { opacity: .45; }
+/* An escort candidate sharing the selected ship's sector. */
+.chip.near { border-color: var(--good); color: var(--text); }
+.chip.near::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: 1px; }
+.chip.near.on { border-color: var(--good); }
+
+/* Trade routes: the one a start would fly, and the best a placement scan turned up. */
+tr.sel td { background: var(--bg-3); }
+tr.sel td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+tr.best td { color: var(--good); }
+.scan-table { overflow-x: auto; }
 
 .errbox { border: 1px solid #5c2a2a; background: #251313; border-radius: 5px; padding: 9px 11px; margin-bottom: 10px; }
 .errbox h3 { color: #f0a0a0; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; margin-bottom: 5px; }

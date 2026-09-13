@@ -577,11 +577,14 @@ function M.makeCommand(missionType, shipName, area, config)
     end
     function c:getPredictableValues() return {yields = {}, attackChance = {value = 0}} end
     function c:getErrors() return M.commandError, M.commandErrorArgs end
-    function c:calculatePrediction()
+    function c:calculatePrediction(ownerIndex, shipName, predictedArea, predictedConfig)
         -- Vanilla prediction code indexes things it assumes are there - the captain,
         -- most often - and raises outright when they are not. That is a different
         -- failure from returning an error, and the mod has to survive both.
         if M.predictionRaises then error(M.predictionRaises, 0) end
+
+        -- trade predictions depend on the route and deposit in the config
+        if M.predictionFor then return M.predictionFor(predictedConfig or {}) end
 
         return {attackChance = {value = 0.12}, yields = {{from = 100, to = 200}},
                 error = M.predictionError}

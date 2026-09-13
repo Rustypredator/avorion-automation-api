@@ -411,6 +411,18 @@
       + 'a start runs &mdash; including the game\'s own calculatePrediction, the function '
       + 'behind the order window\'s yield and risk figures. It takes a second or two.',
 
+    'trade-scan':
+      'Previews the trade area with the ship in each corner, the middle of each side and '
+      + 'the centre, for every area shape the captain allows, and ranks every route found. '
+      + 'Each placement is its own area analysis, so a full scan takes a while. Nothing '
+      + 'is started; pick a row to load it into the form and preview it.',
+
+    'trade-routes':
+      'The routes the game offers for this area. Figures assume the full down payment the '
+      + 'order window allows &mdash; every unit on offer, in as few flights as the cargo '
+      + 'bay fits. Total profit is the contract&rsquo;s upper bound: each flight pays out '
+      + '90&ndash;100% of its figure.',
+
     'orders-unconfirmed':
       'Not proof of failure: a one-shot order that finishes instantly can land and clear '
       + 'again inside the window. The event log below shows what actually happened.',
@@ -1626,6 +1638,21 @@
     return body;
   }
 
+  /* Ships that could escort the selected one, those sharing its sector first: they are
+     the ones a player actually means to send along, and with a big fleet they were lost
+     somewhere in an alphabetical wall of chips. */
+  function escortCandidates() {
+    var here = (S.byName[S.selected] || {}).position;
+    var list = S.ships.filter(function (s) {
+      return s.name !== S.selected && s.type === 'Ship' && s.availability === 'Available';
+    }).map(function (s) {
+      var near = !!(here && s.position && s.position.x === here.x && s.position.y === here.y);
+      return { ship: s, near: near };
+    });
+    // Array sort is stable, so each group keeps the fleet's own order
+    return list.sort(function (a, b) { return (b.near ? 1 : 0) - (a.near ? 1 : 0); });
+  }
+
   function renderMission() {
     if (!S.selected) { return; }
     var out = [];
@@ -1829,15 +1856,19 @@
     }
 
     /* --- escorts ------------------------------------------------------ */
-    var candidates = S.ships.filter(function (s) {
-      return s.name !== S.selected && s.type === 'Ship' && s.availability === 'Available';
-    });
+    var candidates = escortCandidates();
     if (candidates.length) {
-      left.push('<div class="card"><h3>Escorts</h3><div class="chips">'
-        + candidates.map(function (s) {
-            var on = form.escorts.indexOf(s.name) !== -1;
-            return '<button class="chip' + (on ? ' on' : '') + '" data-escort="'
-              + esc(s.name) + '">' + esc(s.name) + '</button>';
+      var nearby = candidates.filter(function (c) { return c.near; }).length;
+      left.push('<div class="card"><h3>Escorts'
+        + (nearby ? ' <span class="mute2">' + nearby + ' in this sector</span>'
+            + ' <button class="ghost small" data-act="escorts-near">select these</button>' : '')
+        + '</h3><div class="chips">'
+        + candidates.map(function (c) {
+            var on = form.escorts.indexOf(c.ship.name) !== -1;
+            return '<button class="chip' + (on ? ' on' : '') + (c.near ? ' near' : '')
+              + '" data-escort="' + esc(c.ship.name) + '"'
+              + (c.near ? ' title="In the same sector as ' + esc(S.selected) + '"' : '')
+              + '>' + esc(c.ship.name) + '</button>';
           }).join('')
         + '</div></div>');
     }
@@ -1858,16 +1889,320 @@
     }
 
     var canStart = preview && preview.canStart;
+    var scanning = !!(form.scan && form.scan.running);
+    var scannable = form.mission === 'trade' && (entry.areaSizes || []).length > 0;
 
     var actions = '<div class="row" style="margin:12px 0">'
-      + '<button class="primary" data-act="preview"' + (form.running ? ' disabled' : '') + '>Preview</button>'
-      + '<button data-act="start"' + (canStart ? ' class="primary"' : ' disabled')
+      + '<button class="primary" data-act="preview"' + (form.running || scanning ? ' disabled' : '') + '>Preview</button>'
+      + '<button data-act="start"' + (canStart && !scanning ? ' class="primary"' : ' disabled')
       + '>Start ' + esc(form.mission) + '</button>'
+      + (scannable
+          ? (scanning
+              ? '<button class="ghost" data-act="scan-stop">Stop scan</button>'
+              : '<button data-act="scan"' + (form.running ? ' disabled' : '') + '>Scan placements</button>')
+            + ' ' + explain('trade-scan')
+          : '')
       + (form.running ? '<span class="mute2">running the area analysis…</span>' : '')
       + '</div>';
 
     return '<div class="section"><h2>Start a mission</h2>' + body + actions
+      + (form.scan ? renderScan(form.scan) : '')
       + '<div class="grid2"><div>' + left.join('') + '</div><div>' + right.join('') + '</div></div>'
+      + '</div>';
+  }
+
+  /* ============================ TRADE PLACEMENTS ============================
+   *
+   * A trade area has to contain the ship, but the ship does not have to sit in its
+   * middle, and which stations fall inside decides which routes the game offers. Finding
+   * the best contract by hand means re-placing the area around the ship over and over:
+   * every corner, the middle of every side, for each of the three shapes. That is what
+   * the scan does, one preview at a time - each needs its own area analysis, the server
+   * runs one per ship at once, and two dozen of them will not fit in one request.
+   */
+
+  /* Where the ship sits inside the area, as a fraction of each side: 0 is the low edge
+     (left, top - map y grows downwards), 1 the high edge. */
+  var PLACEMENTS = [
+    { label: 'top-left corner',     fx: 0,   fy: 0 },
+    { label: 'top-right corner',    fx: 1,   fy: 0 },
+    { label: 'bottom-left corner',  fx: 0,   fy: 1 },
+    { label: 'bottom-right corner', fx: 1,   fy: 1 },
+    { label: 'top side',            fx: 0.5, fy: 0 },
+    { label: 'bottom side',         fx: 0.5, fy: 1 },
+    { label: 'left side',           fx: 0,   fy: 0.5 },
+    { label: 'right side',          fx: 1,   fy: 0.5 },
+    { label: 'centre',              fx: 0.5, fy: 0.5 }
+  ];
+
+  var SCAN_RANKS = {
+    margin:   { label: 'margin',        value: function (r) { return r.margin; } },
+    contract: { label: 'total profit',  value: function (r) { return r.contractProfit && r.contractProfit.to; } },
+    hourly:   { label: 'profit / hour', value: routeHourly }
+  };
+
+  /* Offset of the ship from the area's low edge. The middle matches formArea's rounding,
+     so a placement turns back into a centre without drifting a sector. */
+  function placementOffset(fraction, length) {
+    if (fraction === 0) { return 0; }
+    if (fraction === 1) { return length - 1; }
+    return Math.floor((length - 1) / 2);
+  }
+
+  function placementArea(position, size, placement) {
+    var lower = {
+      x: position.x - placementOffset(placement.fx, size.x),
+      y: position.y - placementOffset(placement.fy, size.y)
+    };
+    return { lower: lower, upper: { x: lower.x + size.x - 1, y: lower.y + size.y - 1 } };
+  }
+
+  /* The whole contract over the time it takes to fly it. */
+  function routeHourly(route) {
+    if (!route.contractProfit || !route.flights || !route.flightTime) { return null; }
+    var seconds = route.flights.to * route.flightTime;
+    return seconds > 0 ? route.contractProfit.to / seconds * 3600 : null;
+  }
+
+  function routeKey(route) {
+    return route.good + '@' + coords(route.from) + '>' + coords(route.to);
+  }
+
+  function runScan() {
+    var form = S.missionForm;
+    var name = S.selected;
+    var ship = S.byName[name];
+    if (!form || !ship || !ship.position) { return; }
+
+    var jobs = [];
+    (form.entry.areaSizes || []).forEach(function (size, sizeIndex) {
+      PLACEMENTS.forEach(function (placement) {
+        var area = placementArea(ship.position, size, placement);
+        jobs.push({ sizeIndex: sizeIndex, size: size, placement: placement,
+                    lower: area.lower, upper: area.upper });
+      });
+    });
+
+    var scan = form.scan = {
+      running: true, done: 0, total: jobs.length, found: [], failed: [],
+      from: { x: ship.position.x, y: ship.position.y },
+      rank: form.scan ? form.scan.rank : 'margin'
+    };
+    renderMission();
+
+    function stale() {
+      return scan.stopped || S.selected !== name || S.missionForm !== form || form.scan !== scan;
+    }
+
+    function finish() {
+      scan.running = false;
+      renderMission();
+      var best = rankedScan(scan)[0];
+      if (best) {
+        toast('good', 'Scan finished', 'Best by ' + SCAN_RANKS[scan.rank].label + ': '
+              + best.route.good + ', ship at the ' + best.placement.label + ' of '
+              + best.size.x + '×' + best.size.y + '.');
+      } else {
+        toast('warn', 'Scan finished', 'No trade routes in any placement.');
+      }
+    }
+
+    function next(index, attempt) {
+      if (stale()) { return; }
+      if (index >= jobs.length) { finish(); return; }
+
+      var job = jobs[index];
+      // No route or deposit: they belong to one area, and every placement is a new one.
+      var body = { area: { lower: job.lower, upper: job.upper }, config: {}, escorts: form.escorts };
+
+      Api.post('/ships/' + Api.seg(name) + '/missions/trade/preview', body,
+               { owner: ownerParamFor(name) },
+               { priority: Api.P.USER, label: 'scan ' + (index + 1) + '/' + jobs.length })
+        .then(function (result) {
+          if (stale()) { return; }
+          (result.routes || []).forEach(function (route) {
+            if (!route.error) { scan.found.push({ job: job, route: route }); }
+          });
+          scan.done++;
+          renderMission();
+          next(index + 1, 0);
+        })
+        .catch(function (error) {
+          if (stale()) { return; }
+          // The analysis slots are shared with every other caller; wait for one.
+          var busy = error.code === 'analysis_busy' || error.code === 'analysis_in_progress';
+          if (busy && attempt < 5) {
+            setTimeout(function () { next(index, attempt + 1); }, 1500);
+            return;
+          }
+          scan.failed.push({ job: job, error: error });
+          scan.done++;
+          renderMission();
+          next(index + 1, 0);
+        });
+    }
+
+    next(0, 0);
+  }
+
+  function stopScan() {
+    var scan = S.missionForm && S.missionForm.scan;
+    if (!scan) { return; }
+    scan.stopped = true;
+    scan.running = false;
+    renderMission();
+  }
+
+  /* One row per distinct route, best first. The same route turns up in every placement
+     whose area holds both its stations, at the same prices; only the attack chance
+     differs, so the safest placement stands for it. */
+  function rankedScan(scan) {
+    var byRoute = {};
+    scan.found.forEach(function (hit) {
+      var key = routeKey(hit.route);
+      var kept = byRoute[key];
+      if (!kept) {
+        byRoute[key] = { route: hit.route, job: hit.job, placements: 1 };
+        return;
+      }
+      kept.placements++;
+      if ((hit.route.attackChance || 0) < (kept.route.attackChance || 0)) {
+        kept.route = hit.route;
+        kept.job = hit.job;
+      }
+    });
+
+    var value = SCAN_RANKS[scan.rank].value;
+    return Object.keys(byRoute).map(function (key) {
+      var row = byRoute[key];
+      return { route: row.route, placements: row.placements, sizeIndex: row.job.sizeIndex,
+               size: row.job.size, placement: row.job.placement, lower: row.job.lower };
+    }).sort(function (a, b) { return (value(b.route) || 0) - (value(a.route) || 0); });
+  }
+
+  function renderScan(scan) {
+    var rows = rankedScan(scan);
+    scan.rows = rows;
+
+    var head = '<div class="row" style="justify-content:space-between">'
+      + '<h3>Placement scan <span class="mute2">around ' + coords(scan.from) + '</span></h3>'
+      + '<div class="row tight"><span class="mute2">rank by</span>'
+      + Object.keys(SCAN_RANKS).map(function (key) {
+          return '<button class="chip' + (scan.rank === key ? ' on' : '') + '" data-scan-rank="'
+            + key + '">' + SCAN_RANKS[key].label + '</button>';
+        }).join('')
+      + '</div></div>';
+
+    var status = scan.running
+      ? '<div class="mute2">' + scan.done + ' of ' + scan.total + ' placements analysed…</div>'
+        + bar(scan.done / scan.total, '')
+      : '<div class="mute2">' + scan.done + ' of ' + scan.total + ' placements analysed'
+        + (scan.stopped ? ', stopped' : '') + '.</div>';
+
+    if (scan.failed.length) {
+      status += '<div class="note warn">' + scan.failed.length + ' failed: '
+        + esc(scan.failed.map(function (f) {
+            return f.job.size.x + '×' + f.job.size.y + ' ' + f.job.placement.label
+              + ' (' + (f.error.code || 'error') + ')';
+          }).join(', '))
+        + '</div>';
+    }
+
+    var table = '';
+    if (rows.length) {
+      table = '<div class="scan-table"><table><thead><tr>'
+        + '<th>good</th><th class="num">margin</th><th class="num">¢/u</th>'
+        + '<th class="num">total profit</th><th class="num">flights</th>'
+        + '<th class="num">profit/h</th><th class="num">attack</th>'
+        + '<th>buy → sell</th><th>area</th><th></th>'
+        + '</tr></thead><tbody>'
+        + rows.map(function (row, i) {
+            var r = row.route;
+            return '<tr' + (i === 0 ? ' class="best"' : '') + '>'
+              + '<td>' + esc(r.good) + '</td>'
+              + '<td class="num">' + marginText(r.margin) + '</td>'
+              + '<td class="num">' + credits(r.profitPerUnit) + '</td>'
+              + '<td class="num">' + credits(r.contractProfit && r.contractProfit.to) + '</td>'
+              + '<td class="num">' + num(r.flights && r.flights.to) + '</td>'
+              + '<td class="num">' + credits(routeHourly(r)) + '</td>'
+              + '<td class="num">' + pct(r.attackChance) + '</td>'
+              + '<td>' + coords(r.from) + ' → ' + coords(r.to) + '</td>'
+              + '<td>' + row.size.x + '×' + row.size.y + ' <span class="mute2">'
+              + esc(row.placement.label)
+              + (row.placements > 1 ? ' +' + (row.placements - 1) + ' more' : '') + '</span></td>'
+              + '<td><button class="ghost small" data-scan-use="' + i + '"'
+              + (scan.running ? ' disabled' : '') + '>use</button></td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    } else if (!scan.running) {
+      table = '<div class="note">No placement found a trade route. Routes need known sectors '
+        + 'with stations buying and selling the same good.</div>';
+    }
+
+    return '<div class="card" style="margin-bottom:12px">' + head + status + table + '</div>';
+  }
+
+  function marginText(margin) {
+    if (margin == null) { return '—'; }
+    return '+' + Math.round(margin * 100) + '%';
+  }
+
+  /* Points the form at a route in the current area and previews it. The deposit is the
+     order window's slider maximum, which the server worked out for the route. */
+  function useRoute(good) {
+    var form = S.missionForm;
+    var routes = form && form.preview && form.preview.routes || [];
+    var route = routes.filter(function (r) { return r.good === good; })[0];
+    if (!route) { return; }
+
+    form.config.goodName = route.good;
+    form.config.deposit = route.deposit;
+    form.config.maxDeposit = route.deposit;
+    runPreview();
+  }
+
+  function useScanRow(index) {
+    var form = S.missionForm;
+    var row = form && form.scan && form.scan.rows && form.scan.rows[index];
+    if (!row) { return; }
+
+    form.sizeIndex = row.sizeIndex;
+    form.center = {
+      x: row.lower.x + Math.floor((row.size.x - 1) / 2),
+      y: row.lower.y + Math.floor((row.size.y - 1) / 2)
+    };
+    form.config.goodName = row.route.good;
+    form.config.deposit = row.route.deposit;
+    form.config.maxDeposit = row.route.deposit;
+    form.preview = null;
+    runPreview();
+  }
+
+  function renderRoutes(p) {
+    var goodName = p.config && p.config.goodName;
+    return '<div class="card" style="margin-top:10px"><h3>Trade routes ' + explain('trade-routes') + '</h3>'
+      + (p.routes.length ? '<div class="scan-table"><table><thead><tr>'
+        + '<th>good</th><th class="num">margin</th><th class="num">total profit</th>'
+        + '<th class="num">flights</th><th class="num">deposit</th><th></th>'
+        + '</tr></thead><tbody>'
+        + p.routes.map(function (r) {
+            var chosen = r.good === goodName;
+            return '<tr' + (chosen ? ' class="sel"' : '') + '>'
+              + '<td>' + esc(r.good) + '</td>'
+              + '<td class="num">' + marginText(r.margin) + '</td>'
+              + (r.error
+                  ? '<td colspan="3" class="note warn">' + esc(message(r.error)) + '</td><td></td>'
+                  : '<td class="num">' + credits(r.contractProfit && r.contractProfit.to) + '</td>'
+                    + '<td class="num">' + num(r.flights && r.flights.to) + '</td>'
+                    + '<td class="num">' + credits(r.deposit) + '</td>'
+                    + '<td>' + (chosen ? '<span class="mute2">chosen</span>'
+                        : '<button class="ghost small" data-route="' + esc(r.good) + '">use</button>')
+                    + '</td>')
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>'
+        : '<div class="note">No routes in this area.</div>')
       + '</div>';
   }
 
@@ -1889,6 +2224,8 @@
     } else {
       out.push('<div class="okbox"><b>Ready to start.</b></div>');
     }
+
+    if (p.routes) { out.push(renderRoutes(p)); }
 
     var cards = [];
     var prediction = p.prediction || {};
@@ -4718,8 +5055,25 @@
         return;
       }
 
+      if (button.dataset.route) { useRoute(button.dataset.route); return; }
+      if (button.dataset.scanUse) { useScanRow(Number(button.dataset.scanUse)); return; }
+      if (button.dataset.scanRank) {
+        S.missionForm.scan.rank = button.dataset.scanRank;
+        renderMission();
+        return;
+      }
+
       var act = button.dataset.act;
-      if (act === 'preview') { runPreview(button); }
+      if (act === 'escorts-near') {
+        var picked = S.missionForm.escorts;
+        escortCandidates().forEach(function (c) {
+          if (c.near && picked.indexOf(c.ship.name) === -1) { picked.push(c.ship.name); }
+        });
+        renderMission();
+      }
+      else if (act === 'scan') { runScan(); }
+      else if (act === 'scan-stop') { stopScan(); }
+      else if (act === 'preview') { runPreview(button); }
       else if (act === 'start') { runStart(button); }
       else if (act === 'collect' || act === 'recall' || act === 'recall-force') {
         missionAction(act, button);
