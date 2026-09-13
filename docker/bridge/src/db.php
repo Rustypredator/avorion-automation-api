@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 2;
+    private const SCHEMA = 3;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -133,9 +133,26 @@ final class Db
 
         try {
             // Re-read under the lock: whoever held it before us may have just done the work.
-            if (self::schemaVersion($pdo) < self::SCHEMA) {
-                foreach (self::statements() as $sql) {
-                    $pdo->exec($sql);
+            $current = self::schemaVersion($pdo);
+            if ($current < self::SCHEMA) {
+                // One transaction for the lot, so a migration that fails part-way leaves
+                // the previous schema standing rather than half of the next one.
+                $pdo->beginTransaction();
+                try {
+                    foreach (self::migrations() as $version => $statements) {
+                        if ($version <= $current) {
+                            continue;
+                        }
+                        foreach ($statements as $sql) {
+                            $pdo->exec($sql);
+                        }
+                    }
+                    $pdo->exec('DELETE FROM api_schema');
+                    $pdo->exec('INSERT INTO api_schema (version) VALUES (' . self::SCHEMA . ')');
+                    $pdo->commit();
+                } catch (Throwable $e) {
+                    $pdo->rollBack();
+                    throw $e;
                 }
             }
             self::$migrated = true;
@@ -157,9 +174,23 @@ final class Db
     }
 
     /**
+     * Schema steps by the version they bring the database up to. A database at version N
+     * runs every step above N, in order.
+     *
+     * Version 2 is the whole schema as it stood before steps were numbered, and every
+     * statement in it is idempotent - a database at version 0 or 1 simply runs it all.
+     *
+     * @return array<int, list<string>>
+     */
+    private static function migrations(): array
+    {
+        return [2 => self::base(), 3 => self::shared()];
+    }
+
+    /**
      * @return list<string>
      */
-    private static function statements(): array
+    private static function base(): array
     {
         return [
             'CREATE TABLE IF NOT EXISTS api_schema (version INTEGER NOT NULL)',
@@ -319,9 +350,122 @@ final class Db
 
             'CREATE INDEX IF NOT EXISTS faction_samples_window_idx
                  ON faction_samples (key_id, owner, taken_at)',
+        ];
+    }
 
-            'DELETE FROM api_schema',
-            'INSERT INTO api_schema (version) VALUES (' . self::SCHEMA . ')',
+    /**
+     * Version 3: rows belong to the faction that owns the craft, not to the key that saw it.
+     *
+     * Up to version 2 everything hung off api_keys, so two members of one alliance each
+     * held a private copy of the same alliance fleet and neither could see the other's -
+     * and one player with two keys held two disjoint histories. From here a row carries
+     * `faction`, the game's own index of the owning player or alliance, and a key reads
+     * whatever its player may: that player's rows, and its alliance's rows while the mod
+     * confirms the membership. See History::scope.
+     *
+     * The existing rows cannot be moved here. SQL alone does not know which player a key
+     * hash belongs to, let alone their alliance, so they keep their key_id with faction
+     * NULL and every key is flagged `legacy`. The next time the mod vouches for a key - the
+     * first /ping it relays, or the check a /history read makes - History::adopt moves that
+     * key's rows over, merging what two members recorded of the same alliance craft. Until
+     * then the key still reads them exactly as before.
+     *
+     * @return list<string>
+     */
+    private static function shared(): array
+    {
+        return [
+            /*
+             * Who a key belongs to, as far as the mod last said. `alliance` is NULL for a
+             * player in none; `verified_at` is when the mod last said so, and alliance rows
+             * are only readable while it is recent. A key whose mod answer is older than
+             * that is re-checked through the transport rather than trusted.
+             */
+            'ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS player BIGINT',
+            'ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS alliance BIGINT',
+            'ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ',
+            'ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS legacy BOOLEAN NOT NULL DEFAULT FALSE',
+
+            // Every key that exists at this point predates faction ownership. A fresh
+            // database has none, so this only ever marks rows an upgrade inherited.
+            'UPDATE api_keys SET legacy = TRUE',
+
+            'CREATE INDEX IF NOT EXISTS api_keys_player_idx ON api_keys (player)',
+
+            /*
+             * Names for the faction indices, so a reader can say "Rusty Industries" rather
+             * than "faction 77". Refreshed from every answer that names one; never used to
+             * decide access, which goes by index alone.
+             */
+            'CREATE TABLE IF NOT EXISTS factions (
+                 id   BIGINT PRIMARY KEY,
+                 kind TEXT   NOT NULL DEFAULT \'\',
+                 name TEXT   NOT NULL DEFAULT \'\'
+             )',
+
+            // The owning faction on every data table. key_id stays for the rows that have
+            // not been adopted yet, and is NULL on everything written from now on.
+            'ALTER TABLE visits ADD COLUMN IF NOT EXISTS faction BIGINT',
+            'ALTER TABLE visits ALTER COLUMN key_id DROP NOT NULL',
+            'ALTER TABLE events ADD COLUMN IF NOT EXISTS faction BIGINT',
+            'ALTER TABLE events ALTER COLUMN key_id DROP NOT NULL',
+            'ALTER TABLE station_samples ADD COLUMN IF NOT EXISTS faction BIGINT',
+            'ALTER TABLE station_samples ALTER COLUMN key_id DROP NOT NULL',
+            'ALTER TABLE faction_samples ADD COLUMN IF NOT EXISTS faction BIGINT',
+            'ALTER TABLE faction_samples ALTER COLUMN key_id DROP NOT NULL',
+
+            // The same partial unique index as visits_open_idx, one level up: at most one
+            // open visit per craft however many keys are polling it.
+            'CREATE UNIQUE INDEX IF NOT EXISTS visits_faction_open_idx
+                 ON visits (faction, ship) WHERE open',
+            'CREATE INDEX IF NOT EXISTS visits_faction_window_idx ON visits (faction, left_at DESC)',
+            'CREATE INDEX IF NOT EXISTS visits_faction_cell_idx ON visits (faction, x, y)',
+
+            /*
+             * Partial on epoch >= 0. Adopted rows are moved to negative epochs - see
+             * History::adopt - because two members numbered their restarts independently,
+             * and "epoch 1, seq 4" from one of them is not the same event as from the other.
+             */
+            'CREATE UNIQUE INDEX IF NOT EXISTS events_faction_dedupe_idx
+                 ON events (faction, ship, epoch, seq) WHERE epoch >= 0',
+            'CREATE INDEX IF NOT EXISTS events_faction_window_idx
+                 ON events (faction, happened_at DESC)',
+
+            'CREATE INDEX IF NOT EXISTS station_samples_faction_window_idx
+                 ON station_samples (faction, ship, taken_at)',
+            'CREATE INDEX IF NOT EXISTS station_samples_faction_latest_idx
+                 ON station_samples (faction, taken_at DESC)',
+
+            'CREATE INDEX IF NOT EXISTS faction_samples_faction_window_idx
+                 ON faction_samples (faction, taken_at)',
+
+            // ship_state, per faction. Shared, so two members polling one alliance craft
+            // agree on which restart they are in and never record an event twice.
+            'CREATE TABLE IF NOT EXISTS event_marks (
+                 faction BIGINT  NOT NULL,
+                 ship    TEXT    NOT NULL,
+                 epoch   INTEGER NOT NULL DEFAULT 0,
+                 max_seq BIGINT  NOT NULL DEFAULT -1,
+                 PRIMARY KEY (faction, ship)
+             )',
+
+            /*
+             * The last manifest seen for each craft: its hold and who is aboard.
+             *
+             * Not a series - one row per craft, replaced on every GET /ships/{name} - because
+             * nobody asks what was in a hold last Tuesday, and a goods search asks what is
+             * in every hold right now. The listing carries no cargo, so without this a
+             * console searching for a good has to read every craft's detail through the
+             * transport, one call each, every session and for every member separately.
+             */
+            'CREATE TABLE IF NOT EXISTS manifests (
+                 faction  BIGINT      NOT NULL,
+                 ship     TEXT        NOT NULL,
+                 owner    TEXT        NOT NULL DEFAULT \'\',
+                 taken_at TIMESTAMPTZ NOT NULL,
+                 data     JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 PRIMARY KEY (faction, ship)
+             )',
         ];
     }
 }

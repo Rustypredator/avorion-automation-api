@@ -48,6 +48,9 @@ services:
       # those out of the craft's database row, which the game only rewrites when it saves,
       # so sampling faster than this buys duplicate rows rather than resolution.
       HISTORY_ECONOMY_INTERVAL: "${HISTORY_ECONOMY_INTERVAL:-300}"
+      # How long the mod's word on which alliance a key's player is in stays good. Alliance
+      # history is shared between members, so a read past this asks the mod again first.
+      HISTORY_VERIFY_TTL: "${HISTORY_VERIFY_TTL:-300}"
 
     # moddata only, so a bridge process that misbehaves still cannot reach saves or the
     # globals file the API keys live in.

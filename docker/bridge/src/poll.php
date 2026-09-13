@@ -103,14 +103,32 @@ function fetch(string $url, string $key, int $timeout): array
 }
 
 /**
- * One pass over one key: the fleet, each craft's events, then the station and faction
- * ledgers the economy series is built from.
+ * One pass over one key: who it belongs to, the fleet, each craft's events, then the
+ * station and faction ledgers the economy series is built from.
+ *
+ * Two members' keys polling the same alliance fleet is fine and costs the database nothing
+ * extra - the rows are the alliance's, and the second pass extends or skips what the first
+ * one wrote. It does cost the game server the round trips, so one key per alliance is
+ * enough to keep an alliance fleet recorded.
  *
  * Nothing is recorded here. The bridge records what it relays, so calling it is the whole
  * of the job - which is also why a key this process cannot use records nothing at all.
  */
 function pass(string $base, string $key, int $timeout, bool $wantEvents, bool $wantEconomy): array
 {
+    /*
+     * First, so the bridge's idea of who this key belongs to is never older than one pass.
+     * That is what lets every member of an alliance read the alliance's history without
+     * each read having to relay a /ping of its own, and it is what moves rows recorded
+     * before rows had owners onto the player and alliance they belong to. One round trip,
+     * and a cheap one: /ping touches no ship data.
+     */
+    $ping = fetch($base . '/ping', $key, $timeout);
+    if ($ping['status'] !== 200) {
+        return ['ok' => false, 'status' => $ping['status'], 'ships' => 0,
+                'detail' => detail($ping)];
+    }
+
     $answer = fetch($base . '/ships', $key, $timeout);
 
     if ($answer['status'] !== 200) {
@@ -237,18 +255,18 @@ while (true) {
         }
     }
 
+    // Once for the whole store, not once per key: rows belong to factions now, and the
+    // retention window is one setting for all of them.
     if (time() - $lastPrune >= $pruneEvery) {
         $lastPrune = time();
-        foreach ($keys as $key) {
-            try {
-                $removed = (new History($key))->prune();
-                if ($removed > 0) {
-                    say(sprintf('pruned %d row%s past the retention window',
-                        $removed, $removed === 1 ? '' : 's'));
-                }
-            } catch (Throwable $e) {
-                say('prune failed: ' . $e->getMessage());
+        try {
+            $removed = (new History($keys[0]))->prune();
+            if ($removed > 0) {
+                say(sprintf('pruned %d row%s past the retention window',
+                    $removed, $removed === 1 ? '' : 's'));
             }
+        } catch (Throwable $e) {
+            say('prune failed: ' . $e->getMessage());
         }
     }
 

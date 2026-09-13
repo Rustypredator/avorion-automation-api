@@ -128,7 +128,8 @@ MOCK_ROOT="$GALAXY" lua tools/fakeserver.lua > "$WORK/fake.log" 2>&1 &
 FAKE_PID=$!
 sleep 3
 KEY="$(grep -o 'avo_[a-f0-9]*' "$WORK/fake.log" | head -1)"
-check "$([ -n "$KEY" ] && echo 0 || echo 1)" "the fake server came up and issued a key"
+MEMBER_KEY="$(grep -o 'avo_[a-f0-9]*' "$WORK/fake.log" | sed -n 2p)"
+check "$([ -n "$KEY" ] && [ -n "$MEMBER_KEY" ] && echo 0 || echo 1)" "the fake server came up and issued two keys"
 
 "${COMPOSE[@]}" up -d >/dev/null 2>&1
 await
@@ -179,6 +180,44 @@ check "$(json 'import json,sys;s=json.load(open(sys.argv[1]));sys.exit(0 if s["s
 
 status="$(get "$KEY" /history/nonsense)"
 check "$([ "$status" = "404" ] && echo 0 || echo 1)" "an unknown history route is a 404 from the bridge" "got $status"
+
+# #### Alliance history #### --
+#
+# Rows belong to the craft's owner, and the bridge asks the mod - by relaying a /ping of its
+# own - which alliance a key's player is in before it lets that key read alliance rows. So
+# this goes through the real transport or it proves nothing.
+
+echo
+echo "alliance history"
+
+status="$(get "$KEY" '/ships?owner=all')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" "GET /ships?owner=all round-trips" "got $status"
+
+status="$(get "$MEMBER_KEY" /history/summary)"
+names="$(json 'import json,sys;print(",".join(sorted(s["name"] for s in json.load(open(sys.argv[1]))["ships"])))')"
+check "$([ "$names" = "Alliance Hauler" ] && echo 0 || echo 1)" \
+    "another member reads the alliance craft the first one recorded, and none of theirs" "got '$names'"
+alliance="$(json 'import json,sys;print((json.load(open(sys.argv[1]))["scope"]["alliance"] or {}).get("name",""))')"
+check "$([ "$alliance" = "Test Alliance" ] && echo 0 || echo 1)" \
+    "having had the membership confirmed by the mod" "got '$alliance'"
+
+status="$(get "$KEY" /history/summary)"
+names="$(json 'import json,sys;print(",".join(sorted(s["name"] for s in json.load(open(sys.argv[1]))["ships"])))')"
+check "$([ "$names" = "Alliance Hauler,Ore Hound,Tug" ] && echo 0 || echo 1)" \
+    "while the recording member reads both their own craft and the alliance's" "got '$names'"
+
+status="$(curl -s -m 40 -X POST -o "$WORK/body" -w '%{http_code}' -H "X-API-Key: $MEMBER_KEY" \
+    "http://127.0.0.1:$PORT/history/clear?owner=alliance")"
+check "$([ "$status" = "403" ] && echo 0 || echo 1)" "no single member can clear the alliance's history" "got $status"
+
+# The goods search's head start: a hold read once is there for every member.
+get "$KEY" /ships/Ore%20Hound >/dev/null
+status="$(get "$KEY" /history/manifests)"
+held="$(json 'import json,sys;print(",".join(m["ship"] for m in json.load(open(sys.argv[1]))["manifests"]))')"
+check "$([ "$held" = "Ore Hound" ] && echo 0 || echo 1)" "reading a craft keeps its manifest" "got '$held'"
+get "$MEMBER_KEY" /history/manifests >/dev/null
+held="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["manifests"]))')"
+check "$([ "$held" = "0" ] && echo 0 || echo 1)" "and a personal craft's stays private" "got '$held'"
 
 # #### The station economy #### --
 #
@@ -254,15 +293,18 @@ echo "POLL_KEYS=$KEY" >> "$WORK/env"
 curl -s -m 40 -X POST -o /dev/null -H "X-API-Key: $KEY" \
     "http://127.0.0.1:$PORT/history/clear" 2>/dev/null
 
+# Clearing takes the player's own craft only; the alliance's history is everyone's.
+own='import json,sys;print(len([s for s in json.load(open(sys.argv[1]))["ships"] if s["owner"]=="player"]))'
+
 status="$(get "$KEY" /history/summary)"
-empty="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["ships"]))')"
+empty="$(json "$own")"
 check "$([ "$empty" = "0" ] && echo 0 || echo 1)" "the history starts cleared" "got $empty"
 
 # Nothing below calls /ships. If craft show up in the history it is because the poller put
 # them there - which is the whole point of the service.
 for _ in $(seq 1 40); do
     get "$KEY" /history/summary >/dev/null
-    seen="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["ships"]))')"
+    seen="$(json "$own")"
     [ "${seen:-0}" -gt 0 ] && break
     sleep 1
 done

@@ -238,6 +238,17 @@ const routes = {
     },
     '/ships/Ore%20Hound/mission': { active: null },
     '/history/events': storedEvents,
+    // What the bridge kept of holds read earlier, by this console or anyone else's. Far
+    // Scout's is fresh; Wingman's is an hour old, and neither has a live detail route here,
+    // so a live re-read of either answers 404 - which is how the test tells them apart.
+    '/history/manifests': {
+        manifests: [
+            { ship: 'Far Scout', owner: 'player', at: now - 30,
+              cargo: { goods: [{ name: 'Xanion Ore', amount: 70 }] }, passengers: [] },
+            { ship: 'Wingman', owner: 'player', at: now - 3600,
+              cargo: { goods: [{ name: 'Xanion Ore', amount: 10 }] }, passengers: [] }
+        ]
+    },
     '/stations': stationListing,
     '/stations/Rusty%20Refinery': refinery,
     '/history/economy/summary': {
@@ -364,6 +375,22 @@ const ready = window.document.readyState === 'loading'
           'searching a passenger finds the craft carrying them');
     check(/passenger Oren Dask/.test(found[0] ? found[0].textContent : ''),
           'and says who matched');
+
+    search.value = '';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(100);
+
+    console.log('\nstored manifests');
+
+    search.value = 'xanion';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(1200);
+
+    const carrying = $$('#fleet-rows [data-ship]').map((row) => row.dataset.ship);
+    check(carrying.includes('Far Scout'),
+          'a hold the bridge read recently is searched without reading it again');
+    check(!carrying.includes('Wingman'),
+          'and a stale one is re-read live, which wins over what was stored');
 
     search.value = '';
     search.dispatchEvent(new window.Event('input', { bubbles: true }));

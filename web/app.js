@@ -390,6 +390,12 @@
       'The bridge builds the history out of the calls this console makes, so it fills in '
       + 'while a tab is open on it.',
 
+    'history-shared':
+      'Alliance craft are recorded once for the whole alliance, whichever member\'s '
+      + 'console or poller saw them, and every current member reads the same history. '
+      + 'Your own craft stay private to you. The bridge checks your membership with the '
+      + 'game every few minutes, so leaving the alliance takes its history with it.',
+
     'history-observed':
       'Only observed time is counted. The bridge records what it relays, so this is '
       + 'continuous if the poller service is running and otherwise covers only the '
@@ -675,6 +681,10 @@
         // history rather than only what happens from now on.
         S.cursors = {};
         S.shipHistory = {};
+        // Holds are per key as much as history is - a different key may see different
+        // craft - and the bridge's stored manifests make starting over cheap.
+        S.cargoIndex = {};
+        manifestsAt = 0;
         startLoops();
         refreshFleet();
         loadGalaxy();
@@ -704,6 +714,7 @@
     setStatus(online ? 'on' : 'warn',
       esc(p.galaxy && p.galaxy.name || 'galaxy') + ' · '
       + esc(p.player && p.player.name || 'player ' + p.player.index)
+      + (p.player && p.player.alliance ? ' · ' + esc(p.player.alliance.name) : '')
       + (online ? '' : ' (offline)'),
       'mod ' + p.mod + ' · game ' + p.game + ' · api ' + p.api
       + ' · ' + p.server.players + ' players · up ' + duration(p.server.runtime));
@@ -987,9 +998,49 @@
     return !!entry && (Date.now() - entry.at) < CARGO_TTL;
   }
 
+  /* The bridge keeps the last manifest anyone read for each craft - this console, another
+     tab, a fellow alliance member's - so a search starts from those in one call instead of
+     from nothing. Each keeps the time it was read: one still inside CARGO_TTL spares its
+     craft a call, and an older one shows a match straight away while the sweep re-reads
+     the hold behind it. A bridge that keeps no history answers 404 and the sweep simply
+     reads every hold, as it always did. */
+  var manifestsAt = 0;
+
+  function seedCargo() {
+    if (Date.now() - manifestsAt < CARGO_TTL) { return Promise.resolve(); }
+    manifestsAt = Date.now();
+
+    return Api.get('/history/manifests', null, { priority: Api.P.DETAIL, label: 'manifests' })
+      .then(function (body) {
+        (body.manifests || []).forEach(function (manifest) {
+          var ship = S.byName[manifest.ship];
+          var at = (manifest.at || 0) * 1000;
+          var known = S.cargoIndex[manifest.ship];
+
+          // A player and their alliance can each own a craft by this name; the listing
+          // says which one this row is.
+          if (!ship || (ship.owner && ship.owner.kind !== manifest.owner)) { return; }
+          if (known && known.at >= at) { return; }
+
+          indexCargo(manifest.ship, manifest);
+          S.cargoIndex[manifest.ship].at = at;
+        });
+
+        renderFleetCount();
+        if (S.search) { renderFleet(); }
+      })
+      .catch(function () { /* no stored manifests: every hold is read live instead */ });
+  }
+
   function sweepCargo() {
     // Two characters: one letter matches most of the goods in the game, and the sweep is
     // a call per craft.
+    if (!S.connected || S.paused || S.search.length < 2) { return; }
+
+    seedCargo().then(sweepHolds);
+  }
+
+  function sweepHolds() {
     if (!S.connected || S.paused || S.search.length < 2) { return; }
 
     S.ships.forEach(function (ship) {
@@ -4654,7 +4705,18 @@
           : 'number of visits, up to ' + num(heat.maxVisits))
         + '.</div>'
       + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
-        + span + ' of recorded travel ' + explain('history-observed') + '</div>';
+        + span + ' of recorded travel ' + explain('history-observed') + '</div>'
+      + sharedNote();
+  }
+
+  /* Whose travel the map is drawing. The bridge keeps an alliance's history once for all
+     its members, so a heatmap can hold craft this key never polled. */
+  function sharedNote() {
+    var alliance = S.ping && S.ping.player && S.ping.player.alliance;
+    if (!alliance) { return ''; }
+
+    return '<div class="mute2">Includes <b>' + esc(alliance.name || 'your alliance')
+      + '</b>&rsquo;s craft ' + explain('history-shared') + '</div>';
   }
 
   function setHistoryWindow(seconds) {

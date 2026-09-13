@@ -138,6 +138,24 @@ local rf = assert(io.open(Config.getResponsesDir() .. "/" .. id .. ".json", "rb"
 local res = Json.decode(rf:read("*all")); rf:close()
 check(res.status == 409 and res.body.error.code == "no_alliance", "no alliance is a clean 409")
 
+-- /ping names the alliance: the HTTP bridge decides who may read an alliance's shared
+-- history off this field, so "not in one" has to be said rather than left out.
+local _, ping = call("GET", "/ping")
+check(ping.player.alliance ~= Json.null and ping.player.alliance.index == 77,
+      "ping names the caller's alliance by faction index")
+check(ping.player.alliance.name == "Rusty Industries", "and by name")
+
+seq = seq + 1
+local id = "r" .. seq
+local f = assert(io.open(Config.getRequestsDir() .. "/" .. id .. ".json", "wb"))
+f:write(Json.encode{id = id, key = otherKey, method = "GET", path = "/ping"})
+f:close()
+Bridge.update(Config.pollInterval)
+local rf = assert(io.open(Config.getResponsesDir() .. "/" .. id .. ".json", "rb"))
+local raw = rf:read("*all"); rf:close()
+check(string.find(raw, '"alliance":null', 1, true) ~= nil,
+      "a player in no alliance gets an explicit null, not a missing field")
+
 -- #### DETAIL #### --
 
 print("\nGET /ships/{name}")

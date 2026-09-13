@@ -249,7 +249,7 @@ readings. So the bridge samples those counters too, along with each station's st
 good, which is the only way to see what a line actually moved: the counters are one number
 for the whole station and never say which good earned it.
 
-So the bridge keeps the copy. It relays every call already, and four of them carry
+So the bridge keeps the copy. It relays every call already, and a handful of them carry
 everything the store needs:
 
 | from | what it records |
@@ -258,13 +258,16 @@ everything the store needs:
 | `GET /ships/{name}/events` | the mod's own events, past the 200 and past a restart |
 | `GET /stations` | each station's running earnings totals and its stock per good |
 | `GET /economy` | the faction's money and resources |
+| `GET /ships/{name}` | the craft's hold and who is aboard - the latest only, for the console's goods search |
+| `GET /ping` | which player the key belongs to and which alliance they are in |
 
 Positions come from the ship database, which reads fine **with every player logged out**, so
 the travel record keeps filling whether or not anyone is flying. So do the station books:
 they are read out of the same database rows, not off a loaded sector.
 
 Read it at `/history/summary`, `/history/visits`, `/history/heatmap`, `/history/events`,
-`/history/economy/summary`, `/history/economy/series` and `/history/economy/goods` - full
+`/history/manifests`, `/history/economy/summary`, `/history/economy/series` and
+`/history/economy/goods` - full
 reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
 travel overlays on the map and the economy ones on the station's Economy tab.
 
@@ -276,11 +279,25 @@ Two things to know about it:
   `POLL_KEYS` in `.env` to the keys whose fleets should be recorded. Without it the history
   only covers the moments a console happened to be open, and dwell is reported as *observed*
   seconds rather than guessed at either way.
-- **It is keyed by a hash of your API key and never stores the key.** An unknown key reads
-  an empty history rather than anyone else's, and nothing is written except off the back of
-  a call the mod itself answered - so a caller who cannot get a 200 out of the mod cannot
-  make the store exist. `POLL_KEYS` is the one place a key is held at rest, because the
-  poller has to authenticate like any other client.
+- **Alliance history is shared; your own stays yours.** A row belongs to whoever owns the
+  craft, as the mod reported it, so an alliance's fleet has one history whichever member's
+  console or poller saw it, and every current member reads it. Your own craft are readable
+  by your keys only - all of them, since it is one history per player. The bridge asks the
+  mod which alliance a key's player is in every few minutes (`HISTORY_VERIFY_TTL`, default
+  300s), so leaving an alliance takes its history with it, and while the game server is
+  down nobody reads alliance history at all. No member can clear it.
+- **It never stores your API key**, only a SHA-256 of it, and nothing is written except off
+  the back of a call the mod itself answered. A key the mod refuses reads nothing.
+  `POLL_KEYS` is the one place a key is held at rest, because the poller has to
+  authenticate like any other client. One member's key there is enough to keep an
+  alliance's fleet recorded; each player's own fleet needs that player's key.
+
+Upgrading from a bridge that kept history per key needs nothing done by hand. The schema
+migrates on the first connection, each key keeps reading exactly what it recorded, and the
+first time the mod vouches for that key again - the console connecting, or the next poller
+pass - its rows move onto the player and alliance they belong to. Two members' copies of the
+same alliance craft are merged rather than doubled. A player who has left their alliance
+since keeps their old copy of its craft, readable by that key alone.
 
 It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns it off
 entirely; `HISTORY_DAYS` (default 30) sets how far back it keeps, and the poller deletes

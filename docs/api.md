@@ -12,9 +12,14 @@ Service metadata. Call it first to check the API version.
   "api": 1, "mod": "0.4.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
-  "player": {"index": 1, "name": "...", "online": true}
+  "player": {"index": 1, "name": "...", "online": true,
+             "alliance": {"index": 77, "name": "..."}}
 }
 ```
+
+`player.alliance` is `null` for a player in no alliance. It is always present, so its absence
+means a mod older than the field. The bundled bridge decides who may read an alliance's
+shared history off it; see [Storage and privacy](#storage-and-privacy).
 
 ## GET /ships
 
@@ -851,6 +856,8 @@ written only when a craft changes sector, so a parked fleet costs nothing.
 | `GET /ships/{name}/events` | the mod's own order and status events, kept past the 200 and past a restart |
 | `GET /stations` | each station's running earnings totals and its stock per good, as a **sample** |
 | `GET /economy` | the faction's money and resources, likewise |
+| `GET /ships/{name}` | the craft's hold, captain and passengers, as a **manifest** - the latest only |
+| `GET /ping` | which player the key belongs to, and which alliance they are in |
 
 Positions come from the ship database, which the mod reads **with every player logged out**,
 so the travel record keeps filling whether or not anything is online to fly.
@@ -882,14 +889,37 @@ timeline, not one crowded second.
 
 ## Storage and privacy
 
-The store is keyed by a SHA-256 of the API key and never holds the key itself. That has two
-consequences worth stating:
+**A row belongs to the faction that owns the craft** - the player, or their alliance - as the
+mod reported it in the answer being recorded, not to the key that relayed it. So an
+alliance's fleet has one history however many members are polling it, and a player with two
+keys has one history rather than two.
 
-- An unknown key reads an **empty** history rather than anyone else's, which is why these
-  routes need no key check of their own.
-- Nothing is ever written except off the back of a call the mod itself answered 2xx, which
-  is the real authentication. A caller who cannot get a 200 out of the mod cannot make the
-  store exist.
+What a key may read:
+
+- **its player's rows**, always;
+- **its alliance's rows**, only while the mod has confirmed the membership within
+  `HISTORY_VERIFY_TTL` seconds (default 300). A read that finds the confirmation older than
+  that relays a `GET /ping` for the key through the transport first. If that cannot be done -
+  the game server is down - the read gets the player's rows and no alliance rows. A player
+  who left the alliance still has a working key, so an old confirmation is not good enough;
+- **rows recorded before rows had owners**, until they are adopted - see below.
+
+A key the mod refuses (`401`) reads nothing. Nothing is ever written except off the back of a
+call the mod itself answered 2xx, and a row's owner comes out of that answer rather than out
+of anything the caller sent. The store keeps a SHA-256 of each key and never the key itself.
+
+### Upgrading from per-key history
+
+A bridge from before faction ownership kept every row against the key that recorded it. The
+schema migrates on first connection and each key goes on reading exactly what it recorded.
+The first time the mod vouches for that key again - a relayed `/ping`, which the console makes
+on connecting and the poller makes every pass, or the check a `/history` read makes - its rows
+move onto their owners: player craft to the player, alliance craft to the alliance the player
+is in now. A visit another member already contributed for the same stay is widened rather than
+duplicated, and an event both collected is kept once.
+
+A player in no alliance at that moment keeps their old alliance rows private to the key,
+rather than carrying them into whichever alliance they join next.
 
 It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns the whole
 thing off and every route below answers `404 history_disabled`; `HISTORY_DAYS` (default 30)
@@ -905,13 +935,18 @@ What is on disk, per craft.
 ```json
 {
   "ships": [
-    {"name": "Ore Hound", "visits": 41, "events": 190, "samples": 0, "sectors": 12,
-     "first": 1757630000, "last": 1757719400}
+    {"name": "Ore Hound", "owner": "player", "visits": 41, "events": 190, "samples": 0,
+     "sectors": 12, "first": 1757630000, "last": 1757719400}
   ],
   "rows": 231, "retentionDays": 30, "recording": true,
+  "scope": {"player": {"index": 1, "name": "..."}, "alliance": {"index": 77, "name": "..."},
+            "verified": true},
   "economy": {"samples": 560, "stations": 2, "since": 1757630100, "interval": 300}
 }
 ```
+
+`scope` is whose history the answer covers. `alliance` is `null` for a player in no alliance,
+and also when the membership could not be confirmed just now - `verified` is `false` then.
 
 `economy` says whether there is a station series at all, which is what tells a client to
 offer the view rather than draw an empty chart - a deployment upgraded mid-month has travel
@@ -1074,10 +1109,37 @@ actually measure.
 `stock` is the latest reading in the window, so a good with a large `in`, a small `out` and
 a high `stock` is a line filling its own bay - which is what stops it producing.
 
+## GET /history/manifests
+
+The last hold and crew list the bridge relayed for each craft, newest first. One per craft,
+replaced whenever anyone reads `GET /ships/{name}` - not a series.
+
+| query | notes |
+|---|---|
+| `ship` | one craft by name |
+| `owner` | `player` or `alliance` |
+| `from` | Unix seconds; only manifests read since |
+
+```json
+{"manifests": [
+  {"ship": "Ore Hound", "owner": "player", "at": 1757719400,
+   "cargo": {"capacity": 6000, "free": 1100, "used": 4900, "goods": [{"name": "Iron Ore", "amount": 2400}]},
+   "captain": {"name": "Vex", "...": "..."}, "passengers": []}
+]}
+```
+
+`cargo`, `captain` and `passengers` are exactly as `GET /ships/{name}` returned them. `at` is
+when that was, and judging it is up to the caller: the console searches stored manifests
+straight away and re-reads any older than two minutes live.
+
 ## POST /history/clear
 
-Drops everything stored for this key, or one craft's share of it with `?ship=`.
+Drops this player's own history, or one craft's share of it with `?ship=`. That is the
+player's rows under every one of their keys.
 
 ```json
 {"cleared": true, "ship": "Ore Hound", "removed": 231}
 ```
+
+Alliance history is never cleared: it belongs to every member, and the bridge cannot ask the
+game which of them may delete it. `?owner=alliance` answers `403 history_shared`.
