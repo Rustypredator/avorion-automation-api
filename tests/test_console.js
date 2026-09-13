@@ -596,7 +596,7 @@ const ready = window.document.readyState === 'loading'
     const used = posts.filter((p) => /trade\/preview$/.test(p.path)).pop();
     check(used && used.body.config.goodName === 'Oil' && used.body.config.deposit === 40000,
           'using a row previews that route at its deposit');
-    check(used && used.body.area.lower.x === 1 && used.body.area.lower.y === 2
+    check(used && used.body.area.lower.x === 1 && used.body.area.upper.y === 2
           && used.body.area.upper.x === 17,
           'in the placement that found it');
     check(/Trade routes/.test(planner.textContent)
