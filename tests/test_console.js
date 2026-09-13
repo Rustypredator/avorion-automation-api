@@ -231,8 +231,34 @@ function tradePreview(body) {
 
 const posts = [];
 
+/* What the ship's orderchain extension last reported, and what it reports once a route is
+   taken up. The Travel tab is order chains now: it must never start a travel mission. */
+const houndAutomation = {
+    ship: 'Ore Hound', source: 'live', reported: true,
+    automation: {
+        autoAggressive: false, attackCivilians: false, enemies: true, defenceFights: 0,
+        plan: { id: 'p1', kind: 'route', phase: 'fighting', hops: 4, hop: 2, loopFrom: 0,
+                jumps: 1, fights: 1, onEnemies: 'fight', target: { x: 20, y: 0 } }
+    }
+};
+
+const flownRoute = (sent) => ({
+    ship: 'Ore Hound', confirmed: true, planId: 'p2', reachable: true, planner: 'automation',
+    jumps: 2, gates: 1, controlledSectors: 0, distance: 30.4,
+    from: { x: 3, y: 0 }, to: sent.to,
+    hops: [{ x: 5, y: 0, kind: 'jump', controlled: false },
+           { x: sent.to.x, y: sent.to.y, kind: 'gate', controlled: false }],
+    route: [{ x: 3, y: 0 }, { x: 5, y: 0 }, sent.to],
+    automation: {
+        autoAggressive: false, attackCivilians: false, enemies: false,
+        plan: { id: 'p2', kind: 'route', phase: 'running', hops: 2, hop: 1, loopFrom: 0,
+                jumps: 0, fights: 0, onEnemies: sent.onEnemies, target: sent.to }
+    }
+});
+
 const dynamic = {
-    '/ships/Ore%20Hound/missions/trade/preview': tradePreview
+    '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
+    '/ships/Ore%20Hound/route': flownRoute
 };
 
 const routes = {
@@ -248,6 +274,7 @@ const routes = {
         cursor: 0, dropped: 0, recording: true, watchers: 1
     },
     '/ships/Ore%20Hound/mission': { active: null },
+    '/ships/Ore%20Hound/automation': houndAutomation,
     '/history/events': storedEvents,
     // What the bridge kept of holds read earlier, by this console or anyone else's. Far
     // Scout's is fresh; Wingman's is an hour old, and neither has a live detail route here,
@@ -387,6 +414,40 @@ const ready = window.document.readyState === 'loading'
     check(/order 2 of 3/.test(overview.textContent), 'with its place in the chain');
     check(/attack combat ships/.test(overview.textContent) && /80%/.test(overview.textContent),
           'and the defensive AI settings');
+
+    console.log('\nthe travel tab');
+
+    tab('travel').click();
+    await settle(600);
+
+    const travel = () => $('#sv-travel');
+    check(/fighting/.test(travel().textContent), 'the automation state the ship reported is shown');
+    check(/enemies in sector/.test(travel().textContent), 'including enemies in its sector');
+    check(!/swiftness/.test(travel().textContent), 'and no travel mission is started from here');
+
+    travel().querySelector('[data-pref="preferUncontrolled"]').click();
+    await settle(50);
+    travel().querySelector('[data-on-enemies="hold"]').click();
+    await settle(50);
+    $('#travel-x').value = '9';
+    $('#travel-y').value = '30';
+    travel().querySelector('[data-act="fly"]').click();
+    await settle(700);
+
+    const flown = posts.filter((p) => p.path === '/ships/Ore%20Hound/route').pop();
+    check(flown && flown.body.preferUncontrolled === true && flown.body.onEnemies === 'hold'
+          && flown.body.to.x === 9 && flown.body.to.y === 30,
+          'flying a route sends the destination, preferences and enemy handling chosen');
+    check(!posts.some((p) => /\/travel$|missions\/travel/.test(p.path)),
+          'and never a travel mission');
+    check(/through gates/.test(travel().textContent), 'the flown route is summarised');
+    check(/route · running/.test(travel().textContent),
+          'and the state the ship confirmed replaces the older read');
+    check(travel().querySelector('[data-act="farm"]').disabled,
+          'boss farming cannot be started for a ship nobody is flying');
+
+    tab('overview').click();
+    await settle(50);
 
     const search = $('#fleet-search');
     search.value = 'oren';

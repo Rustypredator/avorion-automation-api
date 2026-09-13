@@ -297,7 +297,8 @@ craft's name, percent-encoded. Two ships with the same name are ambiguous - rena
 ### Writes need the owner online, reads do not
 
 Every read works with nobody logged in. Every write - mission start, recall, collect, travel,
-orders - answers `409 owner_offline` otherwise, and the event feed records nothing. Plan for a
+orders, routes, automation - answers `409 owner_offline` otherwise, and the event feed records
+nothing. Plan for a
 client that keeps reading and queues its writes rather than one that assumes a session.
 
 ### Preview before you start

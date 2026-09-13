@@ -76,6 +76,17 @@ Config.scanDetailsPerTick = 40
 -- runs on the server tick.
 Config.routeCooldown = 2
 
+-- The route planner behind POST /ships/{name}/route and the preference options on
+-- GET /galaxy/route. It is this mod's own search rather than calculateJumpPath, which
+-- takes no preferences, so it is sliced across ticks like a map scan. A step is one
+-- candidate hop considered - one rift check and one controlling-faction lookup at most.
+Config.routePlanStepsPerTick = 1500
+-- Sectors expanded before the planner gives up and reports the destination unreachable.
+Config.routePlanMaxExpansions = 6000
+-- Directions sampled around each sector. More finds tighter routes around rifts, at a
+-- proportional cost per expansion.
+Config.routePlanDirections = 36
+
 -- How long POST /ships/{name}/orders waits for the ship's order chain to change before
 -- answering unconfirmed. Dispatch is one tick delayed and the chain publishes back on the
 -- tick after that, so this only has to cover a couple of ticks plus slack.

@@ -167,7 +167,9 @@ local function runOrders(owner, job)
 
         -- enchain() only queues; the chain will not advance past what runOrders() has
         -- marked executable, so without this the ship sits there holding its new orders.
-        invoke("runOrders")
+        -- The automation calls run the chain themselves, and a settings change must not
+        -- restart whatever the ship is doing, so those jobs say so.
+        if job.run ~= false then invoke("runOrders") end
     end)
 
     if not ok then
@@ -290,6 +292,13 @@ local function orderPayload(info)
             name = tostring(entry.name or ""),
             action = tonumber(entry.action) or 0,
         }
+    end
+
+    -- The mod's own orderchain.lua extension publishes its state alongside the chain.
+    -- Re-encoded to a string so a nested table never has to survive the crossing.
+    if type(info.automationApi) == "table" then
+        local encoded, text = pcall(Json.encode, info.automationApi)
+        if encoded then payload.automation = text end
     end
 
     return payload

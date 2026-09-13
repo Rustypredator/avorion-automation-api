@@ -26,6 +26,10 @@ galaxy map.
 - read your fleet, including craft in unloaded sectors and while you are offline
 - preview a captain mission with the game's own yield and risk prediction, then start it
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
+- plan routes that prefer gates, keep out of rifts or stay in no man's space, and have the
+  ship fight, hold or press on when enemies show up on the way
+- farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship
+- let idle ships defend themselves: aggressive while enemies are in the sector, idle after
 - query known sectors, and predict unvisited ones straight from the galaxy seed
 - read your stations' books - production chain, stock, and what each one has earned - and
   keep a series of them, so a lifetime total becomes credits an hour
@@ -320,12 +324,15 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/missions/{mission}/start` | start it |
 | `GET /ships/{name}/mission` | live status |
 | `POST /ships/{name}/mission/recall`, `.../collect` | recall, and collect yields |
-| `POST /ships/{name}/travel` | send a ship anywhere in the galaxy |
+| `POST /ships/{name}/travel` | alias of the Travel captain mission's start |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
+| `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
+| `POST /ships/{name}/farm` | boss farming: loop through empty space in a boss ring |
+| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, idle defence, stop |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
-| `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and the game's own pathfinder |
+| `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and route planning |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
 | `GET /history/*` | where the fleet has been, and what its stations earned - served by the bridge, not the mod |
@@ -334,7 +341,8 @@ Full reference in [docs/api.md](docs/api.md).
 
 Every read works with nobody logged in, because the bridge runs on the Galaxy.
 
-Writes do not. Starting, recalling and collecting missions, travel and in-sector orders all
+Writes do not. Starting, recalling and collecting missions, travel, routes, farming,
+automation settings and in-sector orders all
 answer `409 owner_offline` when the owning player is not in game. That is a vanilla
 limitation rather than a shortcut here: mission state lives in a player script, and captain
 missions do not tick for offline players in the base game.
@@ -371,20 +379,29 @@ exact call shape vanilla uses, and every vanilla caller of the background simula
 player script. So the bridge parks a job and the agent, running in the one context where the
 call is legal, executes it and reports back.
 
+Planned routes, boss farming and idle defence need a third place, because only a script in
+the ship's own sector can see enemies in it: `data/scripts/entity/orderchain.lua` extends
+vanilla's order chain. It puts a plan's hops on the ordinary chain, watches the sector while
+the ship flies them, and publishes its state alongside the chain in the order info the agent
+already forwards. Its state is saved with the chain's own, so no script is added to any craft.
+
 Everything else is pure Lua under `data/scripts/lib/automationapi/`: the JSON codec, router,
-auth, serializers and the per-endpoint handlers.
+auth, serializers, the route planner and the per-endpoint handlers.
 
 Both vanilla overlays exist only to add one `addScriptOnce` line each:
 `data/scripts/galaxy/init.lua` attaches the bridge, `data/scripts/player/init.lua` attaches
-the agent. They are the only vanilla files this mod replaces, and they need re-checking
-against the game's copies after an Avorion update.
+the agent. The third vanilla path, `data/scripts/entity/orderchain.lua`, is appended the same
+way and wraps `updateServer`, `getOrderInfo`, `secure` and `restore`. All three need
+re-checking against the game's copies after an Avorion update - and a mod that replaces
+`orderchain.lua` outright instead of extending it switches the automation off, which
+`GET /ships/{name}/automation` shows as `reported: false`.
 
 ## Development
 
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-for t in bridge ships missions movement map shipevents economy; do lua5.4 tests/test_$t.lua; done
+for t in bridge ships missions movement navigation orderchain map shipevents economy; do lua5.4 tests/test_$t.lua; done
 ```
 
 The bridge's history store is PHP over Postgres, so it is tested against a throwaway

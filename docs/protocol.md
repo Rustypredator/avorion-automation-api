@@ -181,7 +181,7 @@ on one connection rather than handing back a job id:
 | kind | why | typical |
 |---|---|---|
 | mission preview and start | a background area analysis has to run | 1-3s |
-| writes (start, recall, collect, travel, orders) | the request is parked for the player agent, which polls four times a second | +0.5s |
+| writes (start, recall, collect, travel, orders, routes, automation) | the request is parked for the player agent, which polls four times a second | +0.5s |
 | `/map/search?predict=true` | the galaxy generator is run over the box, sliced across server ticks so it cannot stall one | ~9s for the 10000-sector cap |
 
 A predicted search answers with partial results and `truncated: "timeout"` rather than

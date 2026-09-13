@@ -223,7 +223,7 @@ end
 local ORDER_FIELDS =
 {
     chain = true, currentIndex = true, finished = true, coordinates = true,
-    defenseAutoAI = true, autoAIConfig = true, ship = true,
+    defenseAutoAI = true, autoAIConfig = true, ship = true, automationApi = true,
 }
 
 -- getOrderInfo() is the order chain's own state as a JSON string (a table in some builds):
@@ -282,8 +282,16 @@ local function ordersOf(raw)
         end
     end
 
+    -- Published by this mod's orderchain.lua extension. As of the last time the game wrote
+    -- the row, so it can trail the live event feed by a save; see handlers/navigation.lua.
+    if type(info.automationApi) == "table" then
+        result.automation = Serialize.value(info.automationApi)
+    end
+
     return result
 end
+
+ShipData.ordersOf = ordersOf
 
 -- Ships carry many copies of the same turret and getTurrets() keys by design instance,
 -- so two identical turrets arrive as two separate entries. They are grouped here by

@@ -101,7 +101,9 @@ Includes every field from the listing, plus:
 
 `activeIndex` is 1-based, `0` when nothing runs. `gate` is only present on fly-through
 links (`false` means a wormhole). `extra` holds any other top-level values a script put in
-the chain state, and is left out when there are none.
+the chain state, and is left out when there are none. `automation` is the ship's automation
+state as of the last save, in the shape [`GET /ships/{name}/automation`](#get-shipsnameautomation)
+returns; that endpoint prefers the live copy.
 
 Errors: `404 no_such_ship` when the caller does not own it, `404 no_ship_data` when it is
 owned but has no database row yet.
@@ -270,10 +272,8 @@ Collects waiting yields into the owner's account. Returns `collected` and `remai
 
 ## POST /ships/{name}/travel
 
-Moves a ship anywhere in the galaxy. This is a Travel captain mission under a shorter
-name: it goes through the same analysis, prediction and start path as
-`/ships/{name}/missions/travel/start` and returns the same body, so the response carries
-a real route prediction and attack chance rather than just an acknowledgement.
+An alias of `POST /ships/{name}/missions/travel/start`, kept for existing callers. It takes
+the destination at the top level and `swiftness` alongside it, and returns the same body:
 
 ```jsonc
 {"to": {"x": -300, "y": 310}, "swiftness": 2}
@@ -282,11 +282,17 @@ a real route prediction and attack chance rather than just an acknowledgement.
 `swiftness` is 0 (careful, slow, unlikely to be attacked) to 3 (reckless, fast, risky) and
 defaults to 2.
 
-Prefer this to `/orders` for anything that is not tactical. It loads no sectors, works
-wherever the ship is, and the game drives it to completion.
+A Travel captain mission loads no sectors, works wherever the ship is and survives the owner
+logging out once started. To fly a route as orders instead - with gate, rift and
+faction-space preferences, and a response to enemies on the way - use
+[`POST /ships/{name}/route`](#post-shipsnameroute).
 
-The destination is checked before an area analysis is spent on it. The game refuses to
-send a ship somewhere it could already reach in one hop, so these come straight back:
+### Destination checks
+
+These apply to the travel mission however it is started - this alias, or `preview` and
+`start` on `/missions/travel`. The game refuses to send a ship somewhere it could already
+reach in one hop, and says so only after an area analysis has been spent, so the destination
+is checked first:
 
 | code | when |
 |---|---|
@@ -295,8 +301,7 @@ send a ship somewhere it could already reach in one hop, so these come straight 
 
 The same rule is enforced after the analysis too, since only then is the real route known:
 a route of two sectors or fewer sets `errors.start` to the game's own
-`"This route is too short."` and `canStart` to false. That applies to preview as well, so
-a preview of a travel mission no longer claims a start would succeed when it would not.
+`"This route is too short."` and `canStart` to false.
 
 **Requires the owning player to be logged in.**
 
@@ -390,8 +395,182 @@ target entity, which this API never has.
 
 `422 order_after_terminal` - the chain refuses to enqueue past `patrol` or a persistent
 `mine`/`salvage`; enforced here rather than discovered later.
-`409 sector_not_loaded` - the ship's sector is not in memory; use `/travel`.
+`409 sector_not_loaded` - the ship's sector is not in memory; a Travel captain mission moves
+a ship wherever it is.
 `409 ship_in_background` - it is out on a captain mission.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/route
+
+Plans a route and has the ship fly it as an order chain. The plan is this mod's own search
+rather than the game's `calculateJumpPath`, which takes no preferences:
+
+```jsonc
+{
+  "to": {"x": -120, "y": 88},
+  "preferGates": true,          // take known gates and wormholes whenever they save time
+  "avoidRifts": false,          // keep a rift-capable ship out of rifts, as if it were not
+  "preferUncontrolled": true,   // stay in no man's space where a detour allows
+  "onEnemies": "fight",         // fight | hold | continue
+  "attackCivilians": false,
+  "dryRun": false               // plan only; nothing is sent to the ship
+}
+```
+
+The response is the plan in [`GET /galaxy/route`](#get-galaxyroute)'s planner shape, plus the
+dispatch:
+
+```json
+{
+  "ship": "Ore Hound", "planId": "p4-7310", "confirmed": true,
+  "reachable": true, "planner": "automation",
+  "jumps": 9, "gates": 1, "controlledSectors": 0, "distance": 61.2,
+  "hops": [{"x": -5, "y": 3, "kind": "jump", "distance": 5.8, "controlled": false, "rift": false}],
+  "route": [{"x": 0, "y": 0}, {"x": -5, "y": 3}],
+  "onEnemies": "fight", "attackCivilians": false, "dryRun": false,
+  "automation": {"plan": {"id": "p4-7310", "kind": "route", "phase": "running"}},
+  "chain": [{"name": "Jump", "action": 1}]
+}
+```
+
+The hops go onto the ship's ordinary order chain - jumps as jumps, gates and wormholes as
+fly-through orders - so the Orders view, the galaxy map and `GET /ships/{name}/events` all
+show them. While the ship flies them it checks its sector every second:
+
+| `onEnemies` | when enemies are present |
+|---|---|
+| `fight` (default) | replace the route with an aggressive order; once the sector has been clear for five seconds, pick the route up at the hop it was interrupted on |
+| `hold` | replace the route with an aggressive order that never finishes, and stay |
+| `continue` | ignore them and keep jumping |
+
+`attackCivilians` decides both whether civilian ships count as enemies and whether the
+aggressive order attacks them.
+
+The request is held open until the ship reports the plan it took up, as `/orders` is:
+`200 confirmed: true` when it did, `422` when it refused, and `202 confirmed: false` when it
+said nothing inside the window - which is what a server where another mod replaced
+`orderchain.lua` outright looks like.
+
+| error | when |
+|---|---|
+| `422 already_there` | the ship is in that sector |
+| `422 no_route` | the planner found none; `reason` is `no_route`, `destination_in_rift`, `barrier`, `search_limit` or `timeout` |
+| `422 needs_captain` | no captain and nobody at the controls |
+| `422 plan_refused` | the ship refused a hop the engine would not allow; the message names it |
+| `400 bad_on_enemies` | |
+
+Plus the world checks `/orders` makes, before any planning: `409 owner_offline`,
+`409 ship_in_background`, `409 sector_not_loaded`. A dry run skips those. Planning is rate
+limited with `GET /galaxy/route`, one call every two seconds per player.
+
+The ship's sector has to stay loaded for the ship to fly; the engine does not simulate a
+craft in a sector nobody is near, and a plan waits with it.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/farm
+
+Boss farming. The game spawns a boss after **ten consecutive jumps into empty space** - no
+regular or off-grid content, not blocked by a rift, not a home sector - inside one of two
+rings around the core, each jump also having a 4% chance of its own:
+
+| `boss` | ring (distance from the core, exclusive) |
+|---|---|
+| `ai` | 240 - 340 |
+| `swoks` | 350 - 430 |
+| `auto` (default) | the ring the ship is in, else the nearer one |
+
+This finds two empty sectors in the ring one jump apart, plans a way there if the ship is not
+on one already, and sends the ship round the pair in a loop:
+
+```jsonc
+{"boss": "auto", "onEnemies": "fight", "attackCivilians": false, "dryRun": false}
+```
+
+```json
+{
+  "ship": "Ore Hound", "boss": "ai", "ring": {"min": 240, "max": 340},
+  "loop": [{"x": 290, "y": 1}, {"x": 293, "y": 4}],
+  "approach": [{"x": 287, "y": 0, "kind": "jump"}],
+  "hops": [{"x": 287, "y": 0, "kind": "jump"}, {"x": 290, "y": 1, "kind": "jump"}],
+  "loopFrom": 2, "piloted": true, "planId": "p5-7322", "confirmed": true
+}
+```
+
+The rules this works around, all vanilla's (`player/story/spawnrandombosses.lua`):
+
+- **The jump counter belongs to the player, not the ship.** It counts the sector changes of
+  the player aboard, so a captain flying the loop alone never spawns anything. A farm is
+  refused with `422 needs_pilot` unless a player is at the controls, and stops itself
+  (`last.outcome: "pilot_left"`) if they leave.
+- A jump into a sector with regular content resets the counter, which is why the loop only
+  uses empty sectors. The approach may pass through anything; counting starts on the loop.
+- After a boss dies, nothing spawns for 30 minutes. The loop keeps jumping regardless.
+
+`onEnemies` applies as for routes; with `fight` the loop resumes after the boss is dealt with.
+A dry run needs nobody aboard and reports `piloted`.
+
+Errors: `400 bad_boss`, `422 needs_pilot`, `422 no_hyperspace`, `422 no_farm_loop` (no pair of
+empty sectors near the ring point), `422 no_route` (none to the loop), plus the world checks
+above.
+
+**Requires the owning player to be logged in.**
+
+## GET /ships/{name}/automation
+
+What the ship's automation is doing, as the ship itself last reported it.
+
+```json
+{
+  "ship": "Ore Hound", "source": "live", "reported": true,
+  "automation": {
+    "version": 1,
+    "autoAggressive": true, "attackCivilians": false,
+    "enemies": false, "defenceFights": 3,
+    "sector": {"x": 290, "y": 1},
+    "plan": {
+      "id": "p5-7322", "kind": "farm", "phase": "running", "onEnemies": "fight",
+      "hops": 3, "hop": 2, "loopFrom": 2, "jumps": 14, "fights": 1,
+      "target": {"x": 293, "y": 4}, "boss": "ai"
+    },
+    "last": {"id": "p4-7310", "kind": "route", "outcome": "arrived", "jumps": 9, "fights": 0,
+             "sector": {"x": -120, "y": 88}}
+  }
+}
+```
+
+| field | notes |
+|---|---|
+| `source` | `live` from the event feed, `database` from the ship's row (as of the last save), `none` |
+| `reported` | false until the ship has published anything - its sector has not loaded since the mod was installed, or another mod replaced `orderchain.lua` |
+| `plan.phase` | `running`, `fighting` or `holding`; `plan` is absent when there is none |
+| `plan.hop` | the hop being flown, 1-based, counting the approach |
+| `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
+
+Works offline, from the database copy.
+
+## POST /ships/{name}/automation
+
+Idle defence: a ship with a captain, no orders and enemies in its sector turns aggressive
+until the sector is clear, then goes back to idle. A ship somebody is flying is left alone.
+
+```jsonc
+{"autoAggressive": true, "attackCivilians": false}
+```
+
+Either field may be sent alone. The setting is saved on the ship and survives restarts. The
+answer is held until the ship reports the new settings, as for routes. It gives the ship no
+order, so only the world checks apply, not the captain ones.
+
+Errors: `400 no_settings`, `400 bad_setting`.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/automation/stop
+
+Ends the ship's plan and clears its order chain. Idle defence is a setting and stays as it
+was. Answered once the ship reports it has no plan.
 
 **Requires the owning player to be logged in.**
 
@@ -655,25 +834,41 @@ losses and everything the owner spent it on; the two are not meant to reconcile.
 
 ## GET /galaxy/route
 
-Runs the game's own `calculateJumpPath`, the same pathfinder the travel analysis uses.
+Plans a route without sending anything. With no preferences this runs the game's own
+`calculateJumpPath`, the same pathfinder the travel analysis uses; with any of them it runs
+this mod's planner, which is what [`POST /ships/{name}/route`](#post-shipsnameroute) flies.
 
 | query | notes |
 |---|---|
 | `ship` | take origin, jump range and rift capability from a ship |
 | `fromX`, `fromY`, `range`, `rifts` | or give them explicitly |
 | `toX`, `toY` | required |
+| `preferGates`, `avoidRifts`, `preferUncontrolled` | `true`/`false`; giving any of them selects the mod's planner |
 
 ```json
 {
   "from": {"x": 0, "y": 0}, "to": {"x": 60, "y": 0},
   "reachable": true, "jumps": 12, "distance": 60.0,
   "route": [{"x": 0, "y": 0}, "..."],
-  "jumpRange": 5.0, "canPassRifts": false
+  "jumpRange": 5.0, "canPassRifts": false, "planner": "engine"
 }
 ```
 
 `reachable` is false when the pathfinder stopped short of the destination - check it rather
 than assuming the last sector in `route` is where you asked to go.
+
+The mod's planner (`"planner": "automation"`) answers in the same shape and adds `hops` - each
+with `kind` (`jump`, `gate`, `wormhole`), `distance`, `controlled` (faction space) and `rift` -
+along with `gates`, `controlledSectors`, `preferences`, and `reason` when unreachable. It
+works from the same facts the engine does: jump range, rift geometry, the barrier, and the
+gates and wormholes the player or their alliance know about. It is not an exhaustive search:
+each step considers a fixed set of directions at full and two-thirds range rather than every
+sector in reach, which keeps it affordable at long jump ranges and costs little in route
+length. Crossing the barrier is only planned for ships that can pass rifts. Every jump is
+re-checked against the engine when the ship takes the route up.
+
+It is sliced across server ticks (`Config.routePlanStepsPerTick`) and gives up after
+`Config.routePlanMaxExpansions` sectors, answering unreachable with `reason: "search_limit"`.
 
 Explicitly expensive and rate limited to one call every two seconds per player;
 `429 route_busy` otherwise.

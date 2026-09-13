@@ -24,7 +24,8 @@ meta =
     clientSideOnly = false,
 
     -- Adds a galaxy script and player/server values that stop meaning anything once the
-    -- mod is removed, so removal is not transparent.
+    -- mod is removed, so removal is not transparent. The order chain extension saves its
+    -- state inside the chain's own data, which vanilla ignores once the mod is gone.
     saveGameAltering = true,
 
     contact = "https://github.com/Rustypredator/avorion-automation-api",

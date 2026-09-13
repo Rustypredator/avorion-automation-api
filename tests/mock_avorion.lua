@@ -215,7 +215,16 @@ function M.install()
                 return M.loadedSectors[keyOf(x, y)] == true
             end,
             sectorExists = function() return true end,
-            jumpRouteUnobstructed = function() return M.jumpUnobstructed ~= false end,
+            jumpRouteUnobstructed = function(_, ax, ay, bx, by)
+                if M.jumpUnobstructed == false then return false end
+                if M.obstruction then return not M.obstruction(ax, ay, bx, by) end
+                return true
+            end,
+            -- a faction handle or nil, as the engine answers; nil is no man's space
+            getControllingFaction = function(_, x, y)
+                local index = M.controlledSectors[keyOf(x, y)]
+                return index and {index = index} or nil
+            end,
             keepSector = function() return true end,
             -- The agent -> bridge direction, proven safe in game.
             invokeFunction = function(_, script, functionName, ...)
@@ -313,6 +322,52 @@ function M.install()
         onUserRefineOresOrder = function() return {{name = "Refine Ores", action = 14}} end,
     }
 
+    -- This mod's orderchain.lua extension, reduced to what the bridge can observe of it:
+    -- the chain it builds and the automation state it publishes. The extension's own
+    -- behaviour is exercised for real in tests/test_orderchain.lua.
+    local Json = require("automationapi.json")
+
+    local automationEffects =
+    {
+        automationApiRunPlan = function(ship, payload)
+            local plan = Json.decode(payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.receivedPlans = ship.receivedPlans or {}
+            ship.receivedPlans[#ship.receivedPlans + 1] = plan
+
+            if M.refusePlan then
+                ship.automation.last = {id = plan.id, kind = plan.kind, outcome = "refused",
+                                        reason = M.refusePlan}
+                return
+            end
+
+            local chain = {}
+            for _, hop in ipairs(plan.hops) do
+                if hop.kind == "jump" then
+                    chain[#chain + 1] = {name = "Jump", action = 1}
+                else
+                    chain[#chain + 1] = {name = "Fly Through Wormhole", action = 11}
+                end
+            end
+            if plan.loopFrom then chain[#chain + 1] = {name = "Loop", action = 4} end
+
+            ship.chain = chain
+            ship.chainIndex = 1
+            ship.automation.plan = {id = plan.id, kind = plan.kind, phase = "running",
+                                    hops = #plan.hops, loopFrom = plan.loopFrom or 0}
+        end,
+        automationApiConfigure = function(ship, payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            for key, value in pairs(Json.decode(payload)) do ship.automation[key] = value end
+        end,
+        automationApiStop = function(ship)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.automation.plan = nil
+            ship.chain = {}
+            ship.chainIndex = 0
+        end,
+    }
+
     _G.invokeEntityFunction = function(x, y, printErrors, target, script, functionName, ...)
         M.entityCalls[#M.entityCalls + 1] =
         {
@@ -326,9 +381,13 @@ function M.install()
         if ship and not M.orderChainFrozen then
             ship.chain = ship.chain or {}
             local effect = chainEffects[functionName]
+            local automationEffect = not M.noOrderChainExtension
+                                     and automationEffects[functionName]
             if effect then
                 ship.chain = effect(ship.chain)
                 ship.chainIndex = 0
+            elseif automationEffect then
+                automationEffect(ship, ...)
             elseif functionName == "runOrders" then
                 ship.chainIndex = math.min(1, #ship.chain)
             end
@@ -336,7 +395,7 @@ function M.install()
             -- The engine raises onShipOrderInfoUpdated on the owning faction whenever the
             -- chain changes; the player agent forwards it to the bridge. Tests install the
             -- forwarding end as `shipEventSink`, standing in for the agent.
-            if M.shipEventSink and (effect or functionName == "runOrders") then
+            if M.shipEventSink and (effect or automationEffect or functionName == "runOrders") then
                 local chain = {}
                 for index, order in ipairs(ship.chain) do
                     chain[index] = {name = order.name, action = order.action}
@@ -344,7 +403,9 @@ function M.install()
 
                 M.shipEventSink(target.faction, target.name, "order",
                                 {chain = chain, activeIndex = ship.chainIndex or 0,
-                                 finished = false, x = x, y = y})
+                                 finished = false, x = x, y = y,
+                                 automation = ship.automation and Json.encode(ship.automation)
+                                              or nil})
             end
         end
 
@@ -422,6 +483,12 @@ function M.install()
                         return spec.regular == true, spec.offgrid == true, spec.dustyness or 0
                     end,
                 }
+
+                function instance:determineContent(x, y, seed)
+                    local spec = M.predicted[keyOf(x, y)] or {}
+                    return spec.regular == true, spec.offgrid == true, spec.blocked == true,
+                           spec.home == true
+                end
 
                 function instance:initialize(x, y, seed)
                     local spec = M.predicted[keyOf(x, y)] or {}
@@ -546,6 +613,14 @@ M.orderChainFrozen = false
 M.shipEventSink = nil
 M.riftSectors = {}
 M.loadedSectors = nil
+-- "x:y" -> controlling faction index; anything absent is no man's space
+M.controlledSectors = {}
+-- function(ax, ay, bx, by) -> true when a rift blocks that jump
+M.obstruction = nil
+-- a reason string makes the orderchain extension refuse every plan with it
+M.refusePlan = nil
+-- models a server where another mod replaced orderchain.lua outright
+M.noOrderChainExtension = false
 M.jumpUnobstructed = true
 M.routeResult = nil
 
@@ -908,6 +983,10 @@ function M.reset()
     M.entityCalls = {}
     M.riftSectors = {}
     M.loadedSectors = nil
+    M.controlledSectors = {}
+    M.obstruction = nil
+    M.refusePlan = nil
+    M.noOrderChainExtension = false
     M.jumpUnobstructed = true
     M.routeResult = nil
     M.commandError = nil

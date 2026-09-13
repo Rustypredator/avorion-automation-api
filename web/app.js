@@ -59,7 +59,14 @@
     follow: true,
 
     galaxy: null,
-    lastRoute: null,
+
+    /* The Travel tab. Preferences and enemy handling stick across craft, since they
+       describe how the player likes to fly; results and the automation read do not. */
+    nav: {
+      preferGates: false, avoidRifts: false, preferUncontrolled: false,
+      onEnemies: 'fight', attackCivilians: false, boss: 'auto',
+      result: null, farm: null, automation: null, automationError: null
+    },
 
     /* The bridge's own history store. Separate from S.events, which is the mod's
        in-memory ring buffer read live: the two overlap but neither contains the other. */
@@ -433,11 +440,36 @@
       'Not proof of failure: a one-shot order that finishes instantly can land and clear '
       + 'again inside the window. The event log below shows what actually happened.',
 
-    'travel':
-      'A Travel captain mission under a shorter name &mdash; the same analysis, '
-      + 'prediction and start path &mdash; so the answer carries a real route prediction '
-      + 'rather than an acknowledgement. Prefer it to orders for anything that is not '
-      + 'tactical: it loads no sectors and works wherever the ship is.',
+    'nav-route':
+      'The route is planned by the mod, not the game\'s pathfinder, so it can prefer gates, '
+      + 'keep a rift-capable ship out of rifts and stay in no man\'s space. The ship flies it '
+      + 'as an ordinary order chain &mdash; the Orders tab and the map show the jumps. Its '
+      + 'sector has to be loaded, and it needs a captain or you at the controls.',
+
+    'nav-enemies':
+      '<p>The ship checks its sector every second while it flies a plan.</p>'
+      + '<p><b>fight</b> drops the route, fights until the sector has been clear for five '
+      + 'seconds, then picks the route up at the hop it was on. <b>hold</b> stays aggressive '
+      + 'where it is and ends the plan. <b>ignore</b> keeps jumping.</p>',
+
+    'nav-farm':
+      '<p>The game spawns a boss after ten consecutive jumps into <b>empty</b> sectors '
+      + '&mdash; no stations, no asteroid fields, no rift &mdash; in two rings: The AI between '
+      + '240 and 340 sectors from the core, Swoks between 350 and 430. Each jump also has a 4% '
+      + 'chance on its own.</p>'
+      + '<p>The counter belongs to the <b>player aboard</b>, not the ship, so this only works '
+      + 'while you are flying it; the loop stops if you leave. A jump into a sector with '
+      + 'stations resets the counter, which is why the loop only uses empty ones. After a boss '
+      + 'is killed nothing spawns for 30 minutes.</p>',
+
+    'nav-defence':
+      'While the ship has no orders and a captain, enemies in its sector make it fight until '
+      + 'the sector is clear, then it goes back to idle. A ship you are flying is left to you. '
+      + 'The setting is saved on the ship.',
+
+    'nav-state':
+      'What the ship last reported. Live while you are in game; otherwise the ship database\'s '
+      + 'copy, which is as fresh as the last save.',
 
     'connect-network':
       '<p>The browser reports no status for this, which means either the bridge is not '
@@ -843,6 +875,7 @@
     $$('.subview').forEach(function (v) { v.classList.toggle('active', v.dataset.sub === name); });
 
     if (name === 'mission' && S.selected && !S.catalog) { loadCatalog(); }
+    if (name === 'travel' && S.selected) { renderTravel(); loadAutomation(); }
     if (name === 'cargo') { renderCargo(); }
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
@@ -1143,7 +1176,10 @@
     S.mission = null;
     S.catalog = null;
     S.missionForm = null;
-    S.lastRoute = null;
+    S.nav.result = null;
+    S.nav.farm = null;
+    S.nav.automation = null;
+    S.nav.automationError = null;
     renderFleet();
 
     if (!name) {
@@ -1175,6 +1211,7 @@
     loadStation();
     renderOrders();
     renderTravel();
+    if (S.sub === 'travel') { loadAutomation(); }
     renderShipLog();
 
     if (changed && S.history.selectedOnly && historyWanted()) { loadHistory(true); }
@@ -2669,6 +2706,30 @@
 
   /* ================================= TRAVEL ================================ */
 
+  /* Travel is order chains the ship flies itself: a route planned with preferences, a
+     boss-farming loop, and the idle defence setting, all carried out by the mod's
+     orderchain.lua extension on the ship. Captain travel missions are a mission like any
+     other and live on the Mission tab; the two used to be one start under two names. */
+
+  var ON_ENEMIES = [
+    ['fight', 'fight, then resume'],
+    ['hold', 'hold & stay aggressive'],
+    ['continue', 'ignore & keep going']
+  ];
+
+  var BOSSES = [
+    ['auto', 'nearest ring'],
+    ['ai', 'The AI · 240–340'],
+    ['swoks', 'Swoks · 350–430']
+  ];
+
+  var PHASE_TONE = { running: 'good', fighting: 'bad', holding: 'warn' };
+
+  function piloted(name) {
+    var ship = S.byName[name] || {};
+    return /\[PLAYER\]/.test(ship.status || '');
+  }
+
   function renderTravel() {
     if (!S.selected) { return; }
     var ship = S.byName[S.selected] || {};
@@ -2676,9 +2737,20 @@
     var target = S.travelTarget || { x: position.x, y: position.y };
     S.travelTarget = target;
 
+    var nav = S.nav;
+    var riftCapable = !!(S.detail && S.detail.hyperspace && S.detail.hyperspace.canPassRifts);
     var out = [];
 
-    out.push('<div class="section"><h2>Travel ' + explain('travel') + '</h2>');
+    if (ship.availability === 'InBackground') {
+      out.push('<div class="note warn" style="margin-bottom:12px">'
+        + 'Out on a captain mission &mdash; no order chain '
+        + explain('orders-background', 'warn') + '</div>');
+    }
+
+    out.push(automationHtml());
+
+    /* --- route --- */
+    out.push('<div class="section"><h2>Planned route ' + explain('nav-route') + '</h2>');
 
     out.push('<div class="row" style="margin-bottom:10px">'
       + '<span class="mute2">from</span><b>' + coords(position) + '</b>'
@@ -2689,66 +2761,180 @@
       + '<button class="ghost small" data-act="travel-map">pick on map</button>'
       + '</div>');
 
-    out.push('<div class="row" style="margin-bottom:10px">'
-      + '<span class="mute2">swiftness</span>'
-      + [0, 1, 2, 3].map(function (v) {
-          var names = ['careful', 'steady', 'normal', 'reckless'];
-          return '<button class="chip' + ((S.swiftness === undefined ? 2 : S.swiftness) === v ? ' on' : '')
-            + '" data-swiftness="' + v + '">' + v + ' ' + names[v] + '</button>';
-        }).join('')
+    out.push('<div class="chips" style="margin-bottom:10px">'
+      + prefChip('preferGates', 'prefer gates')
+      + prefChip('avoidRifts', riftCapable ? 'avoid rifts' : 'avoid rifts (always, no rift drive)')
+      + prefChip('preferUncontrolled', 'prefer no man\'s space')
       + '</div>');
 
     out.push('<div class="row" style="margin-bottom:12px">'
-      + '<button class="ghost" data-act="route">Check route</button>'
-      + '<button class="primary" data-act="travel">Send</button>'
-      + '<span class="mute2">route calculation is limited to one every two seconds</span>'
+      + '<button class="ghost" data-act="route">Plan route</button>'
+      + '<button class="primary" data-act="fly">Fly route</button>'
+      + '<span class="mute2">planning is limited to one every two seconds</span>'
       + '</div>');
 
-    out.push('<div id="travel-result">' + (S.lastRoute ? routeHtml(S.lastRoute) : '') + '</div>');
+    out.push('<div id="travel-result">' + navResultHtml(nav.result) + '</div>');
     out.push('</div>');
+
+    /* --- enemies --- */
+    out.push('<div class="section"><h2>When enemies appear ' + explain('nav-enemies') + '</h2>'
+      + '<div class="row">'
+      + '<div class="chips">' + ON_ENEMIES.map(function (option) {
+          return '<button class="chip' + (nav.onEnemies === option[0] ? ' on' : '')
+            + '" data-on-enemies="' + option[0] + '">' + option[1] + '</button>';
+        }).join('') + '</div>'
+      + '<label class="check"><input type="checkbox" id="nav-civilians"'
+      + (nav.attackCivilians ? ' checked' : '') + '><span>attack civilians</span></label>'
+      + '</div>'
+      + '<div class="mute2" style="margin-top:6px">applies to planned routes and boss farming</div>'
+      + '</div>');
+
+    /* --- boss farming --- */
+    var aboard = piloted(S.selected);
+    out.push('<div class="section"><h2>Boss farming ' + explain('nav-farm') + '</h2>'
+      + '<div class="row" style="margin-bottom:10px">'
+      + '<div class="chips">' + BOSSES.map(function (option) {
+          return '<button class="chip' + (nav.boss === option[0] ? ' on' : '')
+            + '" data-boss="' + option[0] + '">' + option[1] + '</button>';
+        }).join('') + '</div>'
+      + (aboard
+        ? '<span class="badge good">you are at the controls</span>'
+        : '<span class="badge warn" title="Spawns count the jumps of the player aboard.">'
+          + 'nobody at the controls</span>')
+      + '</div>'
+      + '<div class="row" style="margin-bottom:10px">'
+      + '<button class="ghost" data-act="farm-preview">Preview loop</button>'
+      + '<button class="primary" data-act="farm"' + (aboard ? '' : ' disabled') + '>Start farming</button>'
+      + '</div>'
+      + '<div id="farm-result">' + farmResultHtml(nav.farm) + '</div>'
+      + '</div>');
+
+    /* --- idle defence --- */
+    var automation = (nav.automation && nav.automation.automation) || {};
+    out.push('<div class="section"><h2>Idle defence ' + explain('nav-defence') + '</h2>'
+      + '<div class="row">'
+      + '<label class="check"><input type="checkbox" id="nav-auto-aggressive"'
+      + (automation.autoAggressive ? ' checked' : '') + '><span>turn aggressive when idle and '
+      + 'enemies are in the sector</span></label>'
+      + '<label class="check"><input type="checkbox" id="nav-defence-civilians"'
+      + (automation.attackCivilians ? ' checked' : '') + '><span>civilians count</span></label>'
+      + '</div></div>');
+
+    out.push('<div class="note">Captain travel missions, which work in unloaded sectors and '
+      + 'while you are logged out, are on the '
+      + '<a href="#" data-act="to-missions">Mission tab</a>.</div>');
 
     $('#sv-travel').innerHTML = out.join('');
   }
 
-  function routeHtml(route) {
-    if (route.__error) { return errorBox('Route failed', route.__error); }
-
-    var head = route.reachable
-      ? '<div class="okbox"><b>' + num(route.jumps) + ' jumps</b>, '
-        + num(route.distance, 1) + ' sectors flown</div>'
-      : '<div class="errbox"><h3>Unreachable</h3><div>The pathfinder stopped short of '
-        + coords(route.to) + '.</div></div>';
-
-    var path = (route.route || []).map(function (p) { return p.x + ':' + p.y; }).join(' → ');
-
-    return head
-      + kv([
-        ['from', coords(route.from)],
-        ['to', coords(route.to)],
-        ['jump range', num(route.jumpRange, 2)],
-        ['rifts', route.canPassRifts ? 'can pass' : 'no']
-      ])
-      + '<div class="mute2" style="margin-top:8px;overflow-wrap:anywhere">' + esc(path) + '</div>';
+  function prefChip(key, label) {
+    return '<button class="chip' + (S.nav[key] ? ' on' : '') + '" data-pref="' + key + '">'
+      + esc(label) + '</button>';
   }
 
-  function checkRoute(button) {
-    var name = S.selected;
-    if (!name) { return; }
+  function automationHtml() {
+    var nav = S.nav;
+    var head = '<div class="section"><h2>Automation ' + explain('nav-state')
+      + ' <button class="ghost small" data-act="automation-refresh">refresh</button></h2>';
 
-    var to = readTravelTarget();
-    guard(button, Api.get('/galaxy/route',
-      { ship: name, toX: to.x, toY: to.y, owner: ownerParamFor(name) },
-      { priority: Api.P.USER, label: 'route' }))
-      .then(function (route) {
-        S.lastRoute = route;
-        GalaxyMap.setRoute(route);
-        $('#travel-result').innerHTML = routeHtml(route);
-      })
-      .catch(function (error) {
-        S.lastRoute = { __error: error };
-        $('#travel-result').innerHTML = errorBox(
-          error.code === 'route_busy' ? 'Rate limited' : 'Route failed', error);
-      });
+    if (nav.automationError) {
+      return head + errorBox('Could not read the automation state', nav.automationError) + '</div>';
+    }
+    if (!nav.automation) { return head + '<p class="muted">loading…</p></div>'; }
+    if (!nav.automation.reported) {
+      return head + '<div class="note">This ship has not reported any automation state yet. '
+        + 'It does once its sector is loaded with this version of the mod.</div></div>';
+    }
+
+    var a = nav.automation.automation || {};
+    var plan = a.plan;
+    var rows = [];
+    var badges = [];
+
+    if (plan) {
+      badges.push('<span class="badge ' + (PHASE_TONE[plan.phase] || 'info') + '">'
+        + esc(plan.kind) + ' · ' + esc(plan.phase) + '</span>');
+      rows.push(['hop', num(plan.hop) + ' of ' + num(plan.hops)
+        + (plan.loopFrom ? ' · loops from ' + num(plan.loopFrom) : '')]);
+      if (plan.target && !plan.loopFrom) { rows.push(['heading for', esc(coords(plan.target))]); }
+      if (plan.boss) { rows.push(['boss ring', esc(plan.boss)]); }
+      rows.push(['jumps flown', num(plan.jumps)]);
+      rows.push(['fights', num(plan.fights)]);
+      rows.push(['on enemies', esc(plan.onEnemies)]);
+    } else {
+      badges.push('<span class="badge">no plan</span>');
+    }
+
+    if (a.enemies) { badges.push('<span class="badge bad">enemies in sector</span>'); }
+    badges.push('<span class="badge ' + (a.autoAggressive ? 'good' : '') + '">idle defence '
+      + (a.autoAggressive ? 'on' : 'off') + '</span>');
+
+    if (a.last) {
+      rows.push(['last plan', esc(a.last.kind + ' · ' + a.last.outcome)
+        + (a.last.reason ? ' <span class="mute2">' + esc(a.last.reason) + '</span>' : '')]);
+    }
+    if (a.defenceFights) { rows.push(['defence fights', num(a.defenceFights)]); }
+    rows.push(['source', esc(nav.automation.source)
+      + (nav.automation.source === 'database' ? ' <span class="mute2">as of the last save</span>' : '')]);
+
+    return head
+      + '<div class="row" style="margin-bottom:8px"><div class="badges">' + badges.join('') + '</div>'
+      + '<span class="spacer"></span>'
+      + (plan ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
+      + '</div>'
+      + kv(rows)
+      + '</div>';
+  }
+
+  function hopsHtml(hops) {
+    return (hops || []).map(function (hop) {
+      var tag = hop.kind && hop.kind !== 'jump' ? ' <span class="mute2">' + esc(hop.kind) + '</span>' : '';
+      var cls = hop.controlled ? 'dim' : 'active';
+      return '<span class="' + cls + '" title="' + (hop.controlled ? 'faction space' : 'no man\'s space')
+        + '">' + esc(hop.x + ':' + hop.y) + tag + '</span>';
+    }).join(' <span class="dim">→</span> ');
+  }
+
+  function navResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.__error) { return errorBox(result.__title || 'Route failed', result.__error); }
+
+    if (!result.reachable) {
+      return '<div class="errbox"><h3>Unreachable</h3><div>'
+        + esc(result.reason || 'The pathfinder stopped short of ' + coords(result.to) + '.')
+        + '</div></div>';
+    }
+
+    var head = result.planner === 'engine'
+      ? num(result.jumps) + ' jumps (game pathfinder)'
+      : num(result.jumps) + ' hops'
+        + (result.gates ? ' · ' + num(result.gates) + ' through gates' : '')
+        + ' · ' + num(result.controlledSectors || 0) + ' in faction space';
+
+    var sent = result.planId
+      ? '<div class="mute2">' + (result.confirmed ? 'the ship took the plan up' : 'dispatched, not confirmed '
+        + explain('orders-unconfirmed')) + '</div>'
+      : '';
+
+    return '<div class="' + (result.planId && !result.confirmed ? 'errbox' : 'okbox') + '">'
+      + '<b>' + head + '</b>, ' + num(result.distance, 1) + ' sectors flown'
+      + sent + '</div>'
+      + '<div class="hops">' + hopsHtml(result.hops) + '</div>';
+  }
+
+  function farmResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.__error) { return errorBox(result.__title || 'Farming refused', result.__error); }
+
+    var loop = result.loop || [];
+    return '<div class="' + (result.planId && !result.confirmed ? 'errbox' : 'okbox') + '">'
+      + '<b>' + esc(result.boss === 'swoks' ? 'Swoks' : 'The AI') + '</b> ring, looping '
+      + esc(loop.map(coords).join(' ⇄ '))
+      + (result.approach && result.approach.length
+        ? ' after ' + num(result.approach.length) + ' hops to get there' : '')
+      + (result.planId ? '<div class="mute2">' + (result.confirmed ? 'farming' : 'dispatched, not confirmed')
+        + '</div>' : '')
+      + '</div>';
   }
 
   function readTravelTarget() {
@@ -2758,31 +2944,175 @@
     return S.travelTarget;
   }
 
-  function sendTravel(button) {
+  function navOptions() {
+    return {
+      preferGates: S.nav.preferGates,
+      avoidRifts: S.nav.avoidRifts,
+      preferUncontrolled: S.nav.preferUncontrolled
+    };
+  }
+
+  function planRoute(button) {
     var name = S.selected;
     if (!name) { return; }
 
     var to = readTravelTarget();
-    var body = { to: to, swiftness: S.swiftness === undefined ? 2 : S.swiftness };
+    var query = Object.assign({ ship: name, toX: to.x, toY: to.y, owner: ownerParamFor(name) },
+                              navOptions());
 
-    $('#travel-result').innerHTML = '<p class="muted">running the area analysis…</p>';
+    $('#travel-result').innerHTML = '<p class="muted">planning…</p>';
 
-    guard(button, Api.post('/ships/' + Api.seg(name) + '/travel', body,
-                           { owner: ownerParamFor(name) },
-                           { priority: Api.P.USER, label: 'travel' }))
-      .then(function (result) {
-        toast('good', 'Travelling', name + ' is on its way to ' + coords(to) + '.');
-        $('#travel-result').innerHTML = renderPreview(result);
-        refreshFleet(true);
-        loadMission();
+    guard(button, Api.get('/galaxy/route', query, { priority: Api.P.USER, label: 'route' }))
+      .then(function (route) {
+        if (S.selected !== name) { return; }
+        S.nav.result = route;
+        GalaxyMap.setRoute(route);
+        $('#travel-result').innerHTML = navResultHtml(route);
       })
       .catch(function (error) {
-        if (error.status === 422 && error.body && error.body.errors) {
-          $('#travel-result').innerHTML = renderPreview(error.body);
-        } else {
-          $('#travel-result').innerHTML = errorBox('Travel refused', error);
+        S.nav.result = { __error: error,
+                         __title: error.code === 'route_busy' ? 'Rate limited' : 'Route failed' };
+        $('#travel-result').innerHTML = navResultHtml(S.nav.result);
+      });
+  }
+
+  function flyRoute(button) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var to = readTravelTarget();
+    var body = Object.assign({
+      to: to,
+      onEnemies: S.nav.onEnemies,
+      attackCivilians: S.nav.attackCivilians
+    }, navOptions());
+
+    $('#travel-result').innerHTML = '<p class="muted">planning, then waiting for the ship to '
+      + 'take the plan up…</p>';
+
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/route', body,
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: 'fly route' }))
+      .then(function (result) {
+        if (S.selected !== name) { return; }
+        S.nav.result = result;
+        GalaxyMap.setRoute(result);
+        $('#travel-result').innerHTML = navResultHtml(result);
+        tookAutomation(name, result);
+        toast(result.confirmed ? 'good' : 'warn', result.confirmed ? 'Route flying' : 'Route dispatched',
+              name + ' → ' + coords(to) + ', ' + result.jumps + ' hops.');
+      })
+      .catch(function (error) {
+        S.nav.result = error.body && error.body.hops && error.body.reachable === false
+          ? error.body
+          : { __error: error, __title: 'Route refused' };
+        $('#travel-result').innerHTML = navResultHtml(S.nav.result);
+        apiFailed(error, 'Route refused');
+      });
+  }
+
+  function farm(button, dryRun) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var body = {
+      boss: S.nav.boss,
+      onEnemies: S.nav.onEnemies,
+      attackCivilians: S.nav.attackCivilians,
+      dryRun: !!dryRun
+    };
+
+    $('#farm-result').innerHTML = '<p class="muted">' + (dryRun ? 'finding a loop…'
+      : 'finding a loop, then waiting for the ship…') + '</p>';
+
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/farm', body,
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: dryRun ? 'farm preview' : 'farm' }))
+      .then(function (result) {
+        if (S.selected !== name) { return; }
+        S.nav.farm = result;
+        GalaxyMap.setRoute(result);
+        $('#farm-result').innerHTML = farmResultHtml(result);
+        if (!dryRun) {
+          tookAutomation(name, result);
+          toast('good', 'Farming', name + ' is looping in the ' + result.boss + ' ring.');
         }
-        apiFailed(error, 'Travel refused');
+      })
+      .catch(function (error) {
+        S.nav.farm = { __error: error };
+        $('#farm-result').innerHTML = farmResultHtml(S.nav.farm);
+        if (!dryRun) { apiFailed(error, 'Farming refused'); }
+      });
+  }
+
+  /* A confirmed dispatch carries the state the ship published, which is newer than the
+     last read - so it is shown straight away rather than after another round trip. */
+  function tookAutomation(name, body) {
+    if (body && body.automation && S.selected === name) {
+      S.nav.automation = { ship: name, source: 'live', reported: true, automation: body.automation };
+      S.nav.automationError = null;
+      renderTravel();
+    }
+    refreshFleet(true);
+    sweepEvents();
+  }
+
+  function loadAutomation(background) {
+    var name = S.selected;
+    if (!name || isStation(S.byName[name])) { return Promise.resolve(); }
+
+    return Api.get('/ships/' + Api.seg(name) + '/automation', { owner: ownerParamFor(name) },
+                   { priority: background ? Api.P.POLL : Api.P.DETAIL, label: 'automation' })
+      .then(function (body) {
+        if (S.selected !== name) { return; }
+        S.nav.automation = body;
+        S.nav.automationError = null;
+        if (S.sub === 'travel') { renderTravel(); }
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled' || S.selected !== name) { return; }
+        S.nav.automationError = error;
+        if (S.sub === 'travel') { renderTravel(); }
+      });
+  }
+
+  function stopAutomation(button) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/automation/stop', {},
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: 'stop automation' }))
+      .then(function (result) {
+        toast('good', 'Stopped', name + ' has no plan any more.');
+        tookAutomation(name, result);
+      })
+      .catch(function (error) { apiFailed(error, 'Stop refused'); });
+  }
+
+  function saveDefence(input) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var body = {
+      autoAggressive: $('#nav-auto-aggressive').checked,
+      attackCivilians: $('#nav-defence-civilians').checked
+    };
+
+    input.disabled = true;
+    Api.post('/ships/' + Api.seg(name) + '/automation', body,
+             { owner: ownerParamFor(name) },
+             { priority: Api.P.USER, label: 'idle defence' })
+      .then(function (result) {
+        input.disabled = false;
+        toast(result.confirmed ? 'good' : 'warn', 'Idle defence ' + (body.autoAggressive ? 'on' : 'off'),
+              result.confirmed ? name + ' confirmed the setting.' : 'Sent, but the ship did not confirm it.');
+        tookAutomation(name, result);
+      })
+      .catch(function (error) {
+        input.disabled = false;
+        input.checked = !input.checked;
+        apiFailed(error, 'Setting refused');
       });
   }
 
@@ -2841,6 +3171,12 @@
       event.recvAt = arrived - offset * 1000;
       S.events.push(event);
       added = true;
+
+      if (event.automation && name === S.selected) {
+        S.nav.automation = { ship: name, source: 'live', reported: true,
+                             automation: event.automation };
+        if (S.sub === 'travel') { renderTravel(); }
+      }
 
       if (event.seq > (S.cursors[name] || -1)) { S.cursors[name] = event.seq; }
     }
@@ -5330,22 +5666,54 @@
 
     /* --- travel tab --------------------------------------------------- */
     $('#sv-travel').addEventListener('click', function (e) {
+      var link = e.target.closest('a[data-act="to-missions"]');
+      if (link) {
+        e.preventDefault();
+        showSub('mission');
+        return;
+      }
+
       var button = e.target.closest('button');
       if (!button) { return; }
 
-      if (button.dataset.swiftness !== undefined) {
-        S.swiftness = Number(button.dataset.swiftness);
+      if (button.dataset.pref) {
+        readTravelTarget();
+        S.nav[button.dataset.pref] = !S.nav[button.dataset.pref];
+        renderTravel();
+        return;
+      }
+      if (button.dataset.onEnemies) {
+        readTravelTarget();
+        S.nav.onEnemies = button.dataset.onEnemies;
+        renderTravel();
+        return;
+      }
+      if (button.dataset.boss) {
+        readTravelTarget();
+        S.nav.boss = button.dataset.boss;
         renderTravel();
         return;
       }
 
       var act = button.dataset.act;
-      if (act === 'route') { readTravelTarget(); checkRoute(button); }
-      else if (act === 'travel') { sendTravel(button); }
+      if (act === 'route') { planRoute(button); }
+      else if (act === 'fly') { flyRoute(button); }
+      else if (act === 'farm-preview') { farm(button, true); }
+      else if (act === 'farm') { farm(button, false); }
+      else if (act === 'automation-refresh') { loadAutomation(); }
+      else if (act === 'automation-stop') { stopAutomation(button); }
       else if (act === 'travel-map') {
         S.pickTarget = 'travel';
         showView('map');
-        toast('info', 'Click a sector', 'It becomes the travel destination.');
+        toast('info', 'Click a sector', 'It becomes the route destination.');
+      }
+    });
+
+    $('#sv-travel').addEventListener('change', function (e) {
+      var node = e.target;
+      if (node.id === 'nav-civilians') { S.nav.attackCivilians = node.checked; }
+      else if (node.id === 'nav-auto-aggressive' || node.id === 'nav-defence-civilians') {
+        saveDefence(node);
       }
     });
 

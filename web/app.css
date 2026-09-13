@@ -534,3 +534,9 @@ marker#ia-bad path { fill: #8a3a3a; }
 #popover b { color: var(--text); }
 #popover p { margin: 0 0 7px; }
 #popover p:last-child { margin-bottom: 0; }
+
+/* Travel tab: a planned route's hops. Faction space is dimmed so a route that keeps to
+   no man's space reads as one bright line. */
+.hops { font-size: 12px; overflow-wrap: anywhere; line-height: 1.7; margin-top: 4px; }
+.hops .active { color: var(--text); }
+.hops .dim { color: var(--text-mute); }

@@ -18,6 +18,7 @@ local ShipData = include("automationapi/shipdata")
 local MissionTypes = include("automationapi/missiontypes")
 local Analysis = include("automationapi/analysis")
 local FactionScope = include("automationapi/factionscope")
+local Routes = include("automationapi/routes")
 
 local SimulationUtility = include("simulationutility")
 
@@ -413,6 +414,13 @@ local function withAssessment(ctx, params, onAssessed)
     local config = MissionTypes.buildConfig(key, ctx.body)
     local area = MissionTypes.buildArea(command, owner.index, shipName, ctx.body)
 
+    -- A travel area is the destination sector. Checked against the gates the game applies
+    -- before an analysis is spent on it, so an impossible destination comes back at once
+    -- with a reason rather than as a start the game silently refuses.
+    if key == "travel" and area.lower.x == area.upper.x and area.lower.y == area.upper.y then
+        Routes.checkTravelDestination(owner, shipName, area.lower.x, area.lower.y)
+    end
+
     Analysis.start(owner.index, ctx.playerIndex, shipName, missionType, area,
         function(analyzedArea, results)
             local ok, err = pcall(function()
@@ -484,6 +492,7 @@ function Missions.takeJobs(playerIndex)
                 sector = job.sector,
                 clear = job.clear,
                 calls = job.calls,
+                run = job.run,
             }
         end
     end
