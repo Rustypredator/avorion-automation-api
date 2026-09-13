@@ -548,7 +548,7 @@ const ready = window.document.readyState === 'loading'
     const areas = scanned.map((p) => p.body.area);
     check(areas.every((a) => a.lower.x <= 1 && a.upper.x >= 1 && a.lower.y <= 2 && a.upper.y >= 2),
           'every placement keeps the ship inside the area');
-    check(areas[0].lower.x === 1 && areas[0].lower.y === 2 && areas[0].upper.x === 17,
+    check(areas[0].lower.x === 1 && areas[0].upper.y === 2 && areas[0].upper.x === 17,
           'the first puts the ship in the top-left corner of the square');
     check(areas.some((a) => a.lower.x === -27 && a.upper.x === 1 && a.upper.y - a.lower.y === 10),
           'the wide shape is tried with the ship on its eastern edge');

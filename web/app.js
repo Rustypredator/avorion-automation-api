@@ -1922,14 +1922,14 @@
    */
 
   /* Where the ship sits inside the area, as a fraction of each side: 0 is the low edge
-     (left, top - map y grows downwards), 1 the high edge. */
+     (left, bottom - map y grows upwards), 1 the high edge. */
   var PLACEMENTS = [
-    { label: 'top-left corner',     fx: 0,   fy: 0 },
-    { label: 'top-right corner',    fx: 1,   fy: 0 },
-    { label: 'bottom-left corner',  fx: 0,   fy: 1 },
-    { label: 'bottom-right corner', fx: 1,   fy: 1 },
-    { label: 'top side',            fx: 0.5, fy: 0 },
-    { label: 'bottom side',         fx: 0.5, fy: 1 },
+    { label: 'top-left corner',     fx: 0,   fy: 1 },
+    { label: 'top-right corner',    fx: 1,   fy: 1 },
+    { label: 'bottom-left corner',  fx: 0,   fy: 0 },
+    { label: 'bottom-right corner', fx: 1,   fy: 0 },
+    { label: 'top side',            fx: 0.5, fy: 1 },
+    { label: 'bottom side',         fx: 0.5, fy: 0 },
     { label: 'left side',           fx: 0,   fy: 0.5 },
     { label: 'right side',          fx: 1,   fy: 0.5 },
     { label: 'centre',              fx: 0.5, fy: 0.5 }

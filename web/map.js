@@ -79,7 +79,7 @@
         Map2.scale = clamp(Map2.scale * factor, 0.12, 40);
         var after = Map2.toWorld(p);
         Map2.originX += (after.x - before.x) * Map2.scale;
-        Map2.originY += (after.y - before.y) * Map2.scale;
+        Map2.originY -= (after.y - before.y) * Map2.scale;
         Map2.draw();
       }, { passive: false });
 
@@ -127,11 +127,13 @@
       return { w: Map2.canvas.clientWidth, h: Map2.canvas.clientHeight };
     },
 
+    /* Sector y grows upwards, as on the in-game galaxy map; screen y grows downwards.
+       originX/originY stay in screen pixels so panning needs no flip. */
     toScreen: function (x, y) {
       var s = Map2.size();
       return {
         x: s.w / 2 + Map2.originX + x * Map2.scale,
-        y: s.h / 2 + Map2.originY + y * Map2.scale
+        y: s.h / 2 + Map2.originY - y * Map2.scale
       };
     },
 
@@ -139,7 +141,7 @@
       var s = Map2.size();
       return {
         x: (p.x - s.w / 2 - Map2.originX) / Map2.scale,
-        y: (p.y - s.h / 2 - Map2.originY) / Map2.scale
+        y: (s.h / 2 + Map2.originY - p.y) / Map2.scale
       };
     },
 
@@ -149,8 +151,8 @@
       var a = Map2.toWorld({ x: 0, y: 0 });
       var b = Map2.toWorld({ x: s.w, y: s.h });
       return {
-        minX: Math.floor(a.x), minY: Math.floor(a.y),
-        maxX: Math.ceil(b.x), maxY: Math.ceil(b.y)
+        minX: Math.floor(a.x), minY: Math.floor(b.y),
+        maxX: Math.ceil(b.x), maxY: Math.ceil(a.y)
       };
     },
 
@@ -217,7 +219,7 @@
     focus: function (x, y, scale) {
       if (scale) { Map2.scale = scale; }
       Map2.originX = -x * Map2.scale;
-      Map2.originY = -y * Map2.scale;
+      Map2.originY = y * Map2.scale;
       Map2.draw();
     },
 
@@ -249,7 +251,7 @@
       var w = Math.max(8, maxX - minX), h = Math.max(8, maxY - minY);
       Map2.scale = clamp(Math.min(sz.w / (w * 1.2), sz.h / (h * 1.2)), 0.12, 40);
       Map2.originX = -((minX + maxX) / 2) * Map2.scale;
-      Map2.originY = -((minY + maxY) / 2) * Map2.scale;
+      Map2.originY = ((minY + maxY) / 2) * Map2.scale;
       Map2.draw();
     },
 
