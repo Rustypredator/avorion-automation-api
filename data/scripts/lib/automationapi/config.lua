@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.5.2"
+Config.version = "0.5.3"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
