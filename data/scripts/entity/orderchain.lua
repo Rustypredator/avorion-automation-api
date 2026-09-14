@@ -32,6 +32,35 @@ local AutomationApiJson = include("automationapi/json")
 -- route into the middle of a fight that has not really ended is worse than waiting.
 local AUTOMATION_API_CLEAR_GRACE = 5
 
+-- Vanilla's no-spawn timer after a boss dies (player/story/spawnrandombosses.lua sets
+-- noSpawnTimer = 30 * 60 for Swoks and for the AI alike). It is one timer per player, shared
+-- by both bosses, and while it runs onSectorEntered returns before the jump counter is even
+-- touched - so jumps during it are fuel spent for nothing, not progress towards a spawn.
+local AUTOMATION_API_BOSS_COOLDOWN = 30 * 60
+
+-- The scripts vanilla puts on each boss. Nothing else carries them, which makes them a
+-- surer test than titles (translated, numbered) or factions (Swoks flies for the pirates).
+local AUTOMATION_API_BOSSES =
+{
+    {name = "swoks", script = "entity/story/swoks.lua"},
+    {name = "ai", script = "entity/story/aibehaviour.lua"},
+}
+
+-- How often a farm looks at the sector for bosses and loot. The enemy check stays per tick.
+local AUTOMATION_API_SCAN_INTERVAL = 1
+
+-- Looting limits. Fighters are re-ordered periodically, as vanilla's harvest AI does every
+-- three seconds, because a squad that finds nothing within reach drifts back on its own.
+local AUTOMATION_API_LOOT_MAX = 300        -- the whole collection, at most
+local AUTOMATION_API_LOOT_STALL = 45       -- no drop picked up for this long ends it
+local AUTOMATION_API_LOOT_LAUNCH = 20      -- no fighter out after this long ends it
+local AUTOMATION_API_RETURN_MAX = 90       -- waiting for fighters to land before jumping
+local AUTOMATION_API_ORDER_REPEAT = 5
+
+-- A cooldown republishes its remaining time this often. Every publish is an event in the
+-- ship's feed, so once a minute is enough for a client to keep an honest countdown.
+local AUTOMATION_API_COOLDOWN_PUBLISH = 60
+
 local automationApi =
 {
     settings = {autoAggressive = false, attackCivilians = false},
@@ -85,6 +114,103 @@ local function automationApiJumpValid(fromX, fromY, toX, toY)
     return valid == true, reason
 end
 
+-- #### SECTOR SCANS #### --
+
+-- "Boss Swoks ${num}" and friends: the title is a template and its arguments come apart.
+local function automationApiTitleOf(entity)
+    local ok, title = pcall(function() return entity.title end)
+    if not ok or type(title) ~= "string" or title == "" then return nil end
+
+    local okArgs, args = pcall(function() return entity:getTitleArguments() end)
+    if okArgs and type(args) == "table" then
+        title = string.gsub(title, "%${([%w_]+)}", function(key)
+            return args[key] ~= nil and tostring(args[key]) or nil
+        end)
+    end
+
+    return title
+end
+
+local function automationApiFindBoss()
+    for _, boss in ipairs(AUTOMATION_API_BOSSES) do
+        local ok, entity = pcall(function() return Sector():getEntitiesByScript(boss.script) end)
+        if ok and entity then
+            return {name = boss.name, title = automationApiTitleOf(entity)}
+        end
+    end
+
+    return nil
+end
+
+-- Whether fighters of this ship may pick up cargo drops. The engine gates that on one stat,
+-- which Transporter Software of rare or better adds when permanently installed (and the
+-- behemoth script adds outright) - see systems/transportersoftware.lua.
+local function automationApiCargoPickup(ship)
+    local ok, value = pcall(function()
+        return ship:getBoostedValue(StatsBonuses.FighterCargoPickup, 0)
+    end)
+
+    return ok and (tonumber(value) or 0) > 0
+end
+
+-- Loot in the sector this ship is allowed to pick up, split the way fighters see it: cargo
+-- drops need the pickup stat above, everything else (money, resources, turrets, subsystems,
+-- inventory items) is collected on contact. Loot reserved for somebody else is not counted.
+local function automationApiLootIn(ship)
+    local found = {instant = 0, cargo = 0}
+
+    local ok, loots = pcall(function() return {Sector():getEntitiesByType(EntityType.Loot)} end)
+    if not ok then return found end
+
+    for _, loot in ipairs(loots) do
+        local okCollectable, collectable = pcall(function() return loot:isCollectable(ship) end)
+
+        if okCollectable and collectable then
+            local okCargo, cargo = pcall(function()
+                return loot:hasComponent(ComponentType.CargoLoot)
+            end)
+
+            if okCargo and cargo then
+                found.cargo = found.cargo + 1
+            else
+                found.instant = found.instant + 1
+            end
+        end
+    end
+
+    return found
+end
+
+-- Fighters the ship has at all, how many of them are out, and the squad indices.
+local function automationApiFighters()
+    local total, deployed, squads = 0, 0, {}
+
+    pcall(function()
+        local hangar = Hangar()
+        squads = {hangar:getSquads()}
+        for _, squad in ipairs(squads) do
+            total = total + (tonumber(hangar:getSquadFighters(squad)) or 0)
+        end
+    end)
+
+    pcall(function()
+        deployed = #{FighterController():getDeployedFighters()}
+    end)
+
+    return math.max(total, deployed), deployed, squads
+end
+
+local function automationApiOrderSquads(orders)
+    local _, _, squads = automationApiFighters()
+
+    pcall(function()
+        local controller = FighterController()
+        for _, squad in ipairs(squads) do
+            controller:setSquadOrders(squad, orders, Uuid())
+        end
+    end)
+end
+
 -- #### PUBLISHING #### --
 
 local function automationApiDescribePlan(plan)
@@ -105,6 +231,15 @@ local function automationApiDescribePlan(plan)
         fights = plan.fights,
         target = target and {x = target.x, y = target.y} or nil,
         boss = plan.boss,
+        bossPresent = plan.bossHere and {name = plan.bossHere.name, title = plan.bossHere.title}
+                      or nil,
+        bossKills = plan.bossKills or 0,
+        lastKill = plan.lastKill,
+        collectLoot = plan.collectLoot == true,
+        loot = plan.loot,
+        lootResult = plan.lootResult,
+        cooldown = (plan.cooldownLeft or 0) > 0
+                   and {left = math.ceil(plan.cooldownLeft), total = plan.bossCooldown} or nil,
     }
 end
 
@@ -246,18 +381,7 @@ end
 
 -- #### FIGHTING #### --
 
-local function automationApiStartFight(plan)
-    local current = OrderChain.chain[OrderChain.activeOrder]
-
-    -- the hop the ship was on has not happened yet, so it is where the route picks up
-    if current and current.hop then
-        plan.resumeAt = current.hop
-    elseif plan.loopFrom then
-        plan.resumeAt = plan.loopFrom
-    else
-        plan.resumeAt = plan.resumeAt or 1
-    end
-
+local function automationApiAggressive(plan)
     local hold = plan.onEnemies == "hold"
 
     automationApiReplaceChain({{
@@ -268,8 +392,27 @@ local function automationApiStartFight(plan)
         canFinish = not hold,
         automationApi = plan.id,
     }})
+end
 
-    plan.phase = hold and "holding" or "fighting"
+local function automationApiStartFight(plan)
+    -- the hop the ship was on has not happened yet, so it is where the route picks up. A
+    -- fight that breaks into looting or a cooldown has no hop on the chain, and keeps the
+    -- one the first fight saved.
+    if plan.phase == "running" then
+        local current = OrderChain.chain[OrderChain.activeOrder]
+
+        if current and current.hop then
+            plan.resumeAt = current.hop
+        elseif plan.loopFrom then
+            plan.resumeAt = plan.loopFrom
+        else
+            plan.resumeAt = plan.resumeAt or 1
+        end
+    end
+
+    automationApiAggressive(plan)
+
+    plan.phase = plan.onEnemies == "hold" and "holding" or "fighting"
     plan.fights = plan.fights + 1
     plan.clearFor = 0
 
@@ -286,9 +429,202 @@ local function automationApiResume(plan)
 
     plan.phase = "running"
     plan.clearFor = 0
+    plan.loot = nil
 
     automationApiReplaceChain(orders)
     automationApiPublish()
+end
+
+-- #### BOSSES #### --
+
+-- Watches a farm's sector for a boss, and counts its cooldown down. A boss that was in the
+-- sector and is gone while the ship is still there has been killed: vanilla gives a boss no
+-- other way out with a player in the sector (deleteonplayersleft needs them gone, and Swoks
+-- only flies off after being paid through his dialog). The AI's own cooldown is started by
+-- exactly this test in lib/story/ai.lua checkForDrop.
+--
+-- The cooldown runs on the ship's clock, which is the pilot's: the ship's sector is
+-- simulated because they are in it, as the player script holding vanilla's timer is.
+local function automationApiWatchBoss(plan, timeStep, moved)
+    if (plan.cooldownLeft or 0) > 0 then
+        plan.cooldownLeft = math.max(0, plan.cooldownLeft - timeStep)
+    end
+
+    plan.scanIn = (plan.scanIn or 0) - timeStep
+    if plan.scanIn > 0 and not moved then return end
+    plan.scanIn = AUTOMATION_API_SCAN_INTERVAL
+
+    local x, y = Sector():getCoordinates()
+    local boss = automationApiFindBoss()
+
+    if boss then
+        if not plan.bossHere then
+            plan.bossHere = {name = boss.name, title = boss.title, x = x, y = y}
+            automationApiPublish()
+        end
+        return
+    end
+
+    local seen = plan.bossHere
+    if not seen then return end
+
+    plan.bossHere = nil
+
+    if seen.x == x and seen.y == y then
+        plan.bossKills = (plan.bossKills or 0) + 1
+        plan.lastKill = {name = seen.name, title = seen.title, sector = {x = x, y = y}}
+
+        if (plan.bossCooldown or 0) > 0 then
+            plan.cooldownLeft = plan.bossCooldown
+        end
+    end
+
+    automationApiPublish()
+end
+
+-- #### LOOTING #### --
+
+local function automationApiAfterLoot(plan)
+    if (plan.cooldownLeft or 0) > 0 then
+        -- nothing may be on the chain while the ship waits
+        OrderChain.clearAllOrders()
+        plan.phase = "cooldown"
+        plan.publishIn = AUTOMATION_API_COOLDOWN_PUBLISH
+        automationApiPublish()
+        return
+    end
+
+    automationApiResume(plan)
+end
+
+local function automationApiLootWanted(ship)
+    local loot = automationApiLootIn(ship)
+    local cargoPickup = automationApiCargoPickup(ship)
+    local fighters, deployed = automationApiFighters()
+
+    loot.cargoPickup = cargoPickup
+    loot.fighters = fighters
+    loot.deployed = deployed
+
+    return loot.instant + (cargoPickup and loot.cargo or 0), loot
+end
+
+-- Sends the fighters out for what the fight left behind, if there is any the ship's
+-- fighters can take. Returns whether looting started.
+local function automationApiStartLooting(plan)
+    local wanted, loot = automationApiLootWanted(Entity())
+
+    plan.loot = (loot.instant + loot.cargo) > 0 and loot or nil
+
+    if wanted == 0 then return false end
+
+    if loot.fighters == 0 then
+        plan.lootResult = "no_fighters"
+        return false
+    end
+
+    OrderChain.clearAllOrders()
+
+    plan.phase = "looting"
+    plan.phaseFor = 0
+    plan.stallFor = 0
+    plan.lootLeft = wanted
+    plan.orderIn = 0
+    plan.lootScanIn = AUTOMATION_API_SCAN_INTERVAL
+
+    automationApiPublish()
+    return true
+end
+
+local function automationApiFinishLooting(plan, result)
+    plan.lootResult = result
+    plan.phase = "returning"
+    plan.phaseFor = 0
+    plan.orderIn = AUTOMATION_API_ORDER_REPEAT
+
+    automationApiOrderSquads(FighterOrders.Return)
+    automationApiPublish()
+end
+
+local function automationApiAfterFight(plan)
+    if plan.collectLoot and automationApiStartLooting(plan) then return end
+    automationApiAfterLoot(plan)
+end
+
+local function automationApiTickLooting(plan, timeStep)
+    plan.phaseFor = plan.phaseFor + timeStep
+    plan.stallFor = plan.stallFor + timeStep
+
+    plan.orderIn = plan.orderIn - timeStep
+    if plan.orderIn <= 0 then
+        plan.orderIn = AUTOMATION_API_ORDER_REPEAT
+        automationApiOrderSquads(FighterOrders.CollectLoot)
+    end
+
+    plan.lootScanIn = plan.lootScanIn - timeStep
+    if plan.lootScanIn > 0 then return end
+    plan.lootScanIn = AUTOMATION_API_SCAN_INTERVAL
+
+    local wanted, loot = automationApiLootWanted(Entity())
+
+    if wanted < plan.lootLeft then plan.stallFor = 0 end
+
+    local changed = not plan.loot or plan.loot.instant ~= loot.instant
+                    or plan.loot.cargo ~= loot.cargo or plan.loot.deployed ~= loot.deployed
+    plan.lootLeft = wanted
+    plan.loot = loot
+    if changed then automationApiPublish() end
+
+    if wanted == 0 then
+        automationApiFinishLooting(plan, "collected")
+    elseif loot.deployed == 0 and plan.phaseFor >= AUTOMATION_API_LOOT_LAUNCH then
+        -- no pilots, or squads the hangar will not start
+        automationApiFinishLooting(plan, "no_launch")
+    elseif plan.stallFor >= AUTOMATION_API_LOOT_STALL then
+        automationApiFinishLooting(plan, "stalled")
+    elseif plan.phaseFor >= AUTOMATION_API_LOOT_MAX then
+        automationApiFinishLooting(plan, "timeout")
+    end
+end
+
+-- A jump leaves fighters that are out behind, so the ship waits for them to land.
+local function automationApiTickReturning(plan, timeStep)
+    plan.phaseFor = plan.phaseFor + timeStep
+
+    local _, deployed = automationApiFighters()
+
+    if deployed == 0 then
+        automationApiAfterLoot(plan)
+        return
+    end
+
+    if plan.phaseFor >= AUTOMATION_API_RETURN_MAX then
+        -- Stragglers that cannot find their way back (out of reach, stuck) are pulled in
+        -- rather than abandoned, then the plan moves on regardless.
+        pcall(function() Hangar():collectAllFighters() end)
+        plan.lootResult = (plan.lootResult or "collected") .. "_recalled"
+        automationApiAfterLoot(plan)
+        return
+    end
+
+    plan.orderIn = plan.orderIn - timeStep
+    if plan.orderIn <= 0 then
+        plan.orderIn = AUTOMATION_API_ORDER_REPEAT
+        automationApiOrderSquads(FighterOrders.Return)
+    end
+end
+
+local function automationApiTickCooldown(plan, timeStep)
+    if (plan.cooldownLeft or 0) <= 0 then
+        automationApiResume(plan)
+        return
+    end
+
+    plan.publishIn = (plan.publishIn or 0) - timeStep
+    if plan.publishIn <= 0 then
+        plan.publishIn = AUTOMATION_API_COOLDOWN_PUBLISH
+        automationApiPublish()
+    end
 end
 
 -- #### TICK #### --
@@ -296,19 +632,58 @@ end
 local function automationApiTickPlan(plan, timeStep, enemies)
     local x, y = Sector():getCoordinates()
 
-    if plan.sector.x ~= x or plan.sector.y ~= y then
+    local moved = plan.sector.x ~= x or plan.sector.y ~= y
+
+    if moved then
         plan.sector = {x = x, y = y}
         plan.jumps = plan.jumps + 1
+        -- a boss left behind in another sector was not killed
+        plan.bossHere = nil
         automationApiPublish()
     end
 
+    -- Farms treat a boss as a reason to stay even before it turns hostile: Swoks arrives
+    -- registered as a friend of the player it spawned for, and jumping away from him loses
+    -- the fight the whole loop was for.
+    local hostile = enemies
+
+    if plan.kind == "farm" then
+        automationApiWatchBoss(plan, timeStep, moved)
+        hostile = hostile or plan.bossHere ~= nil
+    end
+
+    local fights = hostile and plan.onEnemies ~= "continue"
+
     -- A boss spawn counts the jumps of the player aboard, not of the ship. With nobody at
-    -- the controls the loop is jumps for nothing, so it stops rather than burn fuel.
-    if plan.kind == "farm" and not automationApiPiloted() then
+    -- the controls the loop is jumps for nothing, so it stops rather than burn fuel. Only a
+    -- ship about to jump is stopped: a fight, fighters out collecting or a cooldown carry on
+    -- without a pilot, and the check comes round again once the loop resumes.
+    if plan.kind == "farm" and plan.phase == "running" and not automationApiPiloted() then
         OrderChain.clearAllOrders()
         automationApiEndPlan("pilot_left",
                              "Nobody is aboard any more, and boss spawns only count the "
                              .. "jumps of a player on the ship.")
+        return
+    end
+
+    -- Looting, returning and cooldown keep the chain empty, so anything on it is somebody
+    -- else's orders.
+    if plan.phase == "looting" or plan.phase == "returning" or plan.phase == "cooldown" then
+        if #OrderChain.chain > 0 then
+            automationApiEndPlan("replaced", "Other orders replaced the " .. plan.phase .. ".")
+            return
+        end
+
+        if fights then
+            automationApiStartFight(plan)
+        elseif plan.phase == "looting" then
+            automationApiTickLooting(plan, timeStep)
+        elseif plan.phase == "returning" then
+            automationApiTickReturning(plan, timeStep)
+        else
+            automationApiTickCooldown(plan, timeStep)
+        end
+
         return
     end
 
@@ -330,7 +705,7 @@ local function automationApiTickPlan(plan, timeStep, enemies)
             return
         end
 
-        if enemies and plan.onEnemies ~= "continue" then
+        if fights then
             automationApiStartFight(plan)
         end
 
@@ -345,15 +720,20 @@ local function automationApiTickPlan(plan, timeStep, enemies)
             return
         end
 
-        if enemies then
+        if hostile then
             plan.clearFor = 0
+
+            -- An aggressive order finishes when the AI sees nobody to fight, which a boss
+            -- that has not turned hostile yet allows. The ship waits by it, and is ordered
+            -- in again the moment there are enemies.
+            if enemies and #OrderChain.chain == 0 then automationApiAggressive(plan) end
             return
         end
 
         plan.clearFor = (plan.clearFor or 0) + timeStep
 
         if plan.clearFor >= AUTOMATION_API_CLEAR_GRACE or #OrderChain.chain == 0 then
-            automationApiResume(plan)
+            automationApiAfterFight(plan)
         end
 
         return
@@ -447,6 +827,12 @@ function OrderChain.automationApiRunPlan(payload)
 
     if plan.onEnemies ~= "hold" and plan.onEnemies ~= "continue" then
         plan.onEnemies = "fight"
+    end
+
+    if plan.kind == "farm" then
+        plan.bossKills = 0
+        plan.collectLoot = spec.collectLoot ~= false
+        plan.bossCooldown = math.max(0, tonumber(spec.bossCooldown) or AUTOMATION_API_BOSS_COOLDOWN)
     end
 
     for index, hop in ipairs(spec.hops) do
@@ -566,6 +952,9 @@ function OrderChain.restore(data)
             automationApi.settings.attackCivilians = saved.settings.attackCivilians == true
         end
         automationApi.plan = type(saved.plan) == "table" and saved.plan or nil
+        -- A boss seen before a reload is not proof of a kill after it: a restart sends every
+        -- boss away with the sector, and resets vanilla's own cooldown with the player script.
+        if automationApi.plan then automationApi.plan.bossHere = nil end
         automationApi.last = type(saved.last) == "table" and saved.last or nil
         automationApi.defenceFights = tonumber(saved.defenceFights) or 0
     end

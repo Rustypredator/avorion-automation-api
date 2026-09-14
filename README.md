@@ -31,7 +31,7 @@ galaxy map.
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
 - plan routes that prefer gates, keep out of rifts or stay in no man's space, and have the
   ship fight, hold or press on when enemies show up on the way
-- farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship
+- farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship; the ship recognises the boss, sends fighters for the loot and sits out the 30 minute cooldown after a kill
 - let idle ships defend themselves: aggressive while enemies are in the sector, idle after
 - query known sectors, and predict unvisited ones straight from the galaxy seed
 - read your stations' books - production chain, stock, and what each one has earned - and

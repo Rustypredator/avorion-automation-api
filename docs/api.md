@@ -664,8 +664,14 @@ This finds two empty sectors in the ring one jump apart, plans a way there if th
 on one already, and sends the ship round the pair in a loop:
 
 ```jsonc
-{"boss": "auto", "onEnemies": "fight", "attackCivilians": false, "dryRun": false}
+{"boss": "auto", "onEnemies": "fight", "attackCivilians": false,
+ "collectLoot": true, "bossCooldown": 1800, "dryRun": false}
 ```
+
+| field | notes |
+|---|---|
+| `collectLoot` | default `true`: after a fight, send the fighters for the loot before jumping on |
+| `bossCooldown` | seconds to stop jumping after a boss is killed, `0` to `14400`, default `1800` (vanilla's); `0` keeps jumping |
 
 ```json
 {
@@ -673,7 +679,8 @@ on one already, and sends the ship round the pair in a loop:
   "loop": [{"x": 290, "y": 1}, {"x": 293, "y": 4}],
   "approach": [{"x": 287, "y": 0, "kind": "jump"}],
   "hops": [{"x": 287, "y": 0, "kind": "jump"}, {"x": 290, "y": 1, "kind": "jump"}],
-  "loopFrom": 2, "piloted": true, "planId": "p5-7322", "confirmed": true
+  "loopFrom": 2, "piloted": true, "collectLoot": true, "bossCooldown": 1800,
+  "planId": "p5-7322", "confirmed": true
 }
 ```
 
@@ -685,12 +692,35 @@ The rules this works around, all vanilla's (`player/story/spawnrandombosses.lua`
   (`last.outcome: "pilot_left"`) if they leave.
 - A jump into a sector with regular content resets the counter, which is why the loop only
   uses empty sectors. The approach may pass through anything; counting starts on the loop.
-- After a boss dies, nothing spawns for 30 minutes. The loop keeps jumping regardless.
+- After a boss dies, nothing spawns for 30 minutes, for Swoks and the AI alike (one timer per
+  player), and jumps in that time are not counted at all. The timer lives in the player
+  script's memory, so the game forgets it on logout or restart.
+
+What the ship does about it, on its own:
+
+- **The boss is recognised** by the script vanilla puts on it (`entity/story/swoks.lua`,
+  `entity/story/aibehaviour.lua`) and published as `plan.bossPresent`. A farm stops for a boss
+  even before it turns hostile - Swoks arrives friendly to the player he spawned for.
+- **A kill** is a boss gone from the sector while the ship is still in it; vanilla gives a boss
+  no other way out with a player present, short of paying Swoks off through his dialog. It
+  counts in `plan.bossKills` and starts `plan.cooldown`.
+- **Looting** (`collectLoot`): once the sector is clear, if there is loot the ship may take
+  and it has fighters, the chain is cleared and every squad is ordered to collect loot. Cargo
+  drops only count when the ship's fighters can pick cargo up (the `FighterCargoPickup` stat,
+  from Transporter Software of rare or better); money, resources, turrets and subsystems always
+  count. It ends when none is left, nothing was picked up for 45 s, no fighter launched within
+  20 s, or after 5 minutes. The fighters are then recalled and the ship waits up to 90 s for
+  them to land before anything else, since a jump leaves them behind; stragglers after that are
+  pulled in with `Hangar.collectAllFighters`.
+- **Cooldown**: with a cooldown running, the ship sits with an empty chain until it is over,
+  then resumes the loop by itself. Enemies meanwhile are fought as `onEnemies` says, and a pilot
+  leaving the controls does not end the farm until it is about to jump again.
 
 `onEnemies` applies as for routes; with `fight` the loop resumes after the boss is dealt with.
-A dry run needs nobody aboard and reports `piloted`.
+With `continue` the ship neither stops for a boss nor, jumping on, sees it die. A dry run needs
+nobody aboard and reports `piloted`.
 
-Errors: `400 bad_boss`, `422 needs_pilot`, `422 no_hyperspace`, `422 no_farm_loop` (no pair of
+Errors: `400 bad_boss`, `400 bad_collect_loot`, `400 bad_boss_cooldown`, `422 needs_pilot`, `422 no_hyperspace`, `422 no_farm_loop` (no pair of
 empty sectors near the ring point), `422 no_route` (none to the loop), plus the world checks
 above.
 
@@ -711,7 +741,12 @@ What the ship's automation is doing, as the ship itself last reported it.
     "plan": {
       "id": "p5-7322", "kind": "farm", "phase": "running", "onEnemies": "fight",
       "hops": 3, "hop": 2, "loopFrom": 2, "jumps": 14, "fights": 1,
-      "target": {"x": 293, "y": 4}, "boss": "ai"
+      "target": {"x": 293, "y": 4}, "boss": "swoks",
+      "bossPresent": null, "bossKills": 1,
+      "lastKill": {"name": "swoks", "title": "Boss Swoks III", "sector": {"x": 293, "y": 4}},
+      "collectLoot": true, "lootResult": "collected",
+      "loot": {"instant": 0, "cargo": 2, "cargoPickup": false, "fighters": 6, "deployed": 0},
+      "cooldown": {"left": 1740, "total": 1800}
     },
     "last": {"id": "p4-7310", "kind": "route", "outcome": "arrived", "jumps": 9, "fights": 0,
              "sector": {"x": -120, "y": 88}}
@@ -723,7 +758,11 @@ What the ship's automation is doing, as the ship itself last reported it.
 |---|---|
 | `source` | `live` from the event feed, `database` from the ship's row (as of the last save), `none` |
 | `reported` | false until the ship has published anything - its sector has not loaded since the mod was installed, or another mod replaced `orderchain.lua` |
-| `plan.phase` | `running`, `fighting` or `holding`; `plan` is absent when there is none |
+| `plan.phase` | `running`, `fighting` or `holding`; farms also `looting`, `returning` (waiting for fighters to land) and `cooldown`. `plan` is absent when there is none |
+| `plan.bossPresent` | farms: `{name, title}` of the boss in the sector, absent when there is none |
+| `plan.cooldown` | farms: `{left, total}` seconds while a kill's cooldown runs. Republished once a minute, so count down from when it arrived |
+| `plan.loot` | farms: the last loot count - `instant` (any fighter), `cargo` (needs `cargoPickup`), `fighters`, `deployed` |
+| `plan.lootResult` | farms: how the last looting ended - `collected`, `stalled`, `timeout`, `no_launch`, `no_fighters`; `_recalled` appended when stragglers had to be pulled in |
 | `plan.hop` | the hop being flown, 1-based, counting the approach |
 | `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
 

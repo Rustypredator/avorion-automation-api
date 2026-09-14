@@ -18,7 +18,8 @@
     remember: 'avoconsole.remember',
     filters: 'avoconsole.filters',
     dock: 'avoconsole.dock',
-    history: 'avoconsole.history'
+    history: 'avoconsole.history',
+    notify: 'avoconsole.notify'
   };
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
@@ -57,6 +58,9 @@
     events: [],
     eventKeys: {},
     cursors: {},        // ship name -> highest seq seen for that ship
+    swept: {},          // ship name -> true once its first sweep set the baseline
+    autoSeen: {},       // ship name -> the last automation state seen, for notifications
+    expectEnd: {},      // ship name -> true while a stop sent from here is on its way
     recording: {},      // ship name -> boolean
     traffic: [],
 
@@ -72,6 +76,7 @@
     nav: {
       preferGates: false, avoidRifts: false, preferUncontrolled: false,
       onEnemies: 'fight', attackCivilians: false, boss: 'auto',
+      collectLoot: true, cooldownMinutes: 30,
       result: null, farm: null, automation: null, automationError: null
     },
 
@@ -234,6 +239,103 @@
       node.style.transition = 'opacity .3s';
       setTimeout(function () { node.remove(); }, 320);
     }, kind === 'bad' ? 9000 : 4500);
+  }
+
+  /* Browser notifications, for what happens while nobody is watching the page: a boss
+     turning up, a cooldown running out, a plan ending. Everything notified is toasted as
+     well; the system notification is added only while the page is hidden or unfocused,
+     since a toast is already in front of anyone looking at it.
+
+     Background tabs get their timers throttled (Chrome to once a minute after a while), so
+     a notification can trail the event by up to that much. */
+  function notifySupported() { return typeof window.Notification === 'function'; }
+
+  function notifyEnabled() {
+    return notifySupported() && window.Notification.permission === 'granted'
+      && localStorage.getItem(LS.notify) !== 'off';
+  }
+
+  function renderNotifyToggle() {
+    var button = $('#notify-toggle');
+    if (!button) { return; }
+
+    if (!notifySupported()) {
+      button.disabled = true;
+      button.title = 'This browser offers no notifications';
+      return;
+    }
+
+    var permission = window.Notification.permission;
+    var on = notifyEnabled();
+    button.innerHTML = on ? '&#128276;' : '&#128277;';
+    button.classList.toggle('primary', permission === 'default');
+    button.title = permission === 'denied'
+      ? 'Notifications are blocked for this page; allow them in the browser\'s site settings'
+      : permission === 'default'
+        ? 'Allow notifications for bosses, cooldowns and ended plans'
+        : on ? 'Notifications on — click to mute' : 'Notifications muted — click to turn on';
+  }
+
+  /* Browsers only show the permission prompt from a click, so this is called from the
+     toggle and from buttons that start something worth being told about. */
+  function requestNotify() {
+    if (!notifySupported() || window.Notification.permission !== 'default') {
+      return Promise.resolve();
+    }
+
+    var asked;
+    try {
+      // older Safari takes a callback and returns nothing
+      asked = window.Notification.requestPermission(renderNotifyToggle);
+    } catch (e) {
+      asked = null;
+    }
+
+    return Promise.resolve(asked).then(function () {
+      renderNotifyToggle();
+      if (window.Notification.permission === 'granted') {
+        toast('good', 'Notifications on', 'Bosses, cooldowns and ended plans reach you with the page in the background.');
+      }
+    }, renderNotifyToggle);
+  }
+
+  function toggleNotify() {
+    if (!notifySupported()) { return; }
+
+    var permission = window.Notification.permission;
+    if (permission === 'default') { requestNotify(); return; }
+    if (permission === 'denied') {
+      toast('warn', 'Notifications blocked', 'Allow them for this page in the browser\'s site settings.');
+      return;
+    }
+
+    localStorage.setItem(LS.notify, notifyEnabled() ? 'off' : 'on');
+    renderNotifyToggle();
+  }
+
+  function notify(kind, title, text, ship) {
+    toast(kind, title, text);
+
+    if (!notifyEnabled()) { return; }
+    if (!document.hidden && (!document.hasFocus || document.hasFocus())) { return; }
+
+    try {
+      var note = new window.Notification(title, {
+        body: text || '',
+        // a newer notice about the same ship and subject replaces the older one
+        tag: ship ? 'avo:' + ship + ':' + title : undefined
+      });
+      note.onclick = function () {
+        window.focus();
+        if (ship && S.byName[ship]) {
+          if (S.selected !== ship) { select(ship); }
+          showSub('travel');
+        }
+        note.close();
+      };
+    } catch (e) {
+      // Chrome on Android only notifies through a service worker; the toast stands
+    }
   }
 
   function apiFailed(error, what) {
@@ -507,8 +609,23 @@
       + 'chance on its own.</p>'
       + '<p>The counter belongs to the <b>player aboard</b>, not the ship, so this only works '
       + 'while you are flying it; the loop stops if you leave. A jump into a sector with '
-      + 'stations resets the counter, which is why the loop only uses empty ones. After a boss '
-      + 'is killed nothing spawns for 30 minutes.</p>',
+      + 'stations resets the counter, which is why the loop only uses empty ones.</p>'
+      + '<p>The ship recognises the boss itself, and stays for it even before it turns '
+      + 'hostile. After a kill nothing spawns for <b>30 minutes</b>, for Swoks and the AI '
+      + 'alike, and jumps in that time do not count at all &mdash; so the loop sends the '
+      + 'fighters for the loot, then waits out the cooldown and resumes by itself. Set the '
+      + 'pause to 0 to keep jumping.</p>'
+      + '<p>The game keeps its timer in memory, so logging out or a server restart clears it. '
+      + 'The ship\'s wait survives both; after either, start the farm again to skip it.</p>',
+
+    'nav-loot':
+      '<p>After a fight the ship stays put and orders every squad to collect loot, until '
+      + 'nothing it can take is left, nothing has been picked up for 45 seconds, or five '
+      + 'minutes have passed. Then it calls the fighters back and waits for them to land '
+      + 'before it jumps.</p>'
+      + '<p>Money, resources, turrets and subsystems are picked up by any fighter. '
+      + '<b>Cargo</b> drops only count when the ship has Transporter Software of rare or '
+      + 'better installed permanently; without it they are left.</p>',
 
     'nav-defence':
       'While the ship has no orders and a captain, enemies in its sector make it fight until '
@@ -760,6 +877,8 @@
         // A fresh session has no cursors, so the first sweep takes each ship's recent
         // history rather than only what happens from now on.
         S.cursors = {};
+        S.swept = {};
+        S.autoSeen = {};
         S.shipHistory = {};
         // Holds are per key as much as history is - a different key may see different
         // craft - and the bridge's stored manifests make starting over cheap.
@@ -3521,7 +3640,130 @@
     ['swoks', 'Swoks · 350–430']
   ];
 
-  var PHASE_TONE = { running: 'good', fighting: 'bad', holding: 'warn' };
+  var PHASE_TONE = { running: 'good', fighting: 'bad', holding: 'warn', looting: 'info',
+                     returning: 'info', cooldown: 'warn' };
+
+  var BOSS_NAMES = { swoks: 'Swoks', ai: 'The AI' };
+
+  var LOOT_RESULTS = {
+    collected: 'everything the fighters could take was collected',
+    collected_recalled: 'collected; fighters that did not make it back were pulled in',
+    stalled: 'nothing was picked up for 45 seconds',
+    stalled_recalled: 'stalled; fighters that did not make it back were pulled in',
+    timeout: 'stopped after five minutes',
+    timeout_recalled: 'stopped after five minutes; stragglers were pulled in',
+    no_launch: 'no fighter left the hangar (pilots?)',
+    no_launch_recalled: 'no fighter left the hangar (pilots?)',
+    no_fighters: 'the ship has no fighters to send'
+  };
+
+  var PLAN_ENDS = {
+    pilot_left: ['warn', 'Farming stopped'],
+    resume_failed: ['bad', 'Plan could not resume'],
+    replaced: ['warn', 'Plan replaced'],
+    stopped: ['warn', 'Plan stopped'],
+    refused: ['bad', 'Plan refused']
+  };
+
+  function bossLabel(boss) {
+    if (!boss) { return 'the boss'; }
+    return boss.title || BOSS_NAMES[boss.name] || boss.name || 'the boss';
+  }
+
+  /* What is worth telling the player about, read off two consecutive automation states of
+     one ship. Events arrive in order, so each state is compared with the one before it. */
+  function automationChanged(name, before, after) {
+    var was = before && before.plan;
+    var now = after && after.plan;
+    var same = !!(was && now && was.id === now.id);
+
+    if (now && now.kind === 'farm') {
+      if (now.bossPresent && !(same && was.bossPresent)) {
+        notify('bad', 'Boss spawned', name + ': ' + bossLabel(now.bossPresent) + ' is in '
+               + coords(after.sector) + '.', name);
+      }
+
+      if (same && (now.bossKills || 0) > (was.bossKills || 0)) {
+        notify('good', 'Boss killed', name + ': ' + bossLabel(now.lastKill) + ' is down.'
+               + (now.cooldown ? ' Jumping pauses for ' + duration(now.cooldown.left) + '.' : ''),
+               name);
+      }
+
+      if (same && was.phase === 'looting' && now.phase !== 'looting' && now.lootResult) {
+        toast('info', 'Looting done', name + ': ' + (LOOT_RESULTS[now.lootResult] || now.lootResult) + '.');
+      }
+
+      if (same && was.phase === 'cooldown' && now.phase === 'running') {
+        notify('good', 'Boss cooldown over', name + ' is jumping again; the next boss can spawn.', name);
+      }
+    }
+
+    if (was && !same) {
+      var last = after && after.last;
+      if (S.expectEnd[name]) {
+        // stopped from this page, which already said so
+        delete S.expectEnd[name];
+      } else if (last && last.id === was.id && !now) {
+        if (last.outcome === 'arrived') {
+          notify('good', 'Route arrived', name + ' reached ' + coords(last.sector) + '.', name);
+        } else {
+          var end = PLAN_ENDS[last.outcome] || ['warn', 'Plan ended'];
+          notify(end[0], end[1], name + ': ' + (last.reason || last.outcome), name);
+        }
+      }
+    }
+  }
+
+  /* Countdowns tick in place between polls, off the moment the state was published. */
+  function countdownHtml(endsAt) {
+    return '<span data-countdown="' + Math.round(endsAt) + '">'
+      + esc(duration(Math.max(0, (endsAt - Date.now()) / 1000))) + '</span>';
+  }
+
+  function tickCountdowns() {
+    $$('[data-countdown]').forEach(function (node) {
+      var left = Math.max(0, (Number(node.dataset.countdown) - Date.now()) / 1000);
+      node.textContent = left > 0 ? duration(left) : 'any moment';
+    });
+  }
+
+  function farmRows(plan, received) {
+    var rows = [];
+
+    rows.push(['boss', plan.bossPresent
+      ? '<span class="badge bad">' + esc(bossLabel(plan.bossPresent)) + ' in sector</span>'
+      : '<span class="mute2">none in sector</span>']);
+
+    rows.push(['bosses killed', num(plan.bossKills || 0)
+      + (plan.lastKill ? ' <span class="mute2">last: ' + esc(bossLabel(plan.lastKill))
+        + ' in ' + esc(coords(plan.lastKill.sector)) + '</span>' : '')]);
+
+    if (plan.cooldown) {
+      rows.push(['boss cooldown', countdownHtml(received + plan.cooldown.left * 1000)
+        + ' <span class="mute2">left of ' + esc(duration(plan.cooldown.total))
+        + (plan.phase === 'cooldown' ? ', not jumping' : '') + '</span>']);
+    }
+
+    var loot = plan.loot;
+    var lootText = plan.collectLoot ? 'fighters collect it' : '<span class="mute2">off</span>';
+    if (loot) {
+      lootText += ' · ' + num(loot.instant) + ' drops';
+      if (loot.cargo) {
+        lootText += ', ' + num(loot.cargo) + ' cargo'
+          + (loot.cargoPickup ? '' : ' <span class="mute2">(fighters need transporter software, rare or better, for cargo)</span>');
+      }
+      if (plan.phase === 'looting' || plan.phase === 'returning') {
+        lootText += ' · ' + num(loot.deployed) + ' of ' + num(loot.fighters) + ' fighters out';
+      }
+    }
+    rows.push(['loot', lootText]);
+
+    if (plan.lootResult) {
+      rows.push(['last looting', esc(LOOT_RESULTS[plan.lootResult] || plan.lootResult)]);
+    }
+
+    return rows;
+  }
 
   function piloted(name) {
     var ship = S.byName[name] || {};
@@ -3601,6 +3843,13 @@
           + 'nobody at the controls</span>')
       + '</div>'
       + '<div class="row" style="margin-bottom:10px">'
+      + '<label class="check"><input type="checkbox" id="nav-collect-loot"'
+      + (nav.collectLoot ? ' checked' : '') + '><span>send fighters for the loot</span></label>'
+      + explain('nav-loot')
+      + '<label class="check">pause after a kill for <input type="number" id="nav-cooldown" min="0" max="240" step="1" value="'
+      + esc(nav.cooldownMinutes) + '" style="width:64px"> min</label>'
+      + '</div>'
+      + '<div class="row" style="margin-bottom:10px">'
       + '<button class="ghost" data-act="farm-preview">Preview loop</button>'
       + '<button class="primary" data-act="farm"' + (aboard ? '' : ' disabled') + '>Start farming</button>'
       + '</div>'
@@ -3655,10 +3904,13 @@
       rows.push(['hop', num(plan.hop) + ' of ' + num(plan.hops)
         + (plan.loopFrom ? ' · loops from ' + num(plan.loopFrom) : '')]);
       if (plan.target && !plan.loopFrom) { rows.push(['heading for', esc(coords(plan.target))]); }
-      if (plan.boss) { rows.push(['boss ring', esc(plan.boss)]); }
+      if (plan.boss) { rows.push(['boss ring', esc(BOSS_NAMES[plan.boss] || plan.boss)]); }
       rows.push(['jumps flown', num(plan.jumps)]);
       rows.push(['fights', num(plan.fights)]);
       rows.push(['on enemies', esc(plan.onEnemies)]);
+      if (plan.kind === 'farm') {
+        rows = rows.concat(farmRows(plan, nav.automation.receivedAt || Date.now()));
+      }
     } else {
       badges.push('<span class="badge">no plan</span>');
     }
@@ -3730,6 +3982,9 @@
       + esc(loop.map(coords).join(' ⇄ '))
       + (result.approach && result.approach.length
         ? ' after ' + num(result.approach.length) + ' hops to get there' : '')
+      + '<div class="mute2">' + (result.collectLoot === false ? 'leaves the loot' : 'fighters collect the loot')
+        + ' · ' + (result.bossCooldown ? 'pauses ' + esc(duration(result.bossCooldown)) + ' after a kill'
+          : 'keeps jumping after a kill') + '</div>'
       + (result.planId ? '<div class="mute2">' + (result.confirmed ? 'farming' : 'dispatched, not confirmed')
         + '</div>' : '')
       + '</div>';
@@ -3817,8 +4072,13 @@
       boss: S.nav.boss,
       onEnemies: S.nav.onEnemies,
       attackCivilians: S.nav.attackCivilians,
+      collectLoot: S.nav.collectLoot,
+      bossCooldown: Math.round(S.nav.cooldownMinutes * 60),
       dryRun: !!dryRun
     };
+
+    // a farm is the thing worth hearing about with the page in the background
+    if (!dryRun) { requestNotify(); }
 
     $('#farm-result').innerHTML = '<p class="muted">' + (dryRun ? 'finding a loop…'
       : 'finding a loop, then waiting for the ship…') + '</p>';
@@ -3847,7 +4107,8 @@
      last read - so it is shown straight away rather than after another round trip. */
   function tookAutomation(name, body) {
     if (body && body.automation && S.selected === name) {
-      S.nav.automation = { ship: name, source: 'live', reported: true, automation: body.automation };
+      S.nav.automation = { ship: name, source: 'live', reported: true, automation: body.automation,
+                           receivedAt: Date.now() };
       S.nav.automationError = null;
       renderTravel();
     }
@@ -3863,6 +4124,7 @@
                    { priority: background ? Api.P.POLL : Api.P.DETAIL, label: 'automation' })
       .then(function (body) {
         if (S.selected !== name) { return; }
+        body.receivedAt = Date.now();
         S.nav.automation = body;
         S.nav.automationError = null;
         if (S.sub === 'travel') { renderTravel(); }
@@ -3878,6 +4140,7 @@
     var name = S.selected;
     if (!name) { return; }
 
+    S.expectEnd[name] = true;
     guard(button, Api.post('/ships/' + Api.seg(name) + '/automation/stop', {},
                            { owner: ownerParamFor(name) },
                            { priority: Api.P.USER, label: 'stop automation' }))
@@ -3885,7 +4148,10 @@
         toast('good', 'Stopped', name + ' has no plan any more.');
         tookAutomation(name, result);
       })
-      .catch(function (error) { apiFailed(error, 'Stop refused'); });
+      .catch(function (error) {
+        delete S.expectEnd[name];
+        apiFailed(error, 'Stop refused');
+      });
   }
 
   function saveDefence(input) {
@@ -3944,6 +4210,11 @@
     var events = body.events || [];
     var added = false;
 
+    // The first sweep for a ship replays its buffer, which is history rather than news:
+    // it sets the baseline for notifications without raising any.
+    var baseline = !S.swept[name];
+    S.swept[name] = true;
+
     /* When each event happened, rather than when this poll collected it.
        A first sweep pulls the whole buffer at once, and stamping all of it with Date.now()
        puts an hour of activity on one timestamp. The mod stamps each event with the
@@ -3970,9 +4241,14 @@
       S.events.push(event);
       added = true;
 
+      if (event.automation) {
+        if (!baseline) { automationChanged(name, S.autoSeen[name], event.automation); }
+        S.autoSeen[name] = event.automation;
+      }
+
       if (event.automation && name === S.selected) {
         S.nav.automation = { ship: name, source: 'live', reported: true,
-                             automation: event.automation };
+                             automation: event.automation, receivedAt: arrived - offset * 1000 };
         if (S.sub === 'travel') { renderTravel(); }
       }
 
@@ -6220,6 +6496,10 @@
 
     $('#poll-toggle').addEventListener('click', function () { setPaused(!S.paused); });
 
+    $('#notify-toggle').addEventListener('click', toggleNotify);
+    renderNotifyToggle();
+    setInterval(tickCountdowns, 1000);
+
     $('#tabs').addEventListener('click', function (e) {
       var tab = e.target.closest('.tab');
       if (tab) { showView(tab.dataset.view); }
@@ -6562,6 +6842,12 @@
     $('#sv-travel').addEventListener('change', function (e) {
       var node = e.target;
       if (node.id === 'nav-civilians') { S.nav.attackCivilians = node.checked; }
+      else if (node.id === 'nav-collect-loot') { S.nav.collectLoot = node.checked; }
+      else if (node.id === 'nav-cooldown') {
+        var minutes = Math.round(Number(node.value));
+        S.nav.cooldownMinutes = isFinite(minutes) ? Math.min(240, Math.max(0, minutes)) : 30;
+        node.value = S.nav.cooldownMinutes;
+      }
       else if (node.id === 'nav-auto-aggressive' || node.id === 'nav-defence-civilians') {
         saveDefence(node);
       }

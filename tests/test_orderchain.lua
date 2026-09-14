@@ -49,9 +49,23 @@ local function newWorld()
         published = {},
         permitted = true,
         blocked = {},   -- "x:y" of sectors no jump may land in
+        bosses = {},    -- {script, title, args} of boss entities in the sector
+        loot = {},      -- {cargo = bool, collectable = bool}
+        cargoPickup = 0,
+        squads = {0, 1},
+        squadFighters = {[0] = 3, [1] = 2},
+        deployed = 0,
+        squadOrders = {},
+        collectedAll = false,
     }
     _G.callingPlayer = nil
 end
+
+_G.EntityType = {Loot = 8}
+_G.ComponentType = {CargoLoot = 71}
+_G.FighterOrders = {Return = 3, CollectLoot = 9}
+_G.StatsBonuses = {FighterCargoPickup = 48}
+_G.Uuid = function() return "uuid" end
 
 _G.checkEntityInteractionPermissions = function()
     return world.permitted and {index = 1} or nil
@@ -63,11 +77,68 @@ _G.Entity = function()
         getCaptain = function() return world.captain end,
         getPilotIndices = function() return table.unpack(world.pilots) end,
         isJumpRouteValid = function(_, ax, ay, bx, by) return true end,
+        getBoostedValue = function(_, stat, base)
+            assert(stat == StatsBonuses.FighterCargoPickup, "unexpected stat")
+            return base + world.cargoPickup
+        end,
     }
 end
 
+-- Script lookups match the way the engine does, on the tail of the path the script was
+-- added under, and hand back entities like the engine: several return values, or none.
 _G.Sector = function()
-    return {getCoordinates = function() return world.x, world.y end}
+    return
+    {
+        getCoordinates = function() return world.x, world.y end,
+        getEntitiesByScript = function(_, script)
+            local found = {}
+            for _, boss in ipairs(world.bosses) do
+                if boss.script:sub(-#script) == script then
+                    found[#found + 1] =
+                    {
+                        title = boss.title,
+                        getTitleArguments = function() return boss.args or {} end,
+                    }
+                end
+            end
+            return table.unpack(found)
+        end,
+        getEntitiesByType = function(_, entityType)
+            assert(entityType == EntityType.Loot, "only loot is looked for")
+            local found = {}
+            for _, loot in ipairs(world.loot) do
+                found[#found + 1] =
+                {
+                    isCollectable = function() return loot.collectable ~= false end,
+                    hasComponent = function(_, component)
+                        return component == ComponentType.CargoLoot and loot.cargo == true
+                    end,
+                }
+            end
+            return table.unpack(found)
+        end,
+    }
+end
+
+_G.Hangar = function()
+    return
+    {
+        getSquads = function() return table.unpack(world.squads) end,
+        getSquadFighters = function(_, squad) return world.squadFighters[squad] or 0 end,
+        collectAllFighters = function() world.deployed = 0; world.collectedAll = true end,
+    }
+end
+
+_G.FighterController = function()
+    return
+    {
+        getDeployedFighters = function()
+            local out = {}
+            for i = 1, world.deployed do out[i] = {index = i} end
+            return table.unpack(out)
+        end,
+        setSquadOrders = function(_, squad, orders) world.squadOrders[squad] = orders end,
+    }
 end
 
 _G.HyperspaceEngine = function()
@@ -408,6 +479,181 @@ world.blocked["290:0"] = true
 plan({id = "f2", kind = "farm", loopFrom = 1,
       hops = {{x = 293, y = 2, kind = "jump"}, {x = 290, y = 0, kind = "jump"}}})
 check(state().last.outcome == "refused", "a loop whose lap cannot be flown is refused up front")
+
+print("\nbosses, loot and the cooldown")
+
+local SWOKS = {script = "data/scripts/entity/story/swoks.lua", title = "Boss Swoks ${num}",
+               args = {num = "III"}}
+
+local function farmAt290(extra)
+    newWorld()
+    world.x, world.y = 290, 0
+    world.pilots = {1}
+    loadOrderChain()
+
+    local spec = {id = "b1", kind = "farm", boss = "swoks", onEnemies = "fight", loopFrom = 1,
+                  hops = {{x = 293, y = 2, kind = "jump"}, {x = 290, y = 0, kind = "jump"}}}
+    for k, v in pairs(extra or {}) do spec[k] = v end
+    plan(spec)
+end
+
+farmAt290()
+check(state().plan.collectLoot == true and state().plan.bossKills == 0,
+      "a farm collects loot unless told otherwise")
+
+-- Swoks spawns friendly to the player he spawned for: no enemies yet, only the boss
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+check(state().plan.bossPresent and state().plan.bossPresent.name == "swoks"
+      and state().plan.bossPresent.title == "Boss Swoks III",
+      "the boss is recognised by its script, and named with its title filled in")
+check(actions() == "A" and state().plan.phase == "fighting",
+      "and the loop stops for it even before it turns hostile")
+
+world.aiState = "Idle"
+tick()
+tick(10)
+check(#OrderChain.chain == 0 and state().plan.phase == "fighting",
+      "an aggressive order with nobody to fight finishes, and the ship waits by the boss")
+
+world.enemies = true
+tick()
+check(actions() == "A", "and is ordered in again once there are enemies")
+
+-- the boss dies: gone from a sector the ship never left, drops behind
+world.bosses = {}
+world.enemies = false
+world.aiState = "Idle"
+world.loot = {{cargo = false}, {cargo = false}, {cargo = true}, {cargo = false, collectable = false}}
+tick()
+local p = state().plan
+check(p.bossKills == 1 and p.lastKill.name == "swoks" and p.lastKill.title == "Boss Swoks III"
+      and p.bossPresent == nil, "a boss gone from the sector is counted as killed")
+check(p.cooldown and p.cooldown.left == 1800 and p.cooldown.total == 1800,
+      "which starts vanilla's thirty minute cooldown")
+check(p.phase == "looting" and #OrderChain.chain == 0, "the fighters go looting first")
+check(p.loot.instant == 2 and p.loot.cargo == 1 and p.loot.cargoPickup == false,
+      "counting only loot the ship may take, cargo apart")
+
+tick()
+check(world.squadOrders[0] == FighterOrders.CollectLoot
+      and world.squadOrders[1] == FighterOrders.CollectLoot,
+      "every squad is sent to collect loot")
+world.deployed = 5
+
+world.loot = {{cargo = false}, {cargo = true}}
+tick()
+check(state().plan.phase == "looting" and state().plan.loot.instant == 1,
+      "while drops it can take remain, it keeps at it")
+
+world.loot = {{cargo = true}}
+tick()
+check(state().plan.phase == "returning" and state().plan.lootResult == "collected",
+      "cargo without transporter software does not keep the fighters out")
+check(world.squadOrders[0] == FighterOrders.Return, "they are called back")
+
+tick(5)
+check(state().plan.phase == "returning", "and the ship will not leave while they are out")
+
+world.deployed = 0
+tick()
+check(state().plan.phase == "cooldown" and #OrderChain.chain == 0,
+      "landed, it sits out the cooldown with nothing on the chain")
+
+world.enemies = true
+tick()
+check(actions() == "A" and state().plan.phase == "fighting", "enemies during it are fought")
+world.enemies = false
+world.aiState = "Idle"
+world.loot = {}
+tick()
+check(state().plan.phase == "cooldown", "and afterwards it goes back to waiting")
+
+world.pilots = {}
+tick(600)
+check(state().plan and state().plan.phase == "cooldown",
+      "leaving the controls during the cooldown does not end the farm")
+world.pilots = {1}
+
+tick(1200)
+check(actions() == "J290:0 J293:2 J290:0 L2" and state().plan.phase == "running"
+      and state().plan.cooldown == nil,
+      "once it is over, the loop resumes from the hop the boss interrupted")
+
+print("\nloot variations")
+
+farmAt290()
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+world.bosses = {}
+world.cargoPickup = 1
+world.loot = {{cargo = true}}
+world.aiState = "Idle"
+tick()
+check(state().plan.phase == "looting" and state().plan.loot.cargoPickup == true,
+      "with transporter software, cargo is worth sending fighters for")
+tick(21)
+tick()
+check(state().plan.phase == "cooldown" and state().plan.lootResult == "no_launch",
+      "fighters that never leave the hangar end the looting, with nobody to wait for")
+
+farmAt290()
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+world.bosses = {}
+world.squadFighters = {}
+world.loot = {{cargo = false}}
+world.aiState = "Idle"
+tick()
+check(state().plan.phase == "cooldown" and state().plan.lootResult == "no_fighters",
+      "a ship without fighters goes straight to the cooldown")
+
+farmAt290({collectLoot = false, bossCooldown = 0})
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+world.bosses = {}
+world.loot = {{cargo = false}}
+world.aiState = "Idle"
+tick()
+check(state().plan.phase == "running" and state().plan.bossKills == 1,
+      "with looting off and no cooldown, a kill goes straight back to the loop")
+
+farmAt290({onEnemies = "continue"})
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+check(state().plan.phase == "running", "continue does not stop for a boss either")
+world.bosses = {}
+jumpTo(290, 0)
+tick()
+check(state().plan.bossKills == 0 and state().plan.cooldown == nil,
+      "and a boss left behind in another sector was not killed")
+
+farmAt290()
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+world.bosses = {}
+world.loot = {{cargo = false}}
+world.deployed = 2
+world.aiState = "Idle"
+tick()
+tick()
+world.loot = {}
+tick()
+tick(91)
+check(world.collectedAll and state().plan.phase == "cooldown"
+      and state().plan.lootResult == "collected_recalled",
+      "fighters that cannot find their way back are pulled in rather than left behind")
+
+farmAt290()
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+local saved = OrderChain.secure()
+world.bosses = {}
+loadOrderChain()
+OrderChain.restore(saved)
+tick()
+check(state().plan.bossKills == 0 and state().plan.cooldown == nil,
+      "a boss seen before a reload is not counted as killed after it")
 
 print("\nidle defence")
 

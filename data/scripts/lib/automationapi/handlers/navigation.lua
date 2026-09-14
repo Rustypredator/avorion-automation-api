@@ -37,6 +37,10 @@ local Navigation = {}
 
 local ON_ENEMIES = {fight = true, hold = true, continue = true}
 
+-- player/story/spawnrandombosses.lua: noSpawnTimer = 30 * 60 after either boss dies
+local BOSS_COOLDOWN = 30 * 60
+local BOSS_COOLDOWN_MAX = 4 * 3600
+
 -- A plan's id is how its confirmation is recognised in the event feed, so it only has to
 -- be unique among the plans one ship could report at once.
 local nextPlanId = 0
@@ -272,6 +276,28 @@ function Navigation.register(router)
 
         local onEnemies = onEnemiesOf(body, "fight")
         local dryRun = body.dryRun == true
+
+        local collectLoot = true
+        if body.collectLoot ~= nil then
+            if type(body.collectLoot) ~= "boolean" then
+                Router.fail(400, "bad_collect_loot", "'collectLoot' must be true or false.")
+            end
+            collectLoot = body.collectLoot
+        end
+
+        -- Seconds the loop waits after a kill. Vanilla's is 30 minutes for both bosses; the
+        -- knob exists for servers whose mods change it, and 0 keeps jumping regardless.
+        local bossCooldown = BOSS_COOLDOWN
+        if body.bossCooldown ~= nil then
+            bossCooldown = tonumber(body.bossCooldown)
+            if type(body.bossCooldown) ~= "number" or bossCooldown < 0
+               or bossCooldown > BOSS_COOLDOWN_MAX then
+                Router.fail(400, "bad_boss_cooldown",
+                            string.format("'bossCooldown' is seconds, 0 to %d.", BOSS_COOLDOWN_MAX))
+            end
+            bossCooldown = math.floor(bossCooldown)
+        end
+
         local ship = shipEntry(owner, params.name)
 
         -- The jump counter belongs to the player aboard, not to the ship. A captain flying
@@ -337,6 +363,8 @@ function Navigation.register(router)
                 piloted = piloted,
                 onEnemies = onEnemies,
                 attackCivilians = body.attackCivilians == true,
+                collectLoot = collectLoot,
+                bossCooldown = bossCooldown,
                 dryRun = dryRun,
                 -- the map draws this like any other route
                 route = Json.array((function()
@@ -361,6 +389,8 @@ function Navigation.register(router)
                 loopFrom = loopFrom,
                 onEnemies = onEnemies,
                 attackCivilians = body.attackCivilians == true,
+                collectLoot = collectLoot,
+                bossCooldown = bossCooldown,
             }, response)
         end
 

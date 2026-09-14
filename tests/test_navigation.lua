@@ -287,6 +287,21 @@ check(status == 200 and body.confirmed == true, "a piloted ship's farm is dispat
 local sent = Json.decode(Mock.entityCalls[1].args[1])
 check(sent.kind == "farm" and sent.boss == "ai" and sent.loopFrom == body.loopFrom,
       "as a looping farm plan")
+check(sent.collectLoot == true and sent.bossCooldown == 1800
+      and body.collectLoot == true and body.bossCooldown == 1800,
+      "collecting loot and waiting out vanilla's 30 minute cooldown by default")
+
+local status, body = call("POST", "/ships/Farmer/farm", {collectLoot = "yes"})
+check(status == 400 and body.error.code == "bad_collect_loot", "collectLoot must be a boolean")
+
+local status, body = call("POST", "/ships/Farmer/farm", {bossCooldown = -5})
+check(status == 400 and body.error.code == "bad_boss_cooldown", "a negative cooldown is a 400")
+
+Mock.entityCalls = {}
+local status, body = call("POST", "/ships/Farmer/farm", {collectLoot = false, bossCooldown = 0})
+local sent = Json.decode(Mock.entityCalls[1].args[1])
+check(status == 200 and sent.collectLoot == false and sent.bossCooldown == 0,
+      "both can be switched off")
 local lapA, lapB = sent.hops[sent.loopFrom], sent.hops[sent.loopFrom + 1]
 local last = sent.hops[sent.loopFrom - 1] or {x = 300, y = 0}
 check(distance(lapB, last) == 0,

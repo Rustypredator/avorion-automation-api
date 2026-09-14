@@ -433,6 +433,17 @@ window.fetch = function (url, init) {
     });
 };
 
+/* System notifications, recorded. The page is made to look unfocused, which is when the
+   console adds a system notification to its toast. */
+const notifications = [];
+window.Notification = function (title, options) {
+    notifications.push({ title: title, body: (options && options.body) || '' });
+    this.close = () => {};
+};
+window.Notification.permission = 'granted';
+window.Notification.requestPermission = () => Promise.resolve('granted');
+window.document.hasFocus = () => false;
+
 for (const file of ['api.js', 'map.js', 'app.js']) {
     window.eval(fs.readFileSync(path.join(web, file), 'utf8'));
 }
@@ -519,6 +530,7 @@ const ready = window.document.readyState === 'loading'
           'and the state the ship confirmed replaces the older read');
     check(travel().querySelector('[data-act="farm"]').disabled,
           'boss farming cannot be started for a ship nobody is flying');
+
 
     tab('overview').click();
     await settle(50);
@@ -896,6 +908,51 @@ const ready = window.document.readyState === 'loading'
     check(unresolved.length === 0,
           'every mark resolves to an explanation' + (unresolved.length
               ? ' - ' + unresolved.join(', ') + ' did not' : ''));
+
+    console.log('\nboss farming, as the ship reports it');
+
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
+    tab('travel').click();
+    await settle(600);
+
+    const farmEvent = (seq, plan) => ({
+        seq: seq, at: 3600 + seq, kind: 'order', chain: [], activeIndex: 0, idle: false,
+        automation: {
+            autoAggressive: false, attackCivilians: false, enemies: false, sector: { x: 293, y: 2 },
+            plan: Object.assign({ id: 'f1', kind: 'farm', boss: 'swoks', hops: 2, hop: 2,
+                                  loopFrom: 1, jumps: 12, fights: 0, onEnemies: 'fight',
+                                  collectLoot: true, bossKills: 0 }, plan)
+        }
+    });
+
+    const swoks = { name: 'swoks', title: 'Boss Swoks III' };
+    liveEvents.events.push(
+        farmEvent(5, { phase: 'running' }),
+        farmEvent(6, { phase: 'fighting', fights: 1, bossPresent: swoks }),
+        farmEvent(7, { phase: 'cooldown', fights: 1, bossKills: 1, lastKill: swoks,
+                       lootResult: 'collected', cooldown: { left: 1790, total: 1800 },
+                       loot: { instant: 0, cargo: 2, cargoPickup: false, fighters: 6, deployed: 0 } })
+    );
+    notifications.length = 0;
+    await settle(4500);
+
+    check(notifications.some((n) => n.title === 'Boss spawned' && /Boss Swoks III/.test(n.body)),
+          'a boss turning up is a system notification while the page is unfocused');
+    check(notifications.some((n) => n.title === 'Boss killed' && /pauses for 29m/.test(n.body)),
+          'and so is its death, with the pause it starts');
+    check(/boss cooldown/.test(travel().textContent) && /not jumping/.test(travel().textContent),
+          'the travel tab counts the cooldown down');
+    check(/2 cargo/.test(travel().textContent) && /transporter software/.test(travel().textContent),
+          'and says why cargo was left behind');
+
+    liveEvents.events.push(farmEvent(8, { phase: 'running', fights: 1, bossKills: 1, lastKill: swoks }));
+    await settle(4500);
+
+    check(notifications.some((n) => n.title === 'Boss cooldown over'),
+          'the end of the cooldown is notified');
+    check(notifications.filter((n) => n.title === 'Boss spawned').length === 1,
+          'and nothing seen before is notified twice');
 
     console.log('');
     if (failures === 0) {
