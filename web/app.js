@@ -23,7 +23,7 @@
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
      pushes events as they happen, so polling faster buys nothing but queue depth. */
-  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60 };
+  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60, automations: 10 };
 
   var S = {
     connected: false,
@@ -46,6 +46,13 @@
     mission: null,
     catalog: null,
     missionForm: null,
+
+    /* Mission automation, off /automation/missions. The rules and their live state belong
+       to the mod; `autoForm` is the editor open for the selected craft, `autoDry` a
+       "check now" run against its stored rule. */
+    automations: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
+    autoForm: null,
+    autoDry: null,
 
     events: [],
     eventKeys: {},
@@ -424,6 +431,40 @@
       + 'a start runs &mdash; including the game\'s own calculatePrediction, the function '
       + 'behind the order window\'s yield and risk figures. It takes a second or two.',
 
+    'auto-overview':
+      '<p>The mod sends this craft back out on its own whenever it is free and the mission '
+      + 'stays inside the limits. It runs on the server: closing the console stops nothing, '
+      + 'but the owner &mdash; or, for alliance craft, any member &mdash; has to be logged '
+      + 'in for a start to go through, exactly as for a start by hand.</p>'
+      + '<p>Each check runs one area analysis, tries every way of flying the mission that '
+      + 'is worth trying against it, and sends the best one that passes. An alliance '
+      + 'craft&rsquo;s rule is shared: every member sees and edits the same one.</p>',
+
+    'auto-evaluation':
+      'Every option the check weighed, best first: everything inside the limits ahead of '
+      + 'everything outside them, then by what the rule optimises for. Mining and salvage '
+      + 'try each half hour of duration, expeditions each half hour, trade every route at '
+      + 'every flight count, each with the smallest deposit that achieves it. Yield for '
+      + 'mining is resource units; for trade, the credits the contract is expected to pay '
+      + 'allowing for the customer walking away.',
+
+    'auto-area':
+      'Following the ship recentres the area on wherever the craft is when it is checked, '
+      + 'at the same size &mdash; the right choice for trade, whose ship ends each contract '
+      + 'somewhere else. A fixed area always searches the same rectangle.',
+
+    'auto-objective':
+      '<b>Profit / hour</b> weighs yield against time away. <b>Total yield</b> takes the '
+      + 'biggest haul the limits allow. <b>Lowest ambush</b> takes the safest option that '
+      + 'still passes. Ties go to the safer option.',
+
+    'auto-patience':
+      'The captain&rsquo;s warnings about an impatient customer are about flights, not '
+      + 'time: past three, every flight can end the contract early. The deposit you spend '
+      + 'decides the flight count &mdash; more up front, fewer flights &mdash; but a large '
+      + 'deposit also raises the ambush chance, so max flights and max ambush chance pull '
+      + 'against each other and the check finds the deposit that satisfies both.',
+
     'trade-scan':
       'Previews the trade area with the ship in each corner, the middle of each side and '
       + 'the centre, for every area shape the captain allows, and ranks every route found. '
@@ -726,6 +767,7 @@
         manifestsAt = 0;
         startLoops();
         refreshFleet();
+        loadAutomations(true);
         loadGalaxy();
         loadHistory(true);
       })
@@ -804,6 +846,7 @@
   function startLoops() {
     loop('fleet', EVERY.fleet, refreshFleet);
     loop('events', EVERY.events, sweepEvents);
+    loop('automations', EVERY.automations, loadAutomations);
     loop('mission', EVERY.mission, function () {
       if (!S.selected) { return; }
       var ship = S.byName[S.selected];
@@ -1164,7 +1207,8 @@
       return '<div class="ship-row' + (S.selected === ship.name ? ' sel' : '')
         + '" data-ship="' + esc(ship.name) + '">'
         + '<div class="n">' + esc(ship.name) + '</div>'
-        + '<div class="badges">' + availabilityBadge(ship) + usableBadge(ship) + '</div>'
+        + '<div class="badges">' + availabilityBadge(ship) + usableBadge(ship)
+        + automationBadge(ship) + '</div>'
         + '<div class="s">' + sub.join(' ') + '</div>'
         + '</div>';
     }).join('');
@@ -1183,6 +1227,8 @@
     S.mission = null;
     S.catalog = null;
     S.missionForm = null;
+    S.autoForm = null;
+    S.autoDry = null;
     if (changed) { GalaxyMap.setArea(null); }
     S.nav.result = null;
     S.nav.farm = null;
@@ -1858,6 +1904,7 @@
     var out = [];
 
     out.push(renderMissionStatus());
+    out.push(renderAutomation());
     out.push(renderMissionPlanner());
 
     $('#sv-mission').innerHTML = out.join('');
@@ -2736,6 +2783,582 @@
         loadMission();
       })
       .catch(function (error) { apiFailed(error, 'Command failed'); });
+  }
+
+  /* =========================== MISSION AUTOMATION ===========================
+   *
+   * The mod runs the automation, not this page: rules are stored on the server and the
+   * loop that sends a ship back out runs in the galaxy bridge, so closing the console stops
+   * nothing. What lives here is the view onto it and the editor for it.
+   *
+   * An alliance craft's rule is one document shared by every member, and the live state
+   * comes back with it. Polling /automation/missions is therefore all it takes for two
+   * members' consoles to agree on what a craft is doing - and saving with the revision a
+   * console last saw is what stops one member quietly overwriting the other's change.
+   */
+
+  var AUTO_PHASES = {
+    running:    { tone: 'good', label: 'out on mission' },
+    starting:   { tone: 'busy', label: 'starting' },
+    evaluating: { tone: 'busy', label: 'checking' },
+    waiting:    { tone: 'info', label: 'waiting' },
+    busy:       { tone: 'info', label: 'busy elsewhere' },
+    offline:    { tone: 'warn', label: 'owner offline' },
+    blocked:    { tone: 'warn', label: 'blocked' },
+    missing:    { tone: 'bad',  label: 'craft missing' },
+    error:      { tone: 'bad',  label: 'error' },
+    disabled:   { tone: '',     label: 'off' }
+  };
+
+  var AUTO_OBJECTIVES = [
+    { key: 'hourly', label: 'profit / hour' },
+    { key: 'total',  label: 'total yield' },
+    { key: 'safest', label: 'lowest ambush' }
+  ];
+
+  /* The editor's limit fields, in the units a player thinks in. `scale` turns the field
+     into the API's unit: fractions for chances, seconds for durations. */
+  var AUTO_LIMITS = [
+    { key: 'maxAttackChance', label: 'max ambush chance', unit: '%', scale: 0.01, step: 1 },
+    { key: 'maxDuration', label: 'max duration', unit: 'h', scale: 3600, step: 0.5 },
+    { key: 'minDuration', label: 'min duration', unit: 'h', scale: 3600, step: 0.5 },
+    { key: 'maxFlights', label: 'max flights', unit: '', scale: 1, step: 1, mission: 'trade' },
+    { key: 'maxDeposit', label: 'max deposit', unit: '¢', scale: 1, step: 10000, missions: ['trade', 'procure', 'maintenance'] },
+    { key: 'minCreditsLeft', label: 'keep in account', unit: '¢', scale: 1, step: 100000 },
+    { key: 'minValue', label: 'min yield', unit: '', scale: 1, step: 100, missions: ['trade', 'sell', 'mine', 'salvage', 'refine'] }
+  ];
+
+  function autoKey(kind, ship) {
+    return (kind === 'alliance' ? 'alliance' : 'player') + '/' + ship;
+  }
+
+  function automationFor(name) {
+    var ship = S.byName[name];
+    var kind = ship && ship.owner && ship.owner.kind === 'alliance' ? 'alliance' : 'player';
+    return S.automations.byKey[autoKey(kind, name)] || null;
+  }
+
+  /* Seconds since a server-runtime timestamp, carried forward by the local clock since the
+     list arrived. The mod stamps with uptime, which dates nothing on its own. */
+  function autoAge(at) {
+    if (typeof at !== 'number' || typeof S.automations.serverTime !== 'number') { return null; }
+    return Math.max(0, S.automations.serverTime - at + (Date.now() - S.automations.receivedAt) / 1000);
+  }
+
+  function agoText(at) {
+    var age = autoAge(at);
+    return age == null ? '' : duration(age) + ' ago';
+  }
+
+  function loadAutomations(userInitiated) {
+    return Api.get('/automation/missions', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'automations' })
+      .then(function (body) {
+        var byKey = {};
+        (body.automations || []).forEach(function (entry) {
+          byKey[autoKey(entry.owner && entry.owner.kind, entry.ship)] = entry;
+        });
+        S.automations = { byKey: byKey, serverTime: body.serverTime, receivedAt: Date.now(),
+                          error: null, loaded: true };
+        renderFleet();
+        refreshAutomationStatus();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        // a mod older than this console answers 404 here, which is not worth a toast
+        S.automations.error = error;
+        S.automations.loaded = true;
+        refreshAutomationStatus();
+      });
+  }
+
+  /* Folds one entry the API just answered with into the list, so a save shows at once
+     rather than on the next poll. */
+  function storeAutomation(body) {
+    var key = autoKey(body.owner && body.owner.kind, body.ship);
+    if (body.rule) { S.automations.byKey[key] = body; } else { delete S.automations.byKey[key]; }
+    if (typeof body.serverTime === 'number') {
+      S.automations.serverTime = body.serverTime;
+      S.automations.receivedAt = Date.now();
+    }
+    renderFleet();
+  }
+
+  function automationBadge(ship) {
+    var entry = S.automations.byKey[autoKey(ship.owner && ship.owner.kind, ship.name)];
+    if (!entry || !entry.rule) { return ''; }
+    if (!entry.rule.enabled) { return '<span class="badge" title="Automation is switched off">auto off</span>'; }
+
+    var phase = AUTO_PHASES[(entry.state || {}).phase] || { tone: 'info', label: 'auto' };
+    return '<span class="badge ' + phase.tone + '" title="' + esc((entry.state || {}).message || '')
+      + '">auto · ' + esc(phase.label) + '</span>';
+  }
+
+  /* The poll only ever redraws the status half: the editor below it may have focus. */
+  function refreshAutomationStatus() {
+    var node = $('#sv-mission [data-auto-status]');
+    if (node && S.selected) { node.innerHTML = renderAutomationStatus(); }
+  }
+
+  function renderAutomation() {
+    return '<div class="section auto-section"><h2>Automation ' + explain('auto-overview') + '</h2>'
+      + '<div data-auto-status>' + renderAutomationStatus() + '</div>'
+      + '<div data-auto-editor>' + renderAutomationEditor() + '</div>'
+      + '</div>';
+  }
+
+  function limitsText(rule) {
+    var limits = rule.limits || {};
+    var parts = [];
+    AUTO_LIMITS.forEach(function (spec) {
+      var value = limits[spec.key];
+      if (value == null) { return; }
+      var shown = spec.scale === 0.01 ? Math.round(value * 100) + '%'
+        : spec.scale === 3600 ? duration(value)
+        : spec.unit === '¢' ? credits(value) : num(value);
+      parts.push(spec.label + ' ' + shown);
+    });
+    return parts.length ? parts.join(' · ') : 'none &mdash; anything the game would start';
+  }
+
+  function areaText(area) {
+    if (!area || area.mode !== 'fixed') {
+      return 'follows the ship' + (area && area.size ? ', ' + area.size.x + '×' + area.size.y : '');
+    }
+    return coords(area.lower) + ' → ' + coords(area.upper);
+  }
+
+  function renderAutomationStatus() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.automations.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without mission automation.</div>';
+    }
+    if (failed && !Object.keys(S.automations.byKey).length) {
+      return errorBox('Automation unavailable', failed);
+    }
+    if (!S.automations.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var entry = automationFor(name);
+    var dry = S.autoDry && S.autoDry.ship === name ? S.autoDry : null;
+
+    if (!entry || !entry.rule) {
+      if (S.autoForm && S.autoForm.ship === name) { return ''; }
+      return '<div class="row">'
+        + '<span class="note">Not automated. Set a mission up below, then let the mod keep '
+        + 'sending ' + esc(name) + ' out on it whenever it is free.</span>'
+        + '<button data-auto-act="new"' + (S.missionForm ? '' : ' disabled') + '>Automate '
+        + esc(S.missionForm ? S.missionForm.mission : 'a mission') + '…</button>'
+        + '</div>';
+    }
+
+    var rule = entry.rule;
+    var st = entry.state || {};
+    var phase = AUTO_PHASES[st.phase] || { tone: 'info', label: st.phase || 'unknown' };
+    var editing = S.autoForm && S.autoForm.ship === name;
+
+    var out = [];
+
+    out.push('<div class="row auto-head">'
+      + '<label class="check switch"><input type="checkbox" data-auto-toggle'
+      + (rule.enabled ? ' checked' : '') + '><span>send out automatically</span></label>'
+      + '<span class="badge ' + phase.tone + '">' + esc(phase.label) + '</span>'
+      + '<span class="auto-message">' + esc(st.message || '') + '</span>'
+      + (st.since != null ? '<span class="mute2">' + esc(agoText(st.since)) + '</span>' : '')
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-auto-act="check"' + (dry && dry.running ? ' disabled' : '') + '>check now</button>'
+      + (editing ? '' : '<button class="ghost small" data-auto-act="edit">edit</button>')
+      + '<button class="ghost small danger" data-auto-act="remove">remove</button>'
+      + '</div>');
+
+    var cards = [];
+    cards.push(meterCard('Rule', kv([
+      ['mission', esc(rule.mission)],
+      ['area', esc(areaText(rule.area))],
+      ['optimise for', esc((AUTO_OBJECTIVES.filter(function (o) { return o.key === rule.objective; })[0] || {}).label || rule.objective)],
+      ['collect yields', rule.collectYields ? 'yes' : 'no'],
+      ['saved by', esc((rule.updatedBy && rule.updatedBy.name) || '—') + ' <span class="mute2">rev ' + num(rule.revision) + '</span>']
+    ]) + '<div class="note" style="margin-top:6px">' + limitsText(rule) + '</div>'));
+
+    var last = st.lastDispatch;
+    cards.push(meterCard('Activity', kv([
+      ['dispatches', num(st.dispatches || 0)],
+      ['last sent', last ? esc(agoText(last.at)) : '—'],
+      ['what', last ? esc(last.summary) : '—'],
+      ['last collected', st.lastCollect ? num(st.lastCollect.collected) + ' <span class="mute2">' + esc(agoText(st.lastCollect.at)) + '</span>' : '—']
+    ])));
+
+    out.push('<div class="cards" style="margin-top:10px">' + cards.join('') + '</div>');
+
+    if (dry) {
+      out.push(renderAutoEvaluation('Check just now', dry));
+    } else if (st.lastEvaluation) {
+      out.push(renderAutoEvaluation('Last check <span class="mute2">' + esc(agoText(st.lastEvaluation.at)) + '</span>',
+                                    { evaluation: st.lastEvaluation }));
+    }
+
+    if (st.log && st.log.length) {
+      out.push('<details class="card auto-log" style="margin-top:10px"><summary>Decisions '
+        + '<span class="mute2">' + st.log.length + '</span></summary>'
+        + st.log.slice().reverse().map(function (line) {
+            var tone = (AUTO_PHASES[line.phase] || {}).tone || '';
+            return '<div class="log-line ' + (tone === 'bad' ? 'err' : tone === 'warn' ? 'warn' : '') + '">'
+              + '<span class="t">' + esc(agoText(line.at)) + '</span>'
+              + '<span class="k">' + esc(line.phase) + '</span>'
+              + '<span class="m">' + esc(line.message) + (line.detail ? ' <span class="dim">· ' + esc(line.detail) + '</span>' : '') + '</span>'
+              + '</div>';
+          }).join('')
+        + '</details>');
+    }
+
+    return out.join('');
+  }
+
+  /* One option the automation weighed, in a few words. */
+  function candidateLabel(candidate) {
+    var c = candidate.config || {};
+    if (c.goodName) {
+      return '<b>' + esc(c.goodName) + '</b>'
+        + (candidate.route ? ' <span class="mute2">' + coords(candidate.route.from) + ' → ' + coords(candidate.route.to) + '</span>' : '');
+    }
+    if (c.duration != null) { return 'duration ' + esc(String(c.duration)); }
+    return 'as configured';
+  }
+
+  function valueText(m) {
+    if (m.value == null) { return '—'; }
+    return m.valueUnit === 'credits' ? credits(m.value) : num(m.value);
+  }
+
+  function hourlyText(m) {
+    if (m.hourly == null) { return '—'; }
+    return (m.valueUnit === 'credits' ? credits(m.hourly) : num(m.hourly)) + '/h';
+  }
+
+  function renderAutoEvaluation(title, result) {
+    if (result.running) {
+      return '<div class="card" style="margin-top:10px"><h3>' + title + '</h3><div class="mute2">running the area analysis…</div></div>';
+    }
+    if (result.error) {
+      return '<div style="margin-top:10px">' + errorBox('Check failed', result.error) + '</div>';
+    }
+
+    var ev = result.evaluation;
+    if (!ev) { return ''; }
+
+    var verdict = ev.chosen
+      ? '<span class="badge good">would send it</span>'
+      : '<span class="badge warn">nothing within the limits</span>';
+
+    var rows = (ev.candidates || []).map(function (candidate, index) {
+      var m = candidate.metrics || {};
+      var chosen = candidate.passes && index === 0 && ev.chosen;
+      var patience = m.patience
+        ? ' <span class="mute2" title="chance the customer waits for the whole contract: ' + pct(m.completionChance) + '">' + esc(m.patience) + '</span>'
+        : '';
+      return '<tr' + (chosen ? ' class="best"' : '') + '>'
+        + '<td>' + candidateLabel(candidate) + '</td>'
+        + '<td class="num">' + pct(m.attackChance) + '</td>'
+        + '<td class="num">' + duration(m.duration) + '</td>'
+        + '<td class="num">' + (m.flights != null ? num(m.flights) + patience : '—') + '</td>'
+        + '<td class="num">' + (m.cost != null ? credits(m.cost) : '—') + '</td>'
+        + '<td class="num">' + valueText(m) + '</td>'
+        + '<td class="num">' + hourlyText(m) + '</td>'
+        + '<td>' + (candidate.passes
+            ? '<span class="badge good">' + (chosen ? 'chosen' : 'ok') + '</span>'
+            : '<span class="note warn">' + esc((candidate.violations || []).map(function (v) { return v.message; }).join('; ')) + '</span>')
+        + '</td></tr>';
+    }).join('');
+
+    return '<div class="card" style="margin-top:10px">'
+      + '<h3>' + title + ' ' + explain('auto-evaluation') + '</h3>'
+      + '<div class="row tight" style="margin-bottom:6px">' + verdict
+      + '<span class="mute2">' + num(ev.passing) + ' of ' + num(ev.tried) + ' options pass · area '
+      + coords(ev.area && ev.area.lower) + ' → ' + coords(ev.area && ev.area.upper) + '</span></div>'
+      + (rows
+          ? '<div class="scan-table"><table><thead><tr>'
+            + '<th>option</th><th class="num">ambush</th><th class="num">duration</th>'
+            + '<th class="num">flights</th><th class="num">deposit</th><th class="num">yield</th>'
+            + '<th class="num">per hour</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+          : '<div class="note">No way to fly this mission was found in the area.</div>')
+      + (result.assessment && result.assessment.length
+          ? '<div style="margin-top:8px">' + result.assessment.map(function (line) {
+              return '<div class="note">· ' + esc(line) + '</div>';
+            }).join('') + '</div>'
+          : '')
+      + '</div>';
+  }
+
+  /* ---------------------------------- editor --------------------------------- */
+
+  /* What a rule flies, taken off the planner form: the same mission, area, config,
+     materials and escorts a start would send. A trade route and deposit are left behind -
+     choosing those is the automation's job, every time the ship is free. */
+  function plannerSource() {
+    var form = S.missionForm;
+    if (!form) { return null; }
+
+    var body = missionBody();
+    var config = {};
+    Object.keys(body.config).forEach(function (k) {
+      if (form.mission === 'trade' && (k === 'goodName' || k === 'deposit' || k === 'maxDeposit')) { return; }
+      config[k] = body.config[k];
+    });
+
+    return {
+      mission: form.mission,
+      config: config,
+      materials: body.materials || null,
+      escorts: (body.escorts || []).slice(),
+      area: { lower: body.area.lower, upper: body.area.upper },
+      size: formArea().size
+    };
+  }
+
+  function openAutoEditor(entry) {
+    var name = S.selected;
+    var rule = entry && entry.rule;
+    var source = rule
+      ? { mission: rule.mission, config: rule.config || {}, materials: rule.materials || null,
+          escorts: rule.escorts || [],
+          area: rule.area && rule.area.mode === 'fixed' ? { lower: rule.area.lower, upper: rule.area.upper } : null,
+          size: rule.area && rule.area.size }
+      : plannerSource();
+    if (!source) { return; }
+
+    var limits = {};
+    var stored = (rule && rule.limits) || {};
+    AUTO_LIMITS.forEach(function (spec) {
+      if (stored[spec.key] != null) {
+        limits[spec.key] = Math.round(stored[spec.key] / spec.scale * 100) / 100;
+      }
+    });
+    // A new trade rule starts where the captain stops warning about the customer.
+    if (!rule && source.mission === 'trade') { limits.maxFlights = 3; }
+
+    S.autoForm = {
+      ship: name,
+      source: source,
+      areaMode: rule ? (rule.area && rule.area.mode === 'fixed' ? 'fixed' : 'ship') : 'ship',
+      objective: rule ? rule.objective : 'hourly',
+      limits: limits,
+      collectYields: rule ? rule.collectYields === true : false,
+      revision: rule ? rule.revision : 0,
+      existing: !!rule,
+      dry: null
+    };
+    renderMission();
+  }
+
+  function autoBody(form) {
+    var limits = {};
+    AUTO_LIMITS.forEach(function (spec) {
+      var value = form.limits[spec.key];
+      if (value === '' || value == null || isNaN(value) || !limitApplies(spec, form.source.mission)) { return; }
+      limits[spec.key] = spec.key === 'maxFlights' ? Math.round(value) : Number(value) * spec.scale;
+    });
+
+    var source = form.source;
+    var area = form.areaMode === 'fixed' && source.area
+      ? { mode: 'fixed', lower: source.area.lower, upper: source.area.upper }
+      : { mode: 'ship', size: source.size || null };
+
+    return {
+      mission: source.mission,
+      objective: form.objective,
+      area: area,
+      limits: limits,
+      config: source.config,
+      materials: source.materials,
+      escorts: source.escorts,
+      collectYields: form.collectYields
+    };
+  }
+
+  function limitApplies(spec, mission) {
+    if (spec.mission) { return spec.mission === mission; }
+    if (spec.missions) { return spec.missions.indexOf(mission) !== -1; }
+    return true;
+  }
+
+  function renderAutomationEditor() {
+    var form = S.autoForm;
+    if (!form || form.ship !== S.selected) { return ''; }
+
+    var source = form.source;
+    var head = '<div class="card auto-editor" style="margin-top:10px">'
+      + '<div class="row" style="justify-content:space-between"><h3 style="margin-bottom:0">'
+      + (form.existing ? 'Edit rule' : 'New rule') + ' <span class="mute2">' + esc(source.mission) + '</span></h3>'
+      + '<button class="ghost small" data-auto-act="take-planner"' + (S.missionForm ? '' : ' disabled')
+      + ' title="Replace the mission, area, config, materials and escorts with what the planner below holds">take planner settings</button></div>';
+
+    var what = [];
+    Object.keys(source.config || {}).forEach(function (k) {
+      what.push(esc(k) + ' ' + esc(typeof source.config[k] === 'object' ? JSON.stringify(source.config[k]) : String(source.config[k])));
+    });
+    if (source.materials) { what.push('materials ' + esc(source.materials.join(', ') || 'none')); }
+    if (source.escorts && source.escorts.length) { what.push('escorts ' + esc(source.escorts.join(', '))); }
+
+    var fields = AUTO_LIMITS.filter(function (spec) { return limitApplies(spec, source.mission); }).map(function (spec) {
+      var value = form.limits[spec.key];
+      return '<label class="auto-limit"><span class="mute2">' + esc(spec.label) + '</span>'
+        + '<span class="row tight"><input type="number" min="0" step="' + spec.step + '" data-auto-limit="' + spec.key + '"'
+        + ' value="' + (value == null ? '' : esc(String(value))) + '" placeholder="no limit">'
+        + (spec.unit ? '<span class="mute2">' + esc(spec.unit) + '</span>' : '') + '</span></label>';
+    }).join('');
+
+    var body = '<div class="mute2" style="margin:6px 0 10px">flies: ' + (what.join(' · ') || 'defaults') + '</div>'
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">area ' + explain('auto-area') + '</span>'
+      + '<button class="chip' + (form.areaMode === 'ship' ? ' on' : '') + '" data-auto-area="ship">follow the ship'
+      + (source.size ? ' (' + source.size.x + '×' + source.size.y + ')' : '') + '</button>'
+      + (source.area
+          ? '<button class="chip' + (form.areaMode === 'fixed' ? ' on' : '') + '" data-auto-area="fixed">fixed '
+            + coords(source.area.lower) + ' → ' + coords(source.area.upper) + '</button>'
+          : '')
+      + '</div>'
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">optimise for ' + explain('auto-objective') + '</span>'
+      + AUTO_OBJECTIVES.map(function (o) {
+          return '<button class="chip' + (form.objective === o.key ? ' on' : '') + '" data-auto-objective="' + o.key + '">' + esc(o.label) + '</button>';
+        }).join('')
+      + '</div>'
+      + '<div class="auto-limits">' + fields + '</div>'
+      + (source.mission === 'trade'
+          ? '<div class="note" style="margin-top:6px">' + explain('auto-patience') + ' Up to 3 flights the customer always waits; '
+            + 'each flight past that ends the contract early with a 35% chance.</div>'
+          : '')
+      + '<label class="check" style="display:flex;margin-top:8px"><input type="checkbox" data-auto-collect'
+      + (form.collectYields ? ' checked' : '') + '><span>collect yields before sending it out again</span></label>'
+      + '<div class="row" style="margin-top:10px">'
+      + '<button data-auto-act="test"' + (form.dry && form.dry.running ? ' disabled' : '') + '>Test limits</button>'
+      + '<button class="primary" data-auto-act="save">' + (form.existing ? 'Save rule' : 'Save and switch on') + '</button>'
+      + '<button class="ghost" data-auto-act="cancel">Cancel</button>'
+      + '</div>';
+
+    return head + body + '</div>'
+      + (form.dry ? renderAutoEvaluation('Test against the current area', form.dry) : '');
+  }
+
+  /* --------------------------------- actions --------------------------------- */
+
+  function autoPath(name, suffix) {
+    return '/ships/' + Api.seg(name) + '/mission/automation' + (suffix || '');
+  }
+
+  function autoConflict(error) {
+    if (error.code !== 'rule_changed') { return false; }
+    toast('warn', 'Rule changed elsewhere',
+          'Someone else saved this rule since it was loaded. It has been reloaded; apply your change again.');
+    S.autoForm = null;
+    loadAutomations(true).then(renderMission);
+    return true;
+  }
+
+  function saveAutomation(button) {
+    var form = S.autoForm;
+    var name = S.selected;
+    if (!form || !name) { return; }
+
+    var body = autoBody(form);
+    body.ifRevision = form.revision;
+    if (!form.existing) { body.enabled = true; }
+
+    return guard(button, Api.post(autoPath(name), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'save automation' }))
+      .then(function (result) {
+        storeAutomation(result);
+        S.autoForm = null;
+        toast('good', 'Automation saved', name + ': ' + (result.rule.enabled ? 'the mod checks it on its next pass.' : 'switched off.'));
+        renderMission();
+      })
+      .catch(function (error) {
+        if (autoConflict(error)) { return; }
+        apiFailed(error, 'Could not save the rule');
+      });
+  }
+
+  function testAutomation(button, stored) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var form = S.autoForm;
+    var body = stored ? {} : autoBody(form);
+    var holder = { ship: name, running: true };
+
+    if (stored) { S.autoDry = holder; } else { form.dry = holder; }
+    renderMission();
+
+    return guard(button, Api.post(autoPath(name, '/evaluate'), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'test automation' }))
+      .then(function (result) {
+        holder.running = false;
+        holder.evaluation = result.evaluation;
+        holder.assessment = result.assessment;
+        if (S.selected === name) { renderMission(); }
+      })
+      .catch(function (error) {
+        holder.running = false;
+        holder.error = error;
+        if (S.selected === name) { renderMission(); }
+      });
+  }
+
+  function toggleAutomation(input) {
+    var name = S.selected;
+    var entry = automationFor(name);
+    if (!entry || !entry.rule) { return; }
+
+    var enabled = input.checked;
+    input.disabled = true;
+
+    Api.post(autoPath(name), { enabled: enabled, ifRevision: entry.rule.revision },
+             { owner: ownerParamFor(name) }, { priority: Api.P.USER, label: 'toggle automation' })
+      .then(function (result) {
+        storeAutomation(result);
+        toast('good', enabled ? 'Automation on' : 'Automation off', name);
+        refreshAutomationStatus();
+      })
+      .catch(function (error) {
+        input.checked = !enabled;
+        input.disabled = false;
+        if (autoConflict(error)) { return; }
+        apiFailed(error, 'Could not switch automation');
+      });
+  }
+
+  function removeAutomation(button) {
+    var name = S.selected;
+    if (!name || !window.confirm('Remove the automation rule for ' + name + '?')) { return; }
+
+    return guard(button, Api.post(autoPath(name, '/delete'), {}, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'remove automation' }))
+      .then(function (result) {
+        storeAutomation(result);
+        S.autoForm = null;
+        S.autoDry = null;
+        toast('good', 'Automation removed', name);
+        renderMission();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove the rule'); });
+  }
+
+  function automationAction(act, button) {
+    if (act === 'new') { openAutoEditor(null); }
+    else if (act === 'edit') { openAutoEditor(automationFor(S.selected)); }
+    else if (act === 'cancel') { S.autoForm = null; renderMission(); }
+    else if (act === 'save') { saveAutomation(button); }
+    else if (act === 'test') { testAutomation(button, false); }
+    else if (act === 'check') { testAutomation(button, true); }
+    else if (act === 'remove') { removeAutomation(button); }
+    else if (act === 'take-planner') {
+      var source = plannerSource();
+      if (!source || !S.autoForm) { return; }
+      if (source.mission === 'trade' && S.autoForm.limits.maxFlights == null) { S.autoForm.limits.maxFlights = 3; }
+      S.autoForm.source = source;
+      S.autoForm.dry = null;
+      renderMission();
+    }
   }
 
   /* ================================= ORDERS ================================ */
@@ -5712,6 +6335,20 @@
       var button = e.target.closest('button');
       if (!button) { return; }
 
+      if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
+      if (button.dataset.autoArea && S.autoForm) {
+        S.autoForm.areaMode = button.dataset.autoArea;
+        S.autoForm.dry = null;
+        renderMission();
+        return;
+      }
+      if (button.dataset.autoObjective && S.autoForm) {
+        S.autoForm.objective = button.dataset.autoObjective;
+        S.autoForm.dry = null;
+        renderMission();
+        return;
+      }
+
       if (button.dataset.mission) { pickMission(button.dataset.mission); return; }
       if (button.dataset.size) { S.missionForm.sizeIndex = Number(button.dataset.size); renderMission(); return; }
 
@@ -5780,10 +6417,25 @@
       }
     });
 
+    $('#sv-mission').addEventListener('change', function (e) {
+      var node = e.target;
+      if (node.dataset.autoToggle !== undefined) { toggleAutomation(node); }
+      else if (node.dataset.autoCollect !== undefined && S.autoForm) {
+        S.autoForm.collectYields = node.checked;
+      }
+    });
+
     $('#sv-mission').addEventListener('input', function (e) {
+      var node = e.target;
+
+      // Kept on the form as typed and never redrawn from here, so the field keeps focus.
+      if (node.dataset.autoLimit && S.autoForm) {
+        S.autoForm.limits[node.dataset.autoLimit] = node.value === '' ? null : Number(node.value);
+        return;
+      }
+
       var form = S.missionForm;
       if (!form) { return; }
-      var node = e.target;
 
       if (node.dataset.form === 'cx') { form.center.x = Math.round(Number(node.value)) || 0; syncArea(); }
       else if (node.dataset.form === 'cy') { form.center.y = Math.round(Number(node.value)) || 0; syncArea(); }

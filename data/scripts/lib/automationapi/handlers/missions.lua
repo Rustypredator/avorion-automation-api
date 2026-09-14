@@ -258,9 +258,13 @@ end
 
 -- #### PREVIEW AND START #### --
 
--- Validates and predicts against a completed analysis. Shared by preview and start so the
--- two can never disagree about whether a mission is startable.
-local function assess(owner, shipName, key, missionType, area, results, config)
+-- Validates and predicts against a completed analysis. Shared by preview, start and the
+-- mission automation, so none of them can disagree about whether a mission is startable.
+--
+-- opts.brief skips the parts only a person reads - the captain's assessment and the trade
+-- route table - for the automation, which assesses many configs against one analysis.
+local function assess(owner, shipName, key, missionType, area, results, config, opts)
+    opts = opts or {}
     area.analysis = results
 
     local command = MissionTypes.make(missionType, shipName, area, config)
@@ -311,7 +315,7 @@ local function assess(owner, shipName, key, missionType, area, results, config)
         if ok then captain = found end
     end
 
-    if captain and command.generateAssessmentFromPrediction then
+    if captain and command.generateAssessmentFromPrediction and not opts.brief then
         local ok, lines = pcall(function()
             return FactionScope.with(owner.faction, function()
                 return command:generateAssessmentFromPrediction(prediction, captain,
@@ -370,13 +374,15 @@ local function assess(owner, shipName, key, missionType, area, results, config)
     if okStats then areaStats = Serialize.value(stats) end
 
     local routes
-    if key == "trade" then
+    if key == "trade" and not opts.brief then
         routes = describeTradeRoutes(command, owner, shipName, area, command.config)
     end
 
     return
     {
         command = command,
+        -- the raw prediction, before serialization, for callers that do arithmetic on it
+        prediction = prediction,
         body =
         {
             mission = key,
@@ -401,6 +407,10 @@ local function assess(owner, shipName, key, missionType, area, results, config)
         },
     }
 end
+
+Missions.assess = assess
+Missions.plainArea = plainArea
+Missions.plainConfig = plainConfig
 
 -- Runs an analysis and calls back with the assessment. Returns Router.DEFERRED.
 local function withAssessment(ctx, params, onAssessed)

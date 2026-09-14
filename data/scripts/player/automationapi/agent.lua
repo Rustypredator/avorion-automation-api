@@ -246,6 +246,23 @@ end
 
 -- #### LOOP #### --
 
+-- Jobs cross from the bridge as JSON, and JSON object keys are strings. A mission config
+-- is full of index-keyed tables - MineCommand reads config.collected[material - 1],
+-- RefineCommand config.refined[material] - so a selection that arrives keyed "0", "1"
+-- matches nothing and the ship sets off collecting no material at all. Integer-looking
+-- keys are turned back into the numbers the command indexes with.
+local function restoreIndexKeys(value)
+    if type(value) ~= "table" then return value end
+
+    local result = {}
+    for k, v in pairs(value) do
+        if type(k) == "string" and string.match(k, "^%-?%d+$") then k = tonumber(k) end
+        result[k] = restoreIndexKeys(v)
+    end
+
+    return result
+end
+
 local function claimJobs()
     local ok, status, payload = pcall(function()
         if onAlliance() then
@@ -260,6 +277,10 @@ local function claimJobs()
 
     local decoded, jobs = pcall(Json.decode, payload)
     if not decoded or type(jobs) ~= "table" then return nil end
+
+    for _, job in ipairs(jobs) do
+        if job.config then job.config = restoreIndexKeys(job.config) end
+    end
 
     return jobs
 end

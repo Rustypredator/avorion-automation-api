@@ -25,6 +25,9 @@ galaxy map.
 
 - read your fleet, including craft in unloaded sectors and while you are offline
 - preview a captain mission with the game's own yield and risk prediction, then start it
+- automate captain missions per craft: the mod sends the ship back out whenever it is free,
+  picking the duration, trade route and deposit that stay under an ambush-chance ceiling and
+  inside the trade customer's patience - shared across an alliance, running with no client
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
 - plan routes that prefer gates, keep out of rifts or stay in no man's space, and have the
   ship fight, hold or press on when enemies show up on the way
@@ -180,6 +183,14 @@ underneath, turning that lifetime total into credits an hour and a bar per hour 
 the factory in the middle, results and waste on the right, one arrow each. Mission and
 Travel are not offered for a station: the game refuses both outright.
 
+The **Mission** tab's **Automation** section turns whatever the planner below it holds into a
+rule: set a ceiling on the ambush chance, a duration window, how many trade flights the
+customer should have to sit through, a deposit cap or a credit reserve, and pick whether to
+optimise for profit an hour, total yield or safety. **Test limits** runs the check without
+starting anything and lists every option it weighed with why each would or would not go. Once
+saved, the mod does the rest; the fleet list badges each automated craft with what its rule is
+doing, and every alliance member's console shows the same rules and state.
+
 The **Industry** tab puts those lines together, one sector at a time. Each station in the
 sector is a card with its ingredients down one edge and its results down the other, wired
 to the stations it feeds, so a sector reads as the production chain it actually is.
@@ -324,6 +335,8 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/missions/{mission}/start` | start it |
 | `GET /ships/{name}/mission` | live status |
 | `POST /ships/{name}/mission/recall`, `.../collect` | recall, and collect yields |
+| `GET /automation/missions`, `GET`/`POST /ships/{name}/mission/automation` | mission automation rules and what they are doing |
+| `POST /ships/{name}/mission/automation/evaluate`, `.../delete` | dry-run a rule's limits, or remove it |
 | `POST /ships/{name}/travel` | alias of the Travel captain mission's start |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
@@ -352,6 +365,10 @@ key holder online". Alliance craft raise their callbacks on the Alliance object 
 online member's agent registers against them, so an alliance fleet keeps recording while any
 one member is in game - whoever that is. Only personal craft go quiet when their own owner
 logs out. `recording` and `watchers` on the event feed say which case you are in.
+
+**Mission automation** keeps its rules on the server and its loop in the bridge, so no client
+has to stay connected - but each start it makes is still a start, and waits until the owner
+(or, for alliance craft, any member) is in game.
 
 Ship *positions* need nobody at all: they come from the ship database, which is why the
 bridge's [fleet history](#fleet-history) keeps filling on an empty server.
@@ -402,7 +419,7 @@ re-checking against the game's copies after an Avorion update - and a mod that r
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-for t in bridge ships missions movement navigation orderchain map shipevents economy; do lua5.4 tests/test_$t.lua; done
+for t in bridge ships missions missionautomation movement navigation orderchain map shipevents economy; do lua5.4 tests/test_$t.lua; done
 ```
 
 The bridge's history store is PHP over Postgres, so it is tested against a throwaway

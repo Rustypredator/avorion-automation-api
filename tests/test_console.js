@@ -256,7 +256,74 @@ const flownRoute = (sent) => ({
     }
 });
 
+/*
+ * Mission automation as the mod reports it. Wingman already has a rule, held back by its
+ * ambush limit; Ore Hound has none until the test saves one. The store below plays the
+ * mod's part: it keeps what was saved and hands out revisions, which is what the console's
+ * conflict handling keys off.
+ */
+const automationStore = {
+    'player/Wingman': {
+        ship: 'Wingman', owner: { kind: 'player', index: 1, name: 'Rusty' },
+        rule: { mission: 'mine', enabled: true, objective: 'hourly', area: { mode: 'ship' },
+                limits: { maxAttackChance: 0.1 }, config: {}, escorts: [], collectYields: false,
+                revision: 4, updatedBy: { index: 1, name: 'Rusty' } },
+        state: { phase: 'blocked', message: 'Nothing within the limits: ambush chance 12% is above 10%',
+                 since: 3500, dispatches: 2, log: [] }
+    }
+};
+
+function automationList() {
+    return { serverTime: 3600, automations: Object.values(automationStore),
+             supported: ['mine', 'trade'], limits: [] };
+}
+
+function saveAutomation(sent) {
+    const key = 'player/Ore Hound';
+    const previous = automationStore[key];
+    const current = previous ? previous.rule.revision : 0;
+    if (sent.ifRevision !== undefined && sent.ifRevision !== current) {
+        return { status: 409, body: { error: { code: 'rule_changed', message: 'changed' } } };
+    }
+
+    const rule = Object.assign({}, previous ? previous.rule : { enabled: true }, sent);
+    delete rule.ifRevision;
+    rule.revision = current + 1;
+    rule.updatedBy = { index: 1, name: 'Rusty' };
+
+    automationStore[key] = {
+        ship: 'Ore Hound', owner: { kind: 'player', index: 1, name: 'Rusty' }, rule: rule,
+        state: { phase: rule.enabled ? 'waiting' : 'disabled', message: 'Saved.', since: 3600,
+                 dispatches: 0, log: [] },
+        serverTime: 3600
+    };
+    return automationStore[key];
+}
+
+const tradeEvaluation = () => ({
+    ship: 'Ore Hound', wouldStart: true, assessment: ['That is only a few flights.'],
+    evaluation: {
+        at: 3600, objective: 'hourly', tried: 6, passing: 1,
+        area: { lower: { x: -7, y: -6 }, upper: { x: 9, y: 10 } },
+        chosen: { passes: true },
+        candidates: [
+            { passes: true, config: { goodName: 'Oil', deposit: 34304 },
+              route: { good: 'Oil', from: { x: 1, y: 2 }, to: { x: 15, y: 2 } },
+              metrics: { attackChance: 0.07, duration: 3600, flights: 3, patience: 'safe',
+                         completionChance: 1, cost: 34304, value: 60000, valueUnit: 'credits',
+                         hourly: 60000 },
+              violations: [] },
+            { passes: false, config: { goodName: 'Oil', deposit: 51200 },
+              route: { good: 'Oil', from: { x: 1, y: 2 }, to: { x: 15, y: 2 } },
+              metrics: { attackChance: 0.09, duration: 2400, flights: 2, cost: 51200 },
+              violations: [{ limit: 'maxAttackChance', message: 'ambush chance 9% is above 8%' }] }
+        ]
+    }
+});
+
 const dynamic = {
+    '/ships/Ore%20Hound/mission/automation': saveAutomation,
+    '/ships/Ore%20Hound/mission/automation/evaluate': tradeEvaluation,
     '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
     '/ships/Ore%20Hound/route': flownRoute
 };
@@ -275,6 +342,7 @@ const routes = {
     },
     '/ships/Ore%20Hound/mission': { active: null },
     '/ships/Ore%20Hound/automation': houndAutomation,
+    get '/automation/missions'() { return automationList(); },
     '/history/events': storedEvents,
     // What the bridge kept of holds read earlier, by this console or anyone else's. Far
     // Scout's is fresh; Wingman's is an hour old, and neither has a live detail route here,
@@ -348,13 +416,19 @@ window.fetch = function (url, init) {
         if (dynamic[parsed.pathname]) { body = dynamic[parsed.pathname](sent); }
     }
 
+    let status = body !== undefined ? 200 : 404;
+    if (body && typeof body.status === 'number' && body.body) {
+        status = body.status;
+        body = body.body;
+    }
+
     const payload = body !== undefined
         ? body
         : { error: { code: 'no_such_route', message: parsed.pathname } };
 
     return Promise.resolve({
-        ok: body !== undefined,
-        status: body !== undefined ? 200 : 404,
+        ok: status < 400,
+        status: status,
         text: () => Promise.resolve(JSON.stringify(payload))
     });
 };
@@ -713,6 +787,75 @@ const ready = window.document.readyState === 'loading'
     check(/Trade routes/.test(planner.textContent)
           && planner.querySelector('tr.sel') && /Oil/.test(planner.querySelector('tr.sel').textContent),
           'and the preview marks it as the chosen route');
+
+    console.log('\nmission automation');
+
+    check(/auto · blocked/.test($('[data-ship="Wingman"]').textContent),
+          'a craft with a rule is badged in the fleet list with what the loop is doing');
+
+    const autoStatus = () => $('#sv-mission [data-auto-status]');
+    check(/Not automated/.test(autoStatus().textContent), 'Ore Hound starts with no rule');
+
+    click(planner.querySelector('[data-auto-act="new"]'));
+    await settle(50);
+
+    const flightsField = planner.querySelector('[data-auto-limit="maxFlights"]');
+    check(flightsField && flightsField.value === '3',
+          'a new trade rule starts at the three flights a customer always waits for');
+
+    const ambush = planner.querySelector('[data-auto-limit="maxAttackChance"]');
+    ambush.value = '8';
+    ambush.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    posts.length = 0;
+    click(planner.querySelector('[data-auto-act="test"]'));
+    await settle(400);
+
+    const tested = posts.filter((p) => /automation\/evaluate$/.test(p.path)).pop();
+    check(tested && tested.body.limits.maxAttackChance === 0.08 && tested.body.limits.maxFlights === 3,
+          'testing sends the limits in the API\'s units');
+    const testRows = $$('#sv-mission .auto-editor ~ .card tbody tr');
+    check(testRows.length === 2 && /chosen/.test(testRows[0].textContent)
+          && /ambush chance 9% is above 8%/.test(testRows[1].textContent),
+          'and shows each option with why it would or would not go');
+
+    posts.length = 0;
+    click(planner.querySelector('[data-auto-act="save"]'));
+    await settle(400);
+
+    const saved = posts.filter((p) => p.path === '/ships/Ore%20Hound/mission/automation').pop();
+    check(saved && saved.body.mission === 'trade' && saved.body.enabled === true
+          && saved.body.ifRevision === 0,
+          'saving a new rule switches it on, guarded by revision');
+    check(saved && saved.body.config.goodName === undefined && saved.body.config.deposit === undefined,
+          'without the planner\'s route and deposit, which the automation picks each time');
+    check(saved && saved.body.escorts.indexOf('Wingman') !== -1 && saved.body.area.mode === 'ship',
+          'with the planner\'s escorts, following the ship');
+    check(!planner.querySelector('.auto-editor'), 'the editor closes');
+    check(/send out automatically/.test(autoStatus().textContent)
+          && planner.querySelector('[data-auto-toggle]').checked,
+          'and the rule shows with its switch on');
+    check(/auto · waiting/.test($('[data-ship="Ore Hound"]').textContent),
+          'the fleet list picks it up at once');
+
+    // Another member saves in the meantime: the switch must not overwrite their change.
+    automationStore['player/Ore Hound'].rule.revision = 7;
+
+    posts.length = 0;
+    const toggle = planner.querySelector('[data-auto-toggle]');
+    toggle.checked = false;
+    toggle.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+
+    const toggled = posts.filter((p) => p.path === '/ships/Ore%20Hound/mission/automation').pop();
+    check(toggled && toggled.body.enabled === false && toggled.body.ifRevision === 1,
+          'switching off sends only the switch and the revision it last saw');
+    check(automationStore['player/Ore Hound'].rule.enabled === true,
+          'a rule changed elsewhere is not overwritten');
+
+    await settle(300);
+    check(planner.querySelector('[data-auto-toggle]').checked === true,
+          'and the console reloads it rather than showing the switch it failed to flip');
 
     console.log('\nexplanations behind a mark');
 

@@ -542,3 +542,16 @@ marker#ia-bad path { fill: #8a3a3a; }
 .hops { font-size: 12px; overflow-wrap: anywhere; line-height: 1.7; margin-top: 4px; }
 .hops .active { color: var(--text); }
 .hops .dim { color: var(--text-mute); }
+
+/* Mission automation. The decision log reuses .log-line, which leaves a column for the
+   ship name the dock shows; a rule's log is about one craft, so that column goes. */
+.auto-head { gap: 10px; }
+.auto-message { color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.auto-log summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); }
+.auto-log[open] summary { margin-bottom: 6px; }
+.auto-log .log-line { grid-template-columns: 90px 80px 1fr; padding: 2px 0; }
+.auto-log .log-line .dim { color: var(--text-mute); }
+.auto-limits { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 12px; }
+.auto-limit { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.auto-limit input { width: 100%; min-width: 0; }
+.auto-limit .row { flex-wrap: nowrap; }

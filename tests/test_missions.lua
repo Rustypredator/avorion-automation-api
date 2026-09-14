@@ -300,6 +300,11 @@ for _, c in ipairs(Mock.simulationCalls) do
 end
 check(commandCall ~= nil and commandCall.args[1] == "Prospector",
       "startCommand was issued for the right ship")
+-- The job crosses to the agent as JSON, which turns every table key into a string, and
+-- MineCommand indexes its material selection by number. Selected "0" is selected nothing.
+check(commandCall ~= nil and commandCall.args[3].collected[0] == true
+      and commandCall.args[3].collected["0"] == nil,
+      "the material selection reaches startCommand keyed by number")
 
 -- startCommand reports failure only by chat message, so the mod must verify afterwards
 Mock.addShip(1, "Stubborn", {x = 0, y = 0, refuseStart = true,

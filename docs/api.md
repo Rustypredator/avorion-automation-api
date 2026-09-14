@@ -270,6 +270,185 @@ command's own finalisation.
 
 Collects waiting yields into the owner's account. Returns `collected` and `remaining`.
 
+## Mission automation
+
+A rule per craft that has the mod send it back out on a captain mission whenever it is free,
+as long as the mission stays inside the rule's limits. The loop runs in the galaxy bridge -
+no client has to stay connected - and every start it makes is the ordinary start: the same
+assessment preview runs, then the same agent handshake.
+
+- **Rules are stored per owning faction**, as Server values, so they survive restarts. An
+  alliance craft's rule is one document: every member reads the same rule and the same live
+  state, and a member with `ManageShips` can change it.
+- **A start still needs someone in game**: the owner for their own craft, any alliance member
+  for alliance craft. Until then the rule waits in phase `offline`.
+- **Alliance starts run under the rank of the member who last saved the rule.** Demote them
+  and the rule stops (`blocked`) until someone with `ManageShips` saves it again. A trade
+  deposit also needs `SpendResources`.
+- **Automatable missions**: mine, salvage, trade, expedition, scout, refine, sell, procure,
+  maintenance. Travel ends elsewhere and supply never finishes, so neither can be repeated.
+
+Each check runs one area analysis and predicts every config worth trying against it:
+
+| mission | what is searched |
+|---|---|
+| mine, salvage | every half hour of duration the captain allows |
+| expedition | 30, 60, 90 and 120 minutes |
+| trade | every route in the area, at every flight count from the fewest the cargo bay allows, each with the smallest deposit that achieves it |
+| others | the config as given |
+
+Options that break a limit - or that the game itself would refuse - are dropped, and the best
+of the rest by the rule's `objective` is started. Ties go to the lower ambush chance. At most
+one check runs per pass, and never on the last free analysis slot.
+
+### Trade and the impatient customer
+
+The captain's warnings are about flights, not time. A contract always gets three flights;
+after that, each flight ends it early with a 35% chance (`TradeCommand:update`), paying for
+the flights flown plus the deposit back. So `maxFlights` is the patience limit, and the
+figures account for it: `completionChance` is 0.65^(flights - 3), `expectedFlights` and
+`value` are what the contract is expected to deliver before the customer walks.
+
+A bigger deposit means fewer flights, but past a richness-scaled threshold it also stretches
+the attack window from one hour towards three. `maxFlights` and `maxAttackChance` therefore
+pull against each other, and the trade search exists to find the deposit that satisfies both.
+
+### The rule
+
+```json
+{
+  "mission": "trade",
+  "enabled": true,
+  "objective": "hourly",
+  "area": {"mode": "ship", "size": {"x": 17, "y": 17}, "placement": {"fx": 0.5, "fy": 0.5}},
+  "limits": {
+    "maxAttackChance": 0.1,
+    "maxFlights": 3,
+    "maxDeposit": 2000000,
+    "minCreditsLeft": 5000000
+  },
+  "config": {},
+  "materials": ["Iron", "Titanium"],
+  "escorts": ["Wingman"],
+  "collectYields": true
+}
+```
+
+| field | |
+|---|---|
+| `objective` | `hourly` (value per hour away), `total` (biggest value), `safest` (lowest ambush chance) |
+| `area.mode` | `ship` recentres on the craft at every check, at `size` (default: the first the captain allows) with the craft at `placement` (fractions of each side, default the centre); `fixed` takes `lower` and `upper` |
+| `config`, `materials`, `escorts` | as for a start. A searched field (a duration, a trade route and deposit) is chosen by the check, not taken from here |
+| `collectYields` | collect waiting yields before each check |
+
+Every limit is optional. Units are the same for every mission:
+
+| limit | unit | |
+|---|---|---|
+| `maxAttackChance` | fraction, 0-1 | the order window's attack chance |
+| `maxDuration`, `minDuration` | seconds | time away; for trade, the whole contract |
+| `maxFlights` | flights | trade only: the customer's patience |
+| `maxDeposit` | credits | trade deposit, procure budget, maintenance price |
+| `minCreditsLeft` | credits | the owner's account after paying the deposit |
+| `minValue` | credits or resource units | the expected yield: trade and sell in credits, mine, salvage and refine in resources |
+
+### GET /automation/missions
+
+Every rule the caller can see with its live state. `?owner=player|alliance` narrows it; the
+default is both.
+
+```json
+{
+  "serverTime": 18234.5,
+  "automations": [{"ship": "Prospector", "owner": {"kind": "player"}, "rule": {}, "state": {}}],
+  "supported": ["expedition", "maintenance", "mine", "procure", "refine", "salvage", "scout", "sell", "trade"],
+  "limits": ["maxAttackChance", "maxDeposit", "maxDuration", "maxFlights", "minCreditsLeft", "minDuration", "minValue"]
+}
+```
+
+Timestamps in `state` are server runtime seconds, like `serverTime`, so compare them with it
+rather than with a wall clock. `state` is `null` until the loop has looked at the rule, and
+starts empty after a server restart.
+
+```json
+{
+  "phase": "blocked",
+  "message": "Nothing within the limits: ambush chance 14% is above 10%",
+  "since": 18100.2, "nextCheckAt": 18400.2, "busy": false,
+  "dispatches": 6,
+  "lastDispatch": {"at": 16020.0, "mission": "trade", "summary": "trade, Oil, 3 flights, 1.0h, ambush 8%, ~412000 ¢/h", "candidate": {}},
+  "lastEvaluation": {"at": 18100.2, "tried": 9, "passing": 0, "chosen": null, "candidates": []},
+  "lastCollect": {"at": 18099.0, "collected": 3},
+  "log": [{"at": 18100.2, "phase": "blocked", "message": "...", "detail": null}]
+}
+```
+
+| phase | |
+|---|---|
+| `waiting` | will be checked on a coming pass |
+| `evaluating` | an analysis is running for it |
+| `starting` | the start job is with the owner's agent |
+| `running` | out on a mission the automation sent it on |
+| `busy` | out on a mission started some other way |
+| `blocked` | nothing passes the limits, the ship is unusable, or the rule's author lost their rank - retried after `Config.missionAutomationRetry` (300s) |
+| `offline` | nobody who could start it is in game |
+| `missing` | the owner no longer has a craft by that name |
+| `error` | the check or start failed; `message` says how |
+| `disabled` | switched off |
+
+### GET /ships/{name}/mission/automation
+
+One craft's rule and state, in the shape of an `automations` entry. `rule` and `state` are
+`null` when it has none.
+
+### POST /ships/{name}/mission/automation
+
+Creates or updates the rule. Fields left out keep their stored values, so `{"enabled": false}`
+is the whole of switching a craft off. `limits`, when given, replaces the stored limits.
+
+Pass `ifRevision` - the `rule.revision` you last read, `0` for a new rule - and a save that
+would overwrite someone else's change is refused with `409 rule_changed`, the current revision
+and rule in `details`. Alliance craft need `ManageShips` (`403 missing_privilege`). An
+unknown limit or material is `400 bad_rule`; a mission that cannot be automated is
+`422 not_automatable`.
+
+### POST /ships/{name}/mission/automation/delete
+
+Removes the rule. `{"deleted": true}` if there was one.
+
+### POST /ships/{name}/mission/automation/evaluate
+
+A dry run of one check - the analysis and every option, ranked, with the reason each would or
+would not go - and nothing started. The body is merged over the stored rule without saving
+it, so limits can be tried before they are committed; `{}` checks the stored rule as is.
+Works with the owner offline.
+
+```json
+{
+  "wouldStart": true,
+  "evaluation": {
+    "objective": "hourly", "tried": 6, "passing": 2,
+    "area": {"lower": {"x": -324, "y": 311}, "upper": {"x": -308, "y": 327}},
+    "chosen": {"passes": true},
+    "candidates": [{
+      "passes": true,
+      "config": {"goodName": "Oil", "deposit": 34304, "escorts": []},
+      "route": {"good": "Oil", "from": {"x": -310, "y": 318}, "to": {"x": -300, "y": 322}},
+      "metrics": {
+        "attackChance": 0.07, "duration": 3600, "flights": 3, "expectedFlights": 3,
+        "completionChance": 1, "patience": "safe", "cost": 34304,
+        "value": 53760, "valueUnit": "credits", "hourly": 53760
+      },
+      "violations": []
+    }]
+  },
+  "assessment": ["We do not have to fly often. ..."]
+}
+```
+
+`patience` follows the captain's wording thresholds: `safe` up to 3 flights, `small risk` to
+5, `real risk` to 10, `likely lost` beyond.
+
 ## POST /ships/{name}/travel
 
 An alias of `POST /ships/{name}/missions/travel/start`, kept for existing callers. It takes

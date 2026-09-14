@@ -97,6 +97,35 @@ Config.orderConfirmWindow = 3
 Config.shipEventsPerShip = 200
 Config.maxShipEventsPerRead = 200
 
+-- #### MISSION AUTOMATION #### --
+
+-- How often the automation looks over its rules, in seconds. A look is cheap - a few
+-- availability reads per rule - and nothing happens to an idle ship until one runs, so this
+-- is the longest a ship back from a mission waits before being sent out again.
+Config.missionAutomationInterval = 10
+
+-- How long a ship waits before trying again after a check found nothing inside its limits,
+-- or the game refused the start. Most of what blocks a dispatch - the ambush chance, the
+-- money on hand, a trade route the last contract depleted - changes over minutes, not
+-- seconds, and every retry spends one of the server's area analyses.
+Config.missionAutomationRetry = 300
+
+-- The same, for a ship that could not be looked at at all: owner offline, ship busy, an
+-- analysis slot not free. Nothing about the rule failed, so it is checked again soon.
+Config.missionAutomationRecheck = 30
+
+-- Recent decisions kept per rule, for the console to show why a ship did or did not go.
+Config.missionAutomationLogSize = 20
+
+-- Candidates reported back per evaluation. All are checked; only the best are listed.
+Config.missionAutomationReportedCandidates = 8
+
+-- Server value keys the rules are stored under, one per owning faction. On the Server
+-- rather than the faction so the galaxy script reads them without touching a Player or
+-- Alliance object, and so every member of an alliance reads the same copy.
+Config.missionAutomationValuePrefix = "automationapi_missionauto_"
+Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
+
 -- Default and maximum page sizes for list endpoints.
 Config.defaultPageSize = 100
 Config.maxPageSize = 1000
