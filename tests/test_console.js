@@ -943,7 +943,7 @@ const ready = window.document.readyState === 'loading'
           'and so is its death, with the pause it starts');
     check(/boss cooldown/.test(travel().textContent) && /not jumping/.test(travel().textContent),
           'the travel tab counts the cooldown down');
-    check(/2 cargo/.test(travel().textContent) && /transporter software/.test(travel().textContent),
+    check(/2 cargo/.test(travel().textContent) && /transporter block/.test(travel().textContent),
           'and says why cargo was left behind');
 
     liveEvents.events.push(farmEvent(8, { phase: 'running', fights: 1, bossKills: 1, lastKill: swoks }));

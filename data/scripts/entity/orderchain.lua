@@ -142,15 +142,26 @@ local function automationApiFindBoss()
     return nil
 end
 
--- Whether fighters of this ship may pick up cargo drops. The engine gates that on one stat,
--- which Transporter Software of rare or better adds when permanently installed (and the
--- behemoth script adds outright) - see systems/transportersoftware.lua.
+-- Whether fighters of this ship may pick up cargo drops. That takes two things, both checked
+-- in the engine with the boss lab (lib/automationapi/devsetup.lua): the FighterCargoPickup
+-- stat, which Transporter Software of rare or better adds when permanently installed (see
+-- systems/transportersoftware.lua), and a transporter block. Either one alone and the
+-- fighters leave every cargo drop where it is.
+--
+-- Loot:isCollectable does not answer this: it is true for cargo on any ship with hold space,
+-- fighters able to carry it or not. And every ship has a Transporter component, block or
+-- not, so the block is counted in the plan.
 local function automationApiCargoPickup(ship)
-    local ok, value = pcall(function()
+    local okStat, value = pcall(function()
         return ship:getBoostedValue(StatsBonuses.FighterCargoPickup, 0)
     end)
+    if not okStat or (tonumber(value) or 0) <= 0 then return false end
 
-    return ok and (tonumber(value) or 0) > 0
+    local okBlocks, blocks = pcall(function()
+        return Plan(ship):getNumBlocks(BlockType.Transporter)
+    end)
+
+    return okBlocks and (tonumber(blocks) or 0) > 0
 end
 
 -- Loot in the sector this ship is allowed to pick up, split the way fighters see it: cargo
@@ -233,9 +244,10 @@ local function automationApiDescribePlan(plan)
         boss = plan.boss,
         bossPresent = plan.bossHere and {name = plan.bossHere.name, title = plan.bossHere.title}
                       or nil,
-        bossKills = plan.bossKills or 0,
+        -- nil on routes, which have no bosses to count or loot to collect
+        bossKills = plan.bossKills,
         lastKill = plan.lastKill,
-        collectLoot = plan.collectLoot == true,
+        collectLoot = plan.collectLoot,
         loot = plan.loot,
         lootResult = plan.lootResult,
         cooldown = (plan.cooldownLeft or 0) > 0

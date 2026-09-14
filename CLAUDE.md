@@ -57,7 +57,8 @@ data/scripts/                   everything the game loads
     routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates
     routeplanner.lua  own weighted A* with preferences, boss-farm loop picker
     sectors.lua       known sectors + seed-based prediction (SectorSpecifics)
-    devsetup.lua      NOT loaded; console helper to spawn a test ship
+    devsetup.lua      NOT loaded; console helpers: spawn a test ship, spawnBoss, bossLab
+                      (boss + loot + carrier in a sector, prints engine answers)
     handlers/         one module per endpoint group, each exposes .register(router)
       meta.lua              GET /ping
       ships.lua             /ships, /ships/{name}, /ships/{name}/events
@@ -72,9 +73,10 @@ docs/
   api.md        every endpoint + response shapes, incl. bridge-local /history/*
   protocol.md   file transport, envelopes, status codes, auth, root resolution
   external.md   how to write a bridge/client; reference Python bridge
+  local-testing.md  local server, bridge over HTTPS (self-signed), boss lab + findings
 docker/                         deployment only, NOT shipped to Workshop
   docker-compose.yml            services: api (FrankenPHP bridge), db (Postgres), poller, init
-  Caddyfile, .env.example
+  Caddyfile, .env.example       plain HTTP site + self-signed HTTPS site (TLS_HOSTS)
   bridge/public/index.php       HTTP <-> file relay, serves /history/*, records history
   bridge/src/db.php             PDO connection + schema/migrations
   bridge/src/history.php        history store: visits, events, station/faction samples, manifests
@@ -98,6 +100,8 @@ tools/
   e2e.sh        docker stack + fakeserver end-to-end
   dbtest.sh     throwaway Postgres + test_history.php
   uitest.sh     node image + jsdom + test_console.js
+  localserver.sh  headless AvorionServer on the test galaxy, console via FIFO
+                  (start/stop/cmd/run/lab/key/log); paths in gitignored tools/local.env
 ```
 
 ## Request lifecycle (the important part)
@@ -169,7 +173,13 @@ for t in tests/test_*.lua; do lua5.4 "$t" || echo "FAILED: $t"; done
 tools/dbtest.sh    # PHP history store (needs docker)
 tools/uitest.sh    # web console under jsdom (needs docker)
 tools/e2e.sh       # full docker stack against fakeserver (needs docker + lua)
+tools/localserver.sh start   # real game server on the test galaxy, see docs/local-testing.md
 ```
+
+Against the real engine: `tools/localserver.sh lab <step>` drives the boss lab. `/run` lines
+must be one short line (the console strips `;` and truncates, and can wedge); put anything
+bigger in `devsetup.lua`. Running e2e while the local stack is up: set
+`COMPOSE_PROJECT_NAME=something-else`, or its `down -v` removes the stack's volumes.
 
 Lua tests must run from the repo root. They set `package.path` to
 `data/scripts/lib/?.lua;tests/?.lua` and `dofile` the real `bridge.lua`.

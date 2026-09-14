@@ -26,6 +26,13 @@ services:
     environment:
       # Defaults to plain HTTP on :80. A hostname here turns on automatic HTTPS.
       API_DOMAIN: "${API_DOMAIN:-:80}"
+      # Names and addresses served over HTTPS with a self-signed certificate, on
+      # HTTPS_PORT. The console needs HTTPS for browser notifications unless it is opened
+      # on localhost - see the Caddyfile and docs/local-testing.md.
+      TLS_HOSTS: "${TLS_HOSTS:-localhost}"
+      # The certificate presented to a client that names no host, which is any browser
+      # opening an IP address. Set it to that IP (which must also be in TLS_HOSTS).
+      TLS_DEFAULT_SNI: "${TLS_DEFAULT_SNI:-localhost}"
       GALAXY_DIR: /galaxy
       # Which origins a browser page may call the API from. "*" is the default and is
       # safe here - the key is a header, never a cookie, so a browser sends no

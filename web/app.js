@@ -624,8 +624,9 @@
       + 'minutes have passed. Then it calls the fighters back and waits for them to land '
       + 'before it jumps.</p>'
       + '<p>Money, resources, turrets and subsystems are picked up by any fighter. '
-      + '<b>Cargo</b> drops only count when the ship has Transporter Software of rare or '
-      + 'better installed permanently; without it they are left.</p>',
+      + '<b>Cargo</b> drops only count when the ship has a transporter block <b>and</b> '
+      + 'Transporter Software of rare or better installed permanently; with either alone '
+      + 'the fighters leave cargo where it is, so the ship does not wait for it.</p>',
 
     'nav-defence':
       'While the ship has no orders and a captain, enemies in its sector make it fight until '
@@ -3750,7 +3751,7 @@
       lootText += ' · ' + num(loot.instant) + ' drops';
       if (loot.cargo) {
         lootText += ', ' + num(loot.cargo) + ' cargo'
-          + (loot.cargoPickup ? '' : ' <span class="mute2">(fighters need transporter software, rare or better, for cargo)</span>');
+          + (loot.cargoPickup ? '' : ' <span class="mute2">(fighters need a transporter block and transporter software, rare or better, for cargo)</span>');
       }
       if (plan.phase === 'looting' || plan.phase === 'returning') {
         lootText += ' · ' + num(loot.deployed) + ' of ' + num(loot.fighters) + ' fighters out';

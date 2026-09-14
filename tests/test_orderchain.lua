@@ -52,6 +52,7 @@ local function newWorld()
         bosses = {},    -- {script, title, args} of boss entities in the sector
         loot = {},      -- {cargo = bool, collectable = bool}
         cargoPickup = 0,
+        transporterBlocks = 0,
         squads = {0, 1},
         squadFighters = {[0] = 3, [1] = 2},
         deployed = 0,
@@ -65,6 +66,16 @@ _G.EntityType = {Loot = 8}
 _G.ComponentType = {CargoLoot = 71}
 _G.FighterOrders = {Return = 3, CollectLoot = 9}
 _G.StatsBonuses = {FighterCargoPickup = 48}
+_G.BlockType = {Transporter = 55}
+_G.Plan = function()
+    return
+    {
+        getNumBlocks = function(_, blockType)
+            assert(blockType == BlockType.Transporter, "unexpected block type")
+            return world.transporterBlocks
+        end,
+    }
+end
 _G.Uuid = function() return "uuid" end
 
 _G.checkEntityInteractionPermissions = function()
@@ -590,8 +601,20 @@ world.cargoPickup = 1
 world.loot = {{cargo = true}}
 world.aiState = "Idle"
 tick()
+check(state().plan.phase == "cooldown" and state().plan.loot.cargoPickup == false,
+      "transporter software without a transporter block does not make cargo worth a trip")
+
+farmAt290()
+world.bosses = {SWOKS}
+jumpTo(293, 2)
+world.bosses = {}
+world.cargoPickup = 1
+world.transporterBlocks = 1
+world.loot = {{cargo = true}}
+world.aiState = "Idle"
+tick()
 check(state().plan.phase == "looting" and state().plan.loot.cargoPickup == true,
-      "with transporter software, cargo is worth sending fighters for")
+      "with the software and a transporter block, cargo is worth sending fighters for")
 tick(21)
 tick()
 check(state().plan.phase == "cooldown" and state().plan.lootResult == "no_launch",

@@ -242,6 +242,12 @@ directory.
 Then open `http://<your-api-host>/console/` and paste an API key. The address field is
 already filled in with the page's own origin, so there is nothing else to set.
 
+The console's browser notifications (a boss spawning, a cooldown ending) need a secure context:
+HTTPS, or the page opened on `localhost`. The stack also serves HTTPS with a self-signed
+certificate for the names in `TLS_HOSTS` - trust Caddy's local CA once and open
+`https://<name>/console/` instead. [docs/local-testing.md](docs/local-testing.md#the-bridge-over-https)
+has the steps.
+
 You can also just open `web/index.html` off disk, but then the page and the API are
 different origins and the browser has to be let through. The bridge sends the CORS
 headers for that by default (`CORS_ORIGIN` in `.env` narrows or disables them), which
@@ -380,6 +386,7 @@ bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 | [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape |
 | [docs/protocol.md](docs/protocol.md) | the file transport, envelopes, status codes, auth |
 | [docs/external.md](docs/external.md) | writing the bridge process and clients against it |
+| [docs/local-testing.md](docs/local-testing.md) | a local server, the bridge over HTTPS, and the boss lab |
 
 ## Architecture
 
@@ -442,6 +449,11 @@ tools/uitest.sh
 It pins the parts of the console that are decided rather than displayed - which subtabs a
 craft is offered, whether the live event feed and the bridge's copy of it merge or double,
 and which end of the ship log the newest entry is at. All three are silent when they break.
+
+Against the real game, `tools/localserver.sh` runs a headless dedicated server on a test galaxy
+and drives its console, and the boss lab in `devsetup.lua` checks the engine calls the farm
+makes - see [docs/local-testing.md](docs/local-testing.md). Your paths go in the gitignored
+`tools/local.env`.
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather
 than a convenient version of it, so bugs that would otherwise only show up in game fail in

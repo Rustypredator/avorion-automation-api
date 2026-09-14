@@ -706,9 +706,11 @@ What the ship does about it, on its own:
   counts in `plan.bossKills` and starts `plan.cooldown`.
 - **Looting** (`collectLoot`): once the sector is clear, if there is loot the ship may take
   and it has fighters, the chain is cleared and every squad is ordered to collect loot. Cargo
-  drops only count when the ship's fighters can pick cargo up (the `FighterCargoPickup` stat,
-  from Transporter Software of rare or better); money, resources, turrets and subsystems always
-  count. It ends when none is left, nothing was picked up for 45 s, no fighter launched within
+  drops only count when the ship's fighters can pick cargo up, which takes both a transporter
+  block and the `FighterCargoPickup` stat from Transporter Software of rare or better (either
+  alone and fighters leave cargo alone - verified in the engine); money, resources, turrets and
+  subsystems always count. Drops the ship has no room for (`Loot:isCollectable`), such as
+  torpedoes without torpedo storage, never count. It ends when none is left, nothing was picked up for 45 s, no fighter launched within
   20 s, or after 5 minutes. The fighters are then recalled and the ship waits up to 90 s for
   them to land before anything else, since a jump leaves them behind; stragglers after that are
   pulled in with `Hangar.collectAllFighters`.
@@ -761,7 +763,7 @@ What the ship's automation is doing, as the ship itself last reported it.
 | `plan.phase` | `running`, `fighting` or `holding`; farms also `looting`, `returning` (waiting for fighters to land) and `cooldown`. `plan` is absent when there is none |
 | `plan.bossPresent` | farms: `{name, title}` of the boss in the sector, absent when there is none |
 | `plan.cooldown` | farms: `{left, total}` seconds while a kill's cooldown runs. Republished once a minute, so count down from when it arrived |
-| `plan.loot` | farms: the last loot count - `instant` (any fighter), `cargo` (needs `cargoPickup`), `fighters`, `deployed` |
+| `plan.loot` | farms: the last loot count - `instant` (any fighter), `cargo` (needs `cargoPickup`: transporter block and software), `fighters`, `deployed` |
 | `plan.lootResult` | farms: how the last looting ended - `collected`, `stalled`, `timeout`, `no_launch`, `no_fighters`; `_recalled` appended when stragglers had to be pulled in |
 | `plan.hop` | the hop being flown, 1-based, counting the approach |
 | `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
