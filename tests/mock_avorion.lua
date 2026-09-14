@@ -86,7 +86,17 @@ function M.install()
 
     function server:setValue(key, value) serverValues[key] = value end
     function server:getValue(key) return serverValues[key] end
-    function server:isOnline(index) return players[index] ~= nil and players[index].online end
+    function server:isOnline(index)
+        if players[index] then return players[index].online end
+
+        -- an alliance counts as online while any member is
+        local alliance = M.alliances[index]
+        for _, member in ipairs(alliance and {alliance:getMembers()} or {}) do
+            if players[member] and players[member].online then return true end
+        end
+
+        return false
+    end
 
     _G.Server = function() return server end
 
@@ -99,6 +109,11 @@ function M.install()
 
         return p
     end
+
+    _G.Alliance = function()
+        return M.inAllianceAgent and M.alliances[M.inAllianceAgent] or nil
+    end
+    _G.isAllianceScript = function() return M.inAllianceAgent ~= nil end
 
     _G.GameVersion = function() return "2.5.13" end
 
@@ -855,50 +870,7 @@ function M.addPlayer(index, name)
                   .. "not from the galaxy bridge (" .. functionName .. ")", 0)
         end
 
-        local args = {...}
-        M.simulationCalls[#M.simulationCalls + 1] = {fn = functionName, args = args}
-
-        -- The game insists on a two-step handshake: startCommand refuses unless the
-        -- simulation is already holding an analysis it ran itself for that exact
-        -- mission type, and it announces the refusal only by chat message. The delay
-        -- is what forces the agent to retry rather than start in one pass.
-        if functionName == "startAreaAnalysis" then
-            local ship = M.getShip(self.index, args[1])
-            if ship then
-                ship.analyzedType = nil
-                ship.analysisReadyAt = clock + M.analysisDelay
-                ship.analysisPendingType = args[2]
-            end
-
-        elseif functionName == "startCommand" then
-            local ship = M.getShip(self.index, args[1])
-
-            if ship and ship.analysisReadyAt and clock >= ship.analysisReadyAt then
-                ship.analyzedType = ship.analysisPendingType
-                ship.analysisReadyAt = nil
-            end
-
-            if ship and not ship.refuseStart and ship.analyzedType == args[2] then
-                ship.availability = ShipAvailability.InBackground
-            end
-
-        elseif functionName == "recall" or functionName == "forceRecall" then
-            local ship = M.getShip(self.index, args[1])
-            if ship and (functionName == "forceRecall" or not ship.refuseRecall) then
-                ship.availability = ShipAvailability.Available
-            end
-
-        elseif functionName == "takeYield" then
-            local ship = M.getShip(self.index, args[1])
-            if ship then ship.yields = 0 end
-        end
-
-        if functionName == "getNumYields" then
-            local ship = M.getShip(self.index, args[1])
-            return 0, (ship and ship.yields) or 0
-        end
-
-        return M.invokeResult or 0, M.invokeReturns and M.invokeReturns[functionName] or nil
+        return M.simulate(self, functionName, ...)
     end
 
     -- Where the player is standing. canReceivePlayerOrder() lets a captainless craft take
@@ -912,6 +884,54 @@ function M.addPlayer(index, name)
     players[index] = p
 
     return p
+end
+
+-- The Simulation script on a player or alliance, reached through invokeFunction.
+function M.simulate(self, functionName, ...)
+    local args = {...}
+    M.simulationCalls[#M.simulationCalls + 1] = {fn = functionName, args = args}
+
+    -- The game insists on a two-step handshake: startCommand refuses unless the
+    -- simulation is already holding an analysis it ran itself for that exact
+    -- mission type, and it announces the refusal only by chat message. The delay
+    -- is what forces the agent to retry rather than start in one pass.
+    if functionName == "startAreaAnalysis" then
+        local ship = M.getShip(self.index, args[1])
+        if ship then
+            ship.analyzedType = nil
+            ship.analysisReadyAt = clock + M.analysisDelay
+            ship.analysisPendingType = args[2]
+        end
+
+    elseif functionName == "startCommand" then
+        local ship = M.getShip(self.index, args[1])
+
+        if ship and ship.analysisReadyAt and clock >= ship.analysisReadyAt then
+            ship.analyzedType = ship.analysisPendingType
+            ship.analysisReadyAt = nil
+        end
+
+        if ship and not ship.refuseStart and ship.analyzedType == args[2] then
+            ship.availability = ShipAvailability.InBackground
+        end
+
+    elseif functionName == "recall" or functionName == "forceRecall" then
+        local ship = M.getShip(self.index, args[1])
+        if ship and (functionName == "forceRecall" or not ship.refuseRecall) then
+            ship.availability = ShipAvailability.Available
+        end
+
+    elseif functionName == "takeYield" then
+        local ship = M.getShip(self.index, args[1])
+        if ship then ship.yields = 0 end
+    end
+
+    if functionName == "getNumYields" then
+        local ship = M.getShip(self.index, args[1])
+        return 0, (ship and ship.yields) or 0
+    end
+
+    return M.invokeResult or 0, M.invokeReturns and M.invokeReturns[functionName] or nil
 end
 
 -- `members` is every player index in the alliance; `memberIndex` is the one whose
@@ -929,6 +949,14 @@ function M.addAlliance(index, name, memberIndex, privileges, members)
 
     function a:getMembers()
         return table.unpack(roster)
+    end
+
+    -- An alliance's scripts run on the alliance's own thread. From anywhere else - a
+    -- player script included - the real engine refuses the call with result code 7.
+    function a:invokeFunction(script, functionName, ...)
+        if M.inAllianceAgent ~= self.index then return 7 end
+
+        return M.simulate(self, functionName, ...)
     end
 
     addCraftApi(a)
@@ -958,6 +986,15 @@ function M.asPlayerAgent(index, fn)
     if not ok then error(err, 0) end
 end
 
+-- Runs fn in the context of the agent attached to an alliance: that alliance's Simulation
+-- is reachable, Alliance() resolves to it and Player() to nobody.
+function M.asAllianceAgent(index, fn)
+    M.inAllianceAgent = index
+    local ok, err = pcall(fn)
+    M.inAllianceAgent = nil
+    if not ok then error(err, 0) end
+end
+
 function M.setOffline(index) if players[index] then players[index].online = false end end
 function M.setOnline(index) if players[index] then players[index].online = true end end
 
@@ -974,6 +1011,7 @@ function M.reset()
     players = {}
     ships = {}
     M.alliances = {}
+    M.inAllianceAgent = nil
     M.asyncQueue = {}
     M.simulationCalls = {}
     M.known = {}

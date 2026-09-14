@@ -467,15 +467,14 @@ local JOB_TIMEOUT = 12
 
 Missions.uptime = 0
 
--- Called by the bridge on behalf of the player agent. Returns a JSON string rather than
--- a table: tables are known to cross Player->Simulation safely because vanilla does it,
--- but nothing proves it for the galaxy boundary, and after the segfault above this code
--- does not assume. Strings are proven.
-function Missions.takeJobs(playerIndex)
+-- Returns a JSON string rather than a table: tables are known to cross Player->Simulation
+-- safely because vanilla does it, but nothing proves it for the galaxy boundary, and after
+-- the segfault above this code does not assume. Strings are proven.
+local function claimJobs(wanted)
     local claimed = {}
 
     for _, job in ipairs(pendingJobs) do
-        if job.playerIndex == playerIndex and not job.claimed then
+        if not job.claimed and wanted(job) then
             job.claimed = true
 
             claimed[#claimed + 1] =
@@ -483,6 +482,8 @@ function Missions.takeJobs(playerIndex)
                 id = job.id,
                 kind = job.kind,
                 ownerKind = job.owner.kind,
+                -- who asked; the alliance agent checks their privileges, see agent.lua
+                playerIndex = job.playerIndex,
                 shipName = job.shipName,
                 missionType = job.missionType,
                 area = job.area,
@@ -502,6 +503,31 @@ function Missions.takeJobs(playerIndex)
     return Json.encode(Json.array(claimed))
 end
 
+-- An alliance's Simulation runs on the alliance's own script thread, and a player script
+-- calling Alliance:invokeFunction is refused with an undocumented result code 7 - every
+-- call, nothing reaches simulation.lua. So simulation work on alliance craft goes to the
+-- agent attached to the alliance itself, and the player agent only gets the rest.
+--
+-- In-sector orders stay with the player agent whoever owns the ship: they go through
+-- invokeEntityFunction, which never touches the alliance's scripts.
+local function forAllianceAgent(job)
+    return job.owner.kind == "alliance" and job.kind ~= "orders"
+end
+
+-- Called by the bridge on behalf of a player agent.
+function Missions.takeJobs(playerIndex)
+    return claimJobs(function(job)
+        return job.playerIndex == playerIndex and not forAllianceAgent(job)
+    end)
+end
+
+-- Called by the bridge on behalf of the agent attached to an alliance.
+function Missions.takeAllianceJobs(allianceIndex)
+    return claimJobs(function(job)
+        return forAllianceAgent(job) and job.owner.index == allianceIndex
+    end)
+end
+
 -- Called by the bridge when the agent reports back. Each result resolves one request.
 function Missions.report(payload)
     local ok, results = pcall(Json.decode, payload)
@@ -511,6 +537,15 @@ function Missions.report(payload)
         for index, job in ipairs(pendingJobs) do
             if job.id == result.id then
                 table.remove(pendingJobs, index)
+
+                if result.code == "missing_privilege" then
+                    job.complete(403, {error =
+                    {
+                        code = result.code,
+                        message = "Your alliance rank does not allow managing alliance ships.",
+                    }})
+                    break
+                end
 
                 if result.ok == false and job.kind ~= "start" then
                     job.complete(502, {error =
@@ -560,8 +595,11 @@ function Missions.tick(elapsed)
             job.complete(409, {error =
             {
                 code = "agent_unavailable",
-                message = "The owner's player agent did not pick the request up. The "
-                          .. "owning player has to be logged in.",
+                message = job.owner.kind == "alliance"
+                          and "The alliance's agent did not pick the request up. An "
+                              .. "alliance member has to be logged in."
+                          or "The owner's player agent did not pick the request up. The "
+                             .. "owning player has to be logged in.",
             }})
         end
     end

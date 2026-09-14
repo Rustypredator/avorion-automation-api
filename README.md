@@ -388,10 +388,11 @@ already forwards. Its state is saved with the chain's own, so no script is added
 Everything else is pure Lua under `data/scripts/lib/automationapi/`: the JSON codec, router,
 auth, serializers, the route planner and the per-endpoint handlers.
 
-Both vanilla overlays exist only to add one `addScriptOnce` line each:
-`data/scripts/galaxy/init.lua` attaches the bridge, `data/scripts/player/init.lua` attaches
-the agent. The third vanilla path, `data/scripts/entity/orderchain.lua`, is appended the same
-way and wraps `updateServer`, `getOrderInfo`, `secure` and `restore`. All three need
+The init overlays exist only to add one `addScriptOnce` line each:
+`data/scripts/galaxy/init.lua` attaches the bridge, `data/scripts/player/init.lua` and
+`data/scripts/alliance/init.lua` attach the agent. The last vanilla path,
+`data/scripts/entity/orderchain.lua`, is appended the same way and wraps `updateServer`,
+`getOrderInfo`, `secure` and `restore`. All four need
 re-checking against the game's copies after an Avorion update - and a mod that replaces
 `orderchain.lua` outright instead of extending it switches the automation off, which
 `GET /ships/{name}/automation` shows as `reported: false`.

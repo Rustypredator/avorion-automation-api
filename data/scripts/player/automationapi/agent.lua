@@ -9,6 +9,12 @@
 --
 -- So the bridge parks jobs and this agent, running in the right context, executes them
 -- and reports back. Both directions of that handshake are proven in game.
+--
+-- The same script is also attached to every Alliance (data/scripts/alliance/init.lua).
+-- An alliance's Simulation runs on the alliance's own script thread, and a player script
+-- calling Alliance:invokeFunction gets result code 7 back for every call - vanilla only
+-- ever reaches it from the client. Attached to the alliance, this agent is on that thread
+-- and claims the alliance's simulation jobs; attached to a player, it claims the rest.
 
 package.path = package.path .. ";data/scripts/lib/?.lua"
 
@@ -39,6 +45,10 @@ local START_MAX_ATTEMPTS = 5
 
 local running = {}
 
+local function onAlliance()
+    return isAllianceScript ~= nil and isAllianceScript() == true
+end
+
 local function logError(format, ...)
     printlog("AutomationAPI agent: " .. format, ...)
 end
@@ -58,6 +68,8 @@ local function callSimulation(owner, functionName, ...)
 end
 
 local function ownerOf(job)
+    if onAlliance() then return Alliance() end
+
     if job.ownerKind == "alliance" then
         local alliance = Player().alliance
         if not alliance then return nil end
@@ -217,10 +229,29 @@ local function stepStart(owner, job, state)
     return nil
 end
 
+-- Simulation checks ManageShips itself, but only against callingPlayer, and a call made
+-- on the alliance's own thread has none - so without this any member could dispatch or
+-- recall alliance craft through the API. Reading status needs no privilege in vanilla.
+local function mayManage(owner, job)
+    if not owner.isAlliance or job.kind == "status" or job.kind == "orders" then
+        return true
+    end
+
+    local ok, allowed = pcall(function()
+        return owner:hasPrivilege(job.playerIndex, AlliancePrivilege.ManageShips)
+    end)
+
+    return ok and allowed == true
+end
+
 -- #### LOOP #### --
 
 local function claimJobs()
     local ok, status, payload = pcall(function()
+        if onAlliance() then
+            return Galaxy():invokeFunction(BRIDGE_SCRIPT, "takeAllianceJobs", Alliance().index)
+        end
+
         return Galaxy():invokeFunction(BRIDGE_SCRIPT, "takeJobs", Player().index)
     end)
 
@@ -362,6 +393,13 @@ local function registerEventCallbacks()
 end
 
 function AutomationApiAgent.initialize()
+    -- Alliance craft events are registered by each online member's player agent, which
+    -- also keeps them tied to someone being online; this copy only runs jobs.
+    if onAlliance() then
+        printlog("AutomationAPI agent: attached to alliance %s", tostring(Alliance().index))
+        return
+    end
+
     printlog("AutomationAPI agent: attached to player %s", tostring(Player().index))
 
     local ok, err = pcall(registerEventCallbacks)
@@ -375,7 +413,7 @@ function AutomationApiAgent.update(timeStep)
     sinceLastPoll = 0
 
     sinceAllianceCheck = sinceAllianceCheck + elapsed
-    if sinceAllianceCheck >= ALLIANCE_RECHECK_INTERVAL then
+    if sinceAllianceCheck >= ALLIANCE_RECHECK_INTERVAL and not onAlliance() then
         sinceAllianceCheck = 0
 
         local synced, syncErr = pcall(syncAllianceCallbacks)
@@ -394,6 +432,9 @@ function AutomationApiAgent.update(timeStep)
                 results[#results + 1] = {id = job.id, ok = false, started = false,
                                          code = "no_alliance",
                                          message = "You are not in an alliance."}
+            elseif not mayManage(owner, job) then
+                results[#results + 1] = {id = job.id, ok = false, started = false,
+                                         code = "missing_privilege"}
             elseif job.kind == "start" then
                 running[#running + 1] =
                 {

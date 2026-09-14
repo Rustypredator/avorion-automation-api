@@ -576,6 +576,19 @@ function AutomationApiBridge.takeJobs(playerIndex)
     return payload
 end
 
+-- The same, for the agent attached to an alliance: an alliance's Simulation can only be
+-- reached from the alliance's own script thread. See Missions.takeAllianceJobs.
+function AutomationApiBridge.takeAllianceJobs(allianceIndex)
+    local ok, payload = pcall(MissionsHandler.takeAllianceJobs, allianceIndex)
+
+    if not ok then
+        logError("takeAllianceJobs failed for %s: %s", tostring(allianceIndex), tostring(payload))
+        return ""
+    end
+
+    return payload
+end
+
 function AutomationApiBridge.reportJobs(payload)
     local ok, err = pcall(MissionsHandler.report, payload)
 

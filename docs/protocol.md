@@ -196,13 +196,18 @@ Two scripts, and the split is forced by the engine rather than chosen:
   lets every read work with nobody logged in.
 - `data/scripts/player/automationapi/agent.lua` is attached to each Player by a one-line
   overlay of `data/scripts/player/init.lua`. Everything that writes goes through it.
+  The same script is attached to each Alliance by an overlay of
+  `data/scripts/alliance/init.lua`: an alliance's Simulation runs on the alliance's own
+  thread, and a player script calling `Alliance:invokeFunction` gets result code 7 back for
+  every call. That copy claims the alliance's mission jobs and checks the caller's
+  `ManageShips` privilege itself, since Simulation only checks it against `callingPlayer`.
 
 A galaxy script calling `Player:invokeFunction` segfaults the server outright - no error, no
 return code, the process dies - so the bridge parks writes as jobs and the agent, which runs
 in the one context where the call is legal, executes them and reports back. Nothing but
 plain JSON crosses between the two.
 
-Both overlays are copies of the vanilla files with a single `addScriptOnce` line added. They
+The init overlays are copies of the vanilla files with a single `addScriptOnce` line added. They
 are the only vanilla files this mod replaces, and they need re-checking against the game's
 copies after an Avorion update.
 

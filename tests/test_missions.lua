@@ -314,6 +314,61 @@ check(status == 422 and refused.started == false,
       "a silently refused start is detected and reported")
 check(refused.error.code == "start_rejected", "with a specific code")
 
+-- #### ALLIANCE START #### --
+
+print("\nalliance start")
+
+-- An alliance's Simulation lives on the alliance's own thread: a player script calling it
+-- gets result code 7 for everything. So the same agent script is attached to the alliance
+-- too - its own instance, as the engine gives every attached script its own state - and
+-- the bridge hands alliance simulation jobs to that one only.
+dofile("data/scripts/player/automationapi/agent.lua")
+local AllianceAgent = AutomationApiAgent
+
+local privileges = {[AlliancePrivilege.ManageShips] = true}
+Mock.addAlliance(77, "Rusty Industries", 1, privileges)
+Mock.addShip(77, "Alliance Miner", {x = 0, y = 0,
+                                    captain = {name = "Vex", level = 3, tier = 3, primaryClass = 4}})
+
+local function allianceTick(seconds)
+    Mock.advanceClock(seconds)
+    Mock.asPlayerAgent(1, function() Agent.update(seconds) end)
+    Mock.asAllianceAgent(77, function() AllianceAgent.update(seconds) end)
+    Bridge.update(seconds)
+end
+
+Mock.simulationCalls = {}
+local read = send("POST", "/ships/Alliance Miner/missions/mine/start", {}, {owner = "alliance"})
+Mock.flushAsync()
+Bridge.update(Config.pollInterval)
+
+-- the player agent alone must leave it alone: from there every call would come back 7
+tick(0.3)
+check(#Mock.simulationCalls == 0, "the player agent does not claim alliance simulation jobs")
+
+for _ = 1, 6 do allianceTick(0.6) end
+
+local status, allianceStarted = read()
+check(status == 200 and allianceStarted.started == true,
+      "the alliance's own agent starts the mission (got " .. tostring(status) .. ")")
+check(Mock.simulationCalls[1] and Mock.simulationCalls[1].fn == "startAreaAnalysis",
+      "and ran the analysis on the alliance's simulation")
+
+local read = send("GET", "/ships/Alliance Miner/mission", nil, {owner = "alliance"})
+for _ = 1, 2 do allianceTick(0.3) end
+local status = read()
+check(status == 200, "status of an alliance mission is readable (got " .. tostring(status) .. ")")
+
+-- Simulation only checks ManageShips against callingPlayer, which a call on the alliance's
+-- own thread does not have, so the agent checks it on the caller's behalf.
+privileges[AlliancePrivilege.ManageShips] = false
+local read = send("POST", "/ships/Alliance Miner/mission/recall", {}, {owner = "alliance"})
+for _ = 1, 2 do allianceTick(0.3) end
+local status, denied = read()
+check(status == 403 and denied.error.code == "missing_privilege",
+      "a member without ManageShips cannot recall alliance craft (got " .. tostring(status) .. ")")
+privileges[AlliancePrivilege.ManageShips] = true
+
 -- #### OFFLINE #### --
 
 print("\noffline owner")
