@@ -436,6 +436,13 @@
       + 'bay fits. Total profit is the contract&rsquo;s upper bound: each flight pays out '
       + '90&ndash;100% of its figure.',
 
+    'trade-capital':
+      'The down payment the captain buys the goods with &mdash; the order window&rsquo;s '
+      + 'slider. It runs from a tenth of the carriable goods to all of them, at the purchase '
+      + 'price before perks, and the captain returns whatever is not spent. A smaller budget '
+      + 'buys less per flight, so the contract takes more flights; a bigger one raises the '
+      + 'attack chance, since the cargo is worth more.',
+
     'orders-unconfirmed':
       'Not proof of failure: a one-shot order that finishes instantly can land and clear '
       + 'again inside the window. The event log below shows what actually happened.',
@@ -1176,6 +1183,7 @@
     S.mission = null;
     S.catalog = null;
     S.missionForm = null;
+    if (changed) { GalaxyMap.setArea(null); }
     S.nav.result = null;
     S.nav.farm = null;
     S.nav.automation = null;
@@ -1899,12 +1907,7 @@
       ['uncollected yields', num(m.yields)]
     ])));
 
-    if (m.areaStats) {
-      cards.push(meterCard('Area', kv(Object.keys(m.areaStats).map(function (k) {
-        return [esc(k), typeof m.areaStats[k] === 'object'
-          ? esc(JSON.stringify(m.areaStats[k])) : num(m.areaStats[k])];
-      }))));
-    }
+    if (m.areaStats) { cards.push(areaCard(m.areaStats, m.areaStats.area)); }
     if (prediction.attackChance) {
       cards.push(meterCard('Risk',
         '<div class="mute2">attack chance</div>'
@@ -1994,10 +1997,14 @@
       left.push('<div class="mute2">size ' + area.size.x + '×' + area.size.y + '</div>');
     }
 
-    left.push('<div class="mute2" data-area style="margin-top:6px">'
+    left.push('<div class="row tight" style="margin-top:6px">'
+      + '<span class="mute2" data-area>'
       + area.lower.x + ':' + area.lower.y + ' → ' + area.upper.x + ':' + area.upper.y
-      + ' (inclusive)</div>');
+      + ' (inclusive)</span>'
+      + '<button class="ghost small" data-act="area-map-form">show on map</button></div>');
     left.push('</div>');
+
+    if (form.mission === 'trade') { left.push(renderCapital(form)); }
 
     /* --- configurable ------------------------------------------------- */
     var fields = Object.keys(entry.configurable || {});
@@ -2276,9 +2283,29 @@
     var rows = rankedScan(scan);
     scan.rows = rows;
 
+    // Once a row is in the form the table has done its job; it folds down to what was
+    // taken from it, and opens again for another pick.
+    if (scan.collapsed && !scan.running) {
+      var used = scan.used;
+      return '<div class="card" style="margin-bottom:12px">'
+        + '<div class="row" style="justify-content:space-between">'
+        + '<h3 style="margin-bottom:0">Placement scan <span class="mute2">'
+        + rows.length + ' route' + (rows.length === 1 ? '' : 's') + ' around ' + coords(scan.from)
+        + '</span></h3>'
+        + '<button class="ghost small" data-act="scan-open">change</button></div>'
+        + (used
+            ? '<div class="mute2" style="margin-top:4px">using <b>' + esc(used.good) + '</b>, ship at the '
+              + esc(used.placement) + ' of ' + used.size.x + '×' + used.size.y + '</div>'
+            : '')
+        + '</div>';
+    }
+
     var head = '<div class="row" style="justify-content:space-between">'
       + '<h3>Placement scan <span class="mute2">around ' + coords(scan.from) + '</span></h3>'
-      + '<div class="row tight"><span class="mute2">rank by</span>'
+      + '<div class="row tight">'
+      + (scan.used && !scan.running
+          ? '<button class="ghost small" data-act="scan-close">collapse</button>' : '')
+      + '<span class="mute2">rank by</span>'
       + Object.keys(SCAN_RANKS).map(function (key) {
           return '<button class="chip' + (scan.rank === key ? ' on' : '') + '" data-scan-rank="'
             + key + '">' + SCAN_RANKS[key].label + '</button>';
@@ -2351,6 +2378,8 @@
     form.config.goodName = route.good;
     form.config.deposit = route.deposit;
     form.config.maxDeposit = route.deposit;
+    form.route = route;
+    form.routesOpen = false;
     runPreview();
   }
 
@@ -2367,13 +2396,84 @@
     form.config.goodName = row.route.good;
     form.config.deposit = row.route.deposit;
     form.config.maxDeposit = row.route.deposit;
+    form.route = row.route;
+    form.routesOpen = false;
+    form.scan.collapsed = true;
+    form.scan.used = { good: row.route.good, placement: row.placement.label, size: row.size };
     form.preview = null;
     runPreview();
   }
 
+  /* The route the form is set up to fly, as the last preview (or the scan) described it. */
+  function chosenRoute(form) {
+    var route = form.route;
+    return route && !route.error && route.good === form.config.goodName ? route : null;
+  }
+
+  /* The order window's down payment slider. It counts units of the good, from a tenth of
+     what the ship can carry to all of it, each at the pre-perk purchase price; the route's
+     deposit is the top of that range, so the price and the range both come back out of it. */
+  function depositRange(route) {
+    var unitPrice = Math.ceil(route.price * (1 + route.lowest));
+    var max = Math.round(route.deposit / unitPrice);
+    return { unitPrice: unitPrice, min: Math.max(1, Math.floor(max * 0.1)), max: max };
+  }
+
+  function capitalText(units, range) {
+    return credits(units * range.unitPrice) + ' <span class="mute2">' + num(units) + ' u</span>';
+  }
+
+  function capitalStale(form) {
+    var accepted = form.preview && form.preview.config;
+    return !!(accepted && accepted.deposit !== form.config.deposit);
+  }
+
+  function renderCapital(form) {
+    var head = '<div class="card"><h3>Starting capital ' + explain('trade-capital') + '</h3>';
+    var route = chosenRoute(form);
+    if (!route) {
+      return head + '<div class="mute2">Pick a trade route first.</div></div>';
+    }
+
+    var range = depositRange(route);
+    var units = Math.round((form.config.deposit || route.deposit) / range.unitPrice);
+    units = Math.max(range.min, Math.min(range.max, units));
+
+    return head
+      + '<div class="row" style="justify-content:space-between">'
+      + '<span class="mute2">' + esc(route.good) + ' at ' + credits(range.unitPrice) + ' / u</span>'
+      + '<span data-capital>' + capitalText(units, range) + '</span></div>'
+      + '<input type="range" data-capital-range min="' + range.min + '" max="' + range.max
+      + '" step="1" value="' + units + '"' + (range.min === range.max ? ' disabled' : '') + '>'
+      + '<div class="mute2" style="font-size:11px">' + num(range.min) + ' – ' + num(range.max)
+      + ' units</div>'
+      + '<div class="note warn" data-capital-stale' + (capitalStale(form) ? '' : ' hidden')
+      + '>Preview again to update the prediction.</div>'
+      + '</div>';
+  }
+
   function renderRoutes(p) {
+    var form = S.missionForm || {};
     var goodName = p.config && p.config.goodName;
-    return '<div class="card" style="margin-top:10px"><h3>Trade routes ' + explain('trade-routes') + '</h3>'
+    var chosen = p.routes.filter(function (r) { return r.good === goodName && !r.error; })[0];
+
+    if (chosen && !form.routesOpen) {
+      return '<div class="card"><div class="row" style="justify-content:space-between">'
+        + '<h3 style="margin-bottom:0">Trade routes <span class="mute2">' + p.routes.length
+        + ' in this area</span></h3>'
+        + '<button class="ghost small" data-act="routes-open">change</button></div>'
+        + '<div class="row tight" style="margin-top:4px"><b>' + esc(chosen.good) + '</b>'
+        + '<span class="mute2">' + marginText(chosen.margin) + ' · '
+        + credits(chosen.contractProfit && chosen.contractProfit.to) + ' total · '
+        + num(chosen.flights && chosen.flights.to) + ' flights · '
+        + coords(chosen.from) + ' → ' + coords(chosen.to) + '</span></div>'
+        + '</div>';
+    }
+
+    return '<div class="card"><div class="row" style="justify-content:space-between">'
+      + '<h3>Trade routes ' + explain('trade-routes') + '</h3>'
+      + (chosen ? '<button class="ghost small" data-act="routes-close">collapse</button>' : '')
+      + '</div>'
       + (p.routes.length ? '<div class="scan-table"><table><thead><tr>'
         + '<th>good</th><th class="num">margin</th><th class="num">total profit</th>'
         + '<th class="num">flights</th><th class="num">deposit</th><th></th>'
@@ -2396,6 +2496,89 @@
         + '</tbody></table></div>'
         : '<div class="note">No routes in this area.</div>')
       + '</div>';
+  }
+
+  /* What the game's predictable values are called when they carry no displayName of
+     their own, and how each is written. Yields and attack chance have cards of their own;
+     the route is the Trade routes card. */
+  var PREDICTION_SKIP = { yields: true, attackChance: true, error: true, errorArgs: true, route: true };
+  var PREDICTION_LABELS = {
+    transportedPerFlight: 'Goods / Flight',
+    freeCargoSpace: 'Free Cargo Space',
+    attackLocation: 'Attack Location'
+  };
+  var PREDICTION_FORMATS = {
+    flightTime: function (v) { return esc(duration(v)); },
+    profitPerFlight: credits
+  };
+
+  /* Predictions arrive as the game builds them: {displayName, value}, or {displayName,
+     from, to} for a range. */
+  function predictionRows(prediction) {
+    return Object.keys(prediction).filter(function (k) { return !PREDICTION_SKIP[k]; }).map(function (k) {
+      var v = prediction[k];
+      var format = PREDICTION_FORMATS[k] || function (n) { return num(n); };
+      var label = PREDICTION_LABELS[k] || k;
+      var text;
+
+      if (v && typeof v === 'object') {
+        if (v.displayName) { label = v.displayName; }
+        if (v.value !== undefined) { text = format(v.value); }
+        else if (v.from !== undefined && v.to !== undefined) {
+          text = v.from === v.to ? format(v.to) : format(v.from) + ' – ' + format(v.to);
+        } else if (v.x !== undefined && v.y !== undefined) { text = esc(coords(v)); }
+        else { text = esc(JSON.stringify(v)); }
+      } else if (typeof v === 'number') {
+        text = format(v);
+      } else {
+        text = esc(String(v));
+      }
+
+      return [esc(label), text];
+    });
+  }
+
+  /* SimulationUtility.getAreaStats: sector counts, and the share of the reachable ones by
+     who controls them, in whole percent. */
+  var AREA_STATS = [
+    ['numSectors', 'sectors', function (v) { return num(v); }],
+    ['unreachableSectors', 'unreachable', function (v) { return num(v); }],
+    ['noMansSectors', 'no man&rsquo;s space', function (v) { return num(v) + '%'; }],
+    ['outerSectors', 'faction outskirts', function (v) { return num(v) + '%'; }],
+    ['centralSectors', 'faction core', function (v) { return num(v) + '%'; }]
+  ];
+
+  function areaCard(stats, bounds) {
+    var rows = [];
+    if (bounds && bounds.lower && bounds.upper) {
+      rows.push(['bounds', coords(bounds.lower) + ' → ' + coords(bounds.upper)]);
+      if (bounds.origin) { rows.push(['origin', coords(bounds.origin)]); }
+    }
+
+    var known = { area: true };
+    AREA_STATS.forEach(function (spec) {
+      known[spec[0]] = true;
+      if (stats[spec[0]] != null) { rows.push([spec[1], spec[2](stats[spec[0]])]); }
+    });
+    Object.keys(stats).forEach(function (k) {
+      if (known[k]) { return; }
+      var v = stats[k];
+      rows.push([esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : num(v)]);
+    });
+
+    var button = bounds && bounds.lower && bounds.upper
+      ? '<button class="ghost small card-link" data-area-map="' + [bounds.lower.x, bounds.lower.y,
+          bounds.upper.x, bounds.upper.y].join(',') + '">show on map</button>'
+      : '';
+
+    return meterCard('Area' + button, kv(rows));
+  }
+
+  function showAreaOnMap(area) {
+    GalaxyMap.setArea({ lower: area.lower, upper: area.upper, label: S.selected });
+    showView('map');
+    // after showView's own resize, once the canvas has a size to fit into
+    setTimeout(function () { GalaxyMap.resize(); GalaxyMap.fitArea(area); }, 0);
   }
 
   function renderPreview(p) {
@@ -2437,22 +2620,10 @@
         + '<div>' + pct(prediction.attackChance.value) + '</div>'));
     }
 
-    var extra = Object.keys(prediction).filter(function (k) {
-      return k !== 'yields' && k !== 'attackChance' && k !== 'error' && k !== 'errorArgs';
-    });
-    if (extra.length) {
-      cards.push(meterCard('Prediction', kv(extra.map(function (k) {
-        var v = prediction[k];
-        return [esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : esc(String(v))];
-      }))));
-    }
+    var extra = predictionRows(prediction);
+    if (extra.length) { cards.push(meterCard('Prediction', kv(extra))); }
 
-    if (p.area && p.area.stats) {
-      cards.push(meterCard('Area', kv(Object.keys(p.area.stats).map(function (k) {
-        var v = p.area.stats[k];
-        return [esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : num(v)];
-      }))));
-    }
+    if (p.area && p.area.stats) { cards.push(areaCard(p.area.stats, p.area)); }
 
     if (p.config) {
       cards.push(meterCard('Config as accepted', kv(Object.keys(p.config).map(function (k) {
@@ -2492,6 +2663,10 @@
       if (S.selected !== name || S.missionForm !== form) { return; }
       form.running = false;
       form.preview = body;
+      // fresher figures for the chosen route, for the capital slider
+      (body.routes || []).forEach(function (r) {
+        if (r.good === form.config.goodName && !r.error) { form.route = r; }
+      });
       renderMission();
     }).catch(function (error) {
       if (S.missionForm !== form) { return; }
@@ -5559,6 +5734,11 @@
       }
 
       if (button.dataset.route) { useRoute(button.dataset.route); return; }
+      if (button.dataset.areaMap) {
+        var b = button.dataset.areaMap.split(',').map(Number);
+        showAreaOnMap({ lower: { x: b[0], y: b[1] }, upper: { x: b[2], y: b[3] } });
+        return;
+      }
       if (button.dataset.scanUse) { useScanRow(Number(button.dataset.scanUse)); return; }
       if (button.dataset.scanRank) {
         S.missionForm.scan.rank = button.dataset.scanRank;
@@ -5576,6 +5756,13 @@
       }
       else if (act === 'scan') { runScan(); }
       else if (act === 'scan-stop') { stopScan(); }
+      else if (act === 'scan-open' || act === 'scan-close') {
+        S.missionForm.scan.collapsed = act === 'scan-close';
+        renderMission();
+      } else if (act === 'routes-open' || act === 'routes-close') {
+        S.missionForm.routesOpen = act === 'routes-open';
+        renderMission();
+      } else if (act === 'area-map-form') { showAreaOnMap(formArea()); }
       else if (act === 'preview') { runPreview(button); }
       else if (act === 'start') { runStart(button); }
       else if (act === 'collect' || act === 'recall' || act === 'recall-force') {
@@ -5605,6 +5792,17 @@
           ? node.checked : Number(node.value);
         var slider = $('[data-config-range="' + node.dataset.config + '"]', $('#sv-mission'));
         if (slider && node.type !== 'range') { slider.value = node.value; }
+      } else if (node.dataset.capitalRange !== undefined) {
+        var route = chosenRoute(form);
+        if (!route) { return; }
+        var range = depositRange(route);
+        var units = Number(node.value);
+        form.config.deposit = units * range.unitPrice;
+        form.config.maxDeposit = range.max * range.unitPrice;
+        var label = $('#sv-mission [data-capital]');
+        if (label) { label.innerHTML = capitalText(units, range); }
+        var stale = $('#sv-mission [data-capital-stale]');
+        if (stale) { stale.hidden = !capitalStale(form); }
       } else if (node.dataset.configRange) {
         form.config[node.dataset.configRange] = Number(node.value);
         var box = $('[data-config="' + node.dataset.configRange + '"]', $('#sv-mission'));

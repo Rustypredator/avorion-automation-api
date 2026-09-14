@@ -17,6 +17,7 @@
     ships: [],         // GET /ships
     route: null,       // GET /galaxy/route
     hits: [],          // GET /map/search
+    area: null,        // {lower, upper, label}: a mission area, inclusive
     heat: null,        // GET /history/heatmap
     tracks: [],        // GET /history/visits, grouped per craft
     selected: null,    // {x, y}
@@ -188,6 +189,18 @@
     setShips: function (list) { Map2.ships = list || []; Map2.draw(); },
     setRoute: function (route) { Map2.route = route; Map2.draw(); },
     setHits: function (list) { Map2.hits = list || []; Map2.draw(); },
+    setArea: function (area) { Map2.area = area || null; Map2.draw(); },
+
+    /* Frames an inclusive sector rectangle with room around it to see what borders it. */
+    fitArea: function (area) {
+      var sz = Map2.size();
+      if (!sz.w || !sz.h) { return; }
+      var w = area.upper.x - area.lower.x + 1, h = area.upper.y - area.lower.y + 1;
+      Map2.scale = clamp(Math.min(sz.w / (w * 2.2), sz.h / (h * 2.2)), 0.12, 40);
+      Map2.originX = -((area.lower.x + area.upper.x) / 2) * Map2.scale;
+      Map2.originY = ((area.lower.y + area.upper.y) / 2) * Map2.scale;
+      Map2.draw();
+    },
 
     setHeat: function (heat) {
       Map2.heat = heat || null;
@@ -347,6 +360,7 @@
 
       drawRings(ctx);
       if (Map2.show.heat) { drawHeat(ctx); }
+      drawArea(ctx);
       drawSectors(ctx);
       if (Map2.show.tracks) { drawTracks(ctx); }
       drawHits(ctx);
@@ -556,6 +570,30 @@
       ctx.beginPath();
       ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
       ctx.stroke();
+    }
+  }
+
+  /* Sectors are points, so the rectangle runs half a sector outside the outermost ones
+     rather than straight through them. */
+  function drawArea(ctx) {
+    var area = Map2.area;
+    if (!area) { return; }
+
+    var a = Map2.toScreen(area.lower.x - 0.5, area.upper.y + 0.5);
+    var b = Map2.toScreen(area.upper.x + 0.5, area.lower.y - 0.5);
+
+    ctx.fillStyle = 'rgba(169,124,240,.10)';
+    ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.strokeStyle = 'rgba(169,124,240,.9)';
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.setLineDash([]);
+
+    if (area.label) {
+      ctx.fillStyle = 'rgba(169,124,240,.95)';
+      ctx.font = '10px ui-monospace, monospace';
+      ctx.fillText(area.label, a.x + 2, a.y - 5);
     }
   }
 
