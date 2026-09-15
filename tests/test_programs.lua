@@ -463,6 +463,58 @@ courier.x, courier.y = 60, 0
 run(2)
 check(stateOf("Courier").step == 2, "and ends once the craft is back, at the other end")
 
+-- #### TRANSFER STEPS #### --
+
+print("\ntransfer steps")
+
+check(raises(function() Rules.normalize({steps = {{action = {type = "transfer", all = true}}}}) end, "bad_program"),
+      "a transfer step names its target")
+check(raises(function() Rules.normalize({steps = {{action = {type = "transfer", target = "Depot"}}}}) end, "bad_program"),
+      "and its goods")
+local normalized = Rules.normalize({steps = {{action = {type = "transfer", target = "Depot", direction = "take",
+                                                        goods = {{name = "Iron", amount = 50}}}}}})
+check(normalized.steps[1].action.direction == "take" and normalized.steps[1].action.approach == true
+      and normalized.steps[1].action.goods[1].amount == 50 and #normalized.steps[1]["until"].conditions == 0,
+      "and ends by itself, so it needs no condition")
+
+Mock.addShip(1, "Unloader", {x = 0, y = 0, range = 5, captain = captain, cargoCapacity = 100, cargoFree = 10})
+Mock.addShip(1, "Depot", {x = 0, y = 0, type = EntityType.Station, cargoCapacity = 5000, cargoFree = 5000})
+
+Mock.entityCalls = {}
+status = call("POST", "/ships/Unloader/program", {name = "Unload", steps =
+{
+    {action = {type = "transfer", target = "Depot", goods = {{name = "Iron"}}}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+check(status == 200, "(saved)")
+run(6)
+state = stateOf("Unloader")
+check(called("automationApiTransfer") == 1 and state.step == 2,
+      "a transfer in reach is over when the ship reports it (" .. tostring(state.message) .. ")")
+
+Mock.transferApproach = true
+Mock.entityCalls = {}
+call("POST", "/ships/Unloader/program", {steps =
+{
+    {action = {type = "transfer", target = "Depot", all = true}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+run(6)
+state = stateOf("Unloader")
+check(state.step == 1 and state.status == "running" and state.message:find("docking", 1, true) ~= nil,
+      "one out of reach waits while the ship docks (" .. tostring(state.message) .. ")")
+
+local unloader = Mock.getShip(1, "Unloader")
+local current = unloader.automation.transfer
+unloader.automation.transfer = nil
+unloader.automation.lastTransfer = {id = current.id, outcome = "done", total = 90}
+unloader.chain = {}
+Bridge.pushShipEvent(1, "Unloader", "order", {chain = {}, activeIndex = 0, finished = false,
+                                              x = 0, y = 0, automation = Json.encode(unloader.automation)})
+run(2)
+check(stateOf("Unloader").step == 2, "and moves on once the ship reports the cargo moved")
+Mock.transferApproach = nil
+
 print("")
 if failures > 0 then print(failures .. " check(s) failed"); os.exit(1) end
 print("all checks passed")

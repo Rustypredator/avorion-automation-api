@@ -183,6 +183,12 @@ underneath, turning that lifetime total into credits an hour and a bar per hour 
 the factory in the middle, results and waste on the right, one arrow each. Mission and
 Travel are not offered for a station: the game refuses both outright.
 
+The **Orders** tab moves cargo too: pick another craft of yours or your alliance in the same
+sector, see both holds, and tick the goods to give or take and how many - or all of it. A
+target out of reach is docked with or flown to first. Programs on the **Automation** tab have
+the same step, with goods picked from the hold as it is now or named for what it will hold
+when the step runs, so a craft can farm or mine, fly home and unload by itself.
+
 The **Mission** tab's **Automation** section turns whatever the planner below it holds into a
 rule: set a ceiling on the ambush chance, a duration window, how many trade flights the
 customer should have to sit through, a deposit cap or a credit reserve, and pick whether to
@@ -350,6 +356,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
 | `POST /ships/{name}/farm` | boss farming: loop through empty space in a boss ring |
 | `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, standing orders (fight enemies, collect loot), stop |
+| `GET`/`POST /ships/{name}/transfer` | cargo transfer: the holds a craft could trade with, and moving goods into or out of another craft of yours or your alliance |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
@@ -363,7 +370,7 @@ Full reference in [docs/api.md](docs/api.md).
 Every read works with nobody logged in, because the bridge runs on the Galaxy.
 
 Writes do not. Starting, recalling and collecting missions, travel, routes, farming,
-automation settings and in-sector orders all
+automation settings, cargo transfers and in-sector orders all
 answer `409 owner_offline` when the owning player is not in game. That is a vanilla
 limitation rather than a shortcut here: mission state lives in a player script, and captain
 missions do not tick for offline players in the base game.

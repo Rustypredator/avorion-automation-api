@@ -25,7 +25,7 @@ end
 -- #### ENGINE STAND-INS #### --
 
 _G.OrderType = {Jump = 1, Mine = 2, Salvage = 3, Loop = 4, Aggressive = 5, Patrol = 6,
-                FlyThroughWormhole = 11}
+                FlyThroughWormhole = 11, DockToStation = 19}
 _G.AlliancePrivilege = {ManageShips = 15}
 _G.onServer = function() return true end
 _G.onClient = function() return false end
@@ -35,6 +35,75 @@ _G.callable = function(namespace, name) callables[name] = namespace[name] end
 _G.callables = {}
 
 local world
+
+-- A craft with a cargo bay that behaves like the engine's: getCargos() hands out the goods
+-- as keys, removeCargo wants one of those, addCargo merges into a good of the same kind,
+-- and the free space follows what is in the hold.
+local function craft(spec)
+    local c =
+    {
+        name = spec.name, factionIndex = spec.faction or 1, index = spec.name,
+        capacity = spec.capacity or 1000, transporterRange = spec.transporter or 0,
+        isStation = spec.station == true, radius = 40,
+        id = {string = "id-" .. spec.name}, translationf = {name = spec.name},
+        hold = {},
+    }
+
+    for _, entry in ipairs(spec.goods or {}) do
+        c.hold[#c.hold + 1] = {good = entry[1], amount = entry[2]}
+    end
+
+    function c:getCargos()
+        local out = {}
+        for _, entry in ipairs(self.hold) do out[entry.good] = entry.amount end
+        return out
+    end
+
+    function c:removeCargo(good, amount)
+        for index, entry in ipairs(self.hold) do
+            if entry.good == good then
+                assert(entry.amount >= amount, "removed more than held")
+                entry.amount = entry.amount - amount
+                if entry.amount == 0 then table.remove(self.hold, index) end
+                return
+            end
+        end
+        error("removeCargo: not a good in this hold")
+    end
+
+    function c:addCargo(good, amount)
+        assert(self.freeCargoSpace >= good.size * amount, "added more than fits")
+        for _, entry in ipairs(self.hold) do
+            if entry.good.name == good.name and (entry.good.stolen == true) == (good.stolen == true) then
+                entry.amount = entry.amount + amount
+                return
+            end
+        end
+        self.hold[#self.hold + 1] = {good = good, amount = amount}
+    end
+
+    function c:held(name, stolen)
+        for _, entry in ipairs(self.hold) do
+            if entry.good.name == name and (stolen == nil or (entry.good.stolen == true) == stolen) then
+                return entry.amount
+            end
+        end
+        return 0
+    end
+
+    function c:getNearestDistance(other)
+        local d = world.distance[other.name] or world.distance[self.name]
+        return d or 0
+    end
+
+    return setmetatable(c, {__index = function(t, key)
+        if key == "freeCargoSpace" then
+            local used = 0
+            for _, entry in ipairs(rawget(t, "hold")) do used = used + entry.good.size * entry.amount end
+            return rawget(t, "capacity") - used
+        end
+    end})
+end
 
 local function newWorld()
     world =
@@ -58,7 +127,14 @@ local function newWorld()
         deployed = 0,
         squadOrders = {},
         collectedAll = false,
+        crafts = {},     -- other craft in the sector, see craft()
+        distance = {},   -- craft name -> nearest distance from the ship
+        players = {[1] = {allianceIndex = 9}},
+        flyTo = nil,     -- the last setFly: {target, distance}
+        flyCalls = 0,
+        dockDone = false,
     }
+    world.ship = craft({name = "Self", faction = 1, capacity = 100})
     _G.callingPlayer = nil
 end
 
@@ -83,17 +159,18 @@ _G.checkEntityInteractionPermissions = function()
 end
 
 _G.Entity = function()
-    return
-    {
-        getCaptain = function() return world.captain end,
-        getPilotIndices = function() return table.unpack(world.pilots) end,
-        isJumpRouteValid = function(_, ax, ay, bx, by) return true end,
-        getBoostedValue = function(_, stat, base)
-            assert(stat == StatsBonuses.FighterCargoPickup, "unexpected stat")
-            return base + world.cargoPickup
-        end,
-    }
+    local ship = world.ship
+    ship.getCaptain = function() return world.captain end
+    ship.getPilotIndices = function() return table.unpack(world.pilots) end
+    ship.isJumpRouteValid = function(_, ax, ay, bx, by) return true end
+    ship.getBoostedValue = function(_, stat, base)
+        assert(stat == StatsBonuses.FighterCargoPickup, "unexpected stat")
+        return base + world.cargoPickup
+    end
+    return ship
 end
+
+_G.Player = function(index) return world.players[index] end
 
 -- Script lookups match the way the engine does, on the tail of the path the script was
 -- added under, and hand back entities like the engine: several return values, or none.
@@ -112,6 +189,14 @@ _G.Sector = function()
                     }
                 end
             end
+            return table.unpack(found)
+        end,
+        getEntitiesByFaction = function(_, faction)
+            local found = {}
+            for _, other in ipairs(world.crafts) do
+                if other.factionIndex == faction then found[#found + 1] = other end
+            end
+            if world.ship.factionIndex == faction then found[#found + 1] = world.ship end
             return table.unpack(found)
         end,
         getEntitiesByType = function(_, entityType)
@@ -172,6 +257,10 @@ _G.ShipAI = function()
             return world.enemies
         end,
         setAggressive = function() world.aiState = "Aggressive" end,
+        setFly = function(_, target, distance)
+            world.flyTo = {target = target, distance = distance}
+            world.flyCalls = world.flyCalls + 1
+        end,
         setPassive = function() world.aiState = "Passive" end,
     }
 end
@@ -249,6 +338,8 @@ local function loadOrderChain()
             finished = world.aiState ~= "Aggressive"
         elseif current.action == OrderType.Loop then
             finished = true
+        elseif current.action == OrderType.DockToStation then
+            finished = world.dockDone
         end
 
         if finished then
@@ -1057,6 +1148,212 @@ tick()
 tick()
 check(actions() == "J5:0 J10:0" and OrderChain.activeOrder == 2,
       "which still gives the chain back afterwards")
+
+-- #### CARGO TRANSFER #### --
+
+local IRON = {name = "Iron", size = 1}
+local STOLEN_IRON = {name = "Iron", size = 1, stolen = true}
+local STEEL = {name = "Steel /* good */", size = 2}
+
+local function transfer(spec)
+    spec.id = spec.id or "t1"
+    spec.target = spec.target or {faction = 1, name = "Hub"}
+    OrderChain.automationApiTransfer(Json.encode(spec))
+end
+
+local function withHub(hub)
+    hub = hub or {}
+    hub.name = hub.name or "Hub"
+    hub.station = hub.station ~= false
+    local c = craft(hub)
+    world.crafts[#world.crafts + 1] = c
+    return c
+end
+
+print("\ncargo transfer in reach")
+
+newWorld()
+loadOrderChain()
+world.ship = craft({name = "Self", capacity = 200, goods = {{STOLEN_IRON, 20}, {IRON, 100}, {STEEL, 10}}})
+local hub = withHub({capacity = 1000})
+busyChain()
+local chainBefore = actions()
+
+transfer({goods = {{name = "Iron", amount = 110}}})
+local last = state().lastTransfer
+check(last and last.id == "t1" and last.outcome == "done" and last.total == 110,
+      "goods in reach are moved at once, and the ship says so")
+check(world.ship:held("Iron", false) == 0 and world.ship:held("Iron", true) == 10
+      and hub:held("Iron", false) == 100 and hub:held("Iron", true) == 10,
+      "clean goods go before stolen ones of the same name")
+check(#last.moved == 2 and last.moved[1].amount == 100 and last.moved[1].stolen == nil
+      and last.moved[2].amount == 10 and last.moved[2].stolen == true,
+      "and the report keeps the two apart")
+check(actions() == chainBefore and state().transfer == nil,
+      "nothing the ship was doing is touched")
+
+transfer({id = "t2", goods = {{name = "Steel"}}})
+check(state().lastTransfer.outcome == "done" and hub:held("Steel /* good */") == 10,
+      "a good is named without the engine's translator hint, and no amount takes all of it")
+
+transfer({id = "t3", goods = {{name = "Iron", stolen = false}}})
+check(state().lastTransfer.outcome == "nothing_moved" and state().lastTransfer.short[1].reason == "not_held",
+      "an entry that asks for clean goods leaves the stolen ones")
+
+transfer({id = "t4", goods = {{name = "Gold"}, {name = "Iron"}}})
+last = state().lastTransfer
+check(last.outcome == "partial" and last.short[1].name == "Gold" and last.short[1].reason == "not_held"
+      and hub:held("Iron", true) == 20,
+      "what the hold does not have is reported, and the rest still moves")
+
+print("\ncargo transfer, taking, limited by space")
+
+newWorld()
+loadOrderChain()
+world.ship = craft({name = "Self", capacity = 25, goods = {{IRON, 5}}})
+hub = withHub({goods = {{IRON, 50}, {STEEL, 30}}})
+
+transfer({direction = "take", all = true})
+last = state().lastTransfer
+check(last.outcome == "partial" and world.ship.freeCargoSpace == 0 and last.short[1].reason == "no_space",
+      "taking everything fills the hold and says the rest did not fit")
+check(world.ship:held("Iron") == 25 and hub:held("Iron") == 30 and hub:held("Steel /* good */") == 30,
+      "nothing is lost or made up between the two holds")
+
+transfer({id = "t2", direction = "take", goods = {{name = "Steel", amount = 3}}})
+check(state().lastTransfer.outcome == "nothing_moved" and state().lastTransfer.short[1].reason == "no_space",
+      "a good that does not fit at all moves nothing")
+
+print("\ncargo transfer, who with")
+
+newWorld()
+loadOrderChain()
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+withHub({name = "Stranger", faction = 2})
+withHub({name = "Depot", faction = 9})
+
+transfer({target = {faction = 1, name = "Nowhere"}, all = true})
+check(state().lastTransfer.outcome == "refused" and state().lastTransfer.reason == "target_not_here",
+      "a target not in the sector is refused")
+transfer({target = {faction = 2, name = "Stranger"}, all = true})
+check(state().lastTransfer.reason == "not_permitted", "another player's craft is refused")
+transfer({target = {faction = 1, name = "Self"}, all = true})
+check(state().lastTransfer.reason == "same_craft", "the ship itself is refused")
+transfer({target = {faction = 9, name = "Depot"}, all = true})
+check(state().lastTransfer.outcome == "done", "the owner's alliance's craft is allowed")
+
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+world.permitted = false
+_G.callingPlayer = 1
+transfer({target = {faction = 9, name = "Depot"}, all = true, id = "client"})
+check(state().lastTransfer.id ~= "client", "a client without ManageShips gets nowhere")
+_G.callingPlayer = nil
+world.permitted = true
+
+print("\ncargo transfer out of reach")
+
+newWorld()
+loadOrderChain()
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+hub = withHub()
+world.distance.Hub = 500
+
+transfer({all = true, approach = false})
+check(state().lastTransfer.reason == "out_of_range", "without approach, a target out of reach is refused")
+
+world.distance.Hub = 25
+hub.transporterRange = 30
+transfer({id = "t2", all = true, approach = false})
+check(state().lastTransfer.outcome == "done", "a transporter reaching further counts, as in vanilla")
+
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+hub.hold = {}
+world.distance.Hub = 500
+world.captain = nil
+transfer({id = "t3", all = true})
+check(state().lastTransfer.reason == "needs_captain", "approaching needs a captain")
+world.captain = {name = "Vel"}
+world.pilots = {1}
+transfer({id = "t4", all = true})
+check(state().lastTransfer.reason == "piloted", "and nobody at the controls")
+world.pilots = {}
+
+plan({id = "route", hops = {{x = 5, y = 0, kind = "jump"}}})
+transfer({id = "t5", all = true})
+check(state().transfer and state().transfer.phase == "docking" and actions() == "?",
+      "a station out of reach is docked with, with vanilla's dock order")
+check(OrderChain.chain[1].action == OrderType.DockToStation and OrderChain.chain[1].targetId == "id-Hub",
+      "naming the station")
+check(state().plan == nil and state().last.outcome == "replaced", "which ends the plan the ship was flying")
+
+tick()
+check(state().transfer and hub:held("Iron") == 0, "nothing moves while the ship is still out of reach")
+
+world.distance.Hub = 0
+tick()
+check(state().transfer == nil and state().lastTransfer.id == "t5" and state().lastTransfer.outcome == "done"
+      and state().lastTransfer.approached == true and hub:held("Iron") == 10,
+      "and once it is close, the cargo moves")
+
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+world.distance.Hub = 500
+transfer({id = "t6", all = true})
+world.dockDone = true
+tick()
+check(state().transfer == nil and state().lastTransfer.reason == "out_of_range",
+      "docking that ends out of reach is reported rather than waited on")
+world.dockDone = false
+
+print("\ncargo transfer flying alongside a ship")
+
+newWorld()
+loadOrderChain()
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+local freighter = withHub({name = "Freighter", station = false})
+world.distance.Freighter = 800
+
+transfer({target = {faction = 1, name = "Freighter"}, all = true})
+check(state().transfer.phase == "approaching" and #OrderChain.chain == 0, "a ship is flown to, not docked with")
+tick()
+check(world.flyCalls == 1 and world.flyTo.target == freighter.translationf and world.flyTo.distance == 80,
+      "right up to it")
+tick() tick() tick()
+check(world.flyCalls == 2, "renewing the course as the target moves")
+
+standing({enemies = {enabled = true, mode = "idle"}})
+world.enemies = true
+tick()
+check(state().reaction == nil and state().transfer ~= nil, "a standing order waits for the approach")
+world.enemies = false
+
+for _ = 1, 300 do tick() end
+check(state().transfer == nil and state().lastTransfer.reason == "timeout" and world.aiState == "Passive",
+      "a target never reached is given up on")
+
+transfer({id = "t2", target = {faction = 1, name = "Freighter"}, all = true})
+OrderChain.enchain({action = OrderType.Patrol})
+OrderChain.runOrders()
+tick()
+check(state().transfer == nil and state().lastTransfer.outcome == "replaced", "other orders take over from it")
+OrderChain.clearAllOrders()
+
+transfer({id = "t3", target = {faction = 1, name = "Freighter"}, all = true})
+local saved = OrderChain.secure()
+loadOrderChain()
+OrderChain.restore(saved)
+OrderChain.updateShipOrderInfo()
+check(state().transfer and state().transfer.id == "t3", "a transfer on its way survives a reload")
+world.distance.Freighter = 10
+tick()
+check(state().lastTransfer.id == "t3" and state().lastTransfer.outcome == "done" and freighter:held("Iron") == 10,
+      "and finishes after it")
+
+transfer({id = "t4", target = {faction = 1, name = "Freighter"}, direction = "take", all = true})
+world.distance.Freighter = 900
+world.ship = craft({name = "Self"})
+transfer({id = "t5", target = {faction = 1, name = "Freighter"}, all = true})
+OrderChain.automationApiStop()
+check(state().transfer == nil and state().lastTransfer.outcome == "stopped", "stop ends a transfer on its way")
 
 print("\nstopping")
 

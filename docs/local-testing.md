@@ -210,6 +210,22 @@ Then check, in the Travel tab and the notifications:
 5. with the page in the background: "Boss spawned", "Boss killed" and, once the pause is over,
    "Boss cooldown over". Set the pause to 1 minute on the farm form for that last one.
 
+## Cargo transfers: still to check in the engine
+
+The transfer is built from the calls vanilla's transfer window makes
+(`entity/transfercrewgoods.lua`) and is tested against a model of them, not against the game
+yet. These are the assumptions it rests on, and the order to check them in. Put a ship with
+cargo and a captain next to one of your stations in the test galaxy, then use the Orders tab.
+
+| assumption | how to see it |
+|---|---|
+| `Sector():getEntitiesByFaction(index)` finds the target by owner and name | a transfer in reach answers `done`, not `target_not_here` (the code falls back to scanning ships and stations if the call does not exist) |
+| `removeCargo`/`addCargo` with a good from `getCargos()` behave as in `transferCargo` | the holds change by the amounts reported; stolen goods stay stolen |
+| a station's `freeCargoSpace` is its real room, and a factory picks up goods added this way as stock | the station's Economy tab shows the stock grow |
+| `getNearestDistance` of a docked ship is under 20 | a transfer after docking answers `done` without `out_of_range` |
+| `DockToStation` enchained without a calling player docks the ship, and the chain empties once it is docked | the ship docks, and the transfer finishes after it |
+| `ShipAI():setFly(target.translationf, target.radius + ship.radius)` brings two ships within reach without ramming | a ship-to-ship transfer from a few km away ends `done`, not `timeout` |
+
 ## Cleaning up
 
 ```bash

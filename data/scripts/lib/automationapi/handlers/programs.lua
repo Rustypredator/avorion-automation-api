@@ -13,7 +13,8 @@
 --     the order is carried out by the owner's agent, as any write is.
 --
 --   * A step's action is carried out by the endpoint a client would call - a route is
---     POST /ships/{name}/route, standing orders are POST /ships/{name}/automation - issued
+--     POST /ships/{name}/route, standing orders are POST /ships/{name}/automation, a cargo
+--     transfer is POST /ships/{name}/transfer - issued
 --     as an internal request through the router, with the owner, or for alliance craft the
 --     member who last saved the program, as the caller. So a program can never do anything
 --     a request could not, it is validated and confirmed the same way, and a new endpoint
@@ -37,6 +38,7 @@ local ShipEvents = include("automationapi/shipevents")
 local ProgramRules = include("automationapi/programrules")
 local MissionAutomation = include("automationapi/handlers/missionautomation")
 local MissionLibrary = include("automationapi/handlers/missionlibrary")
+local TransferRules = include("automationapi/transferrules")
 
 local Programs = {}
 
@@ -194,6 +196,10 @@ local function resetTracking(run)
     run.sawBackground = false
     run.returned = false
     run.dispatchedAt = nil
+    run.transferId = nil
+    run.transferShip = nil
+    run.transferEnded = false
+    run.transferOutcome = nil
 end
 
 local function enterStep(index, shipName, run, stepIndex)
@@ -242,7 +248,7 @@ end
 
 -- Runs an endpoint as the program's authority. onDone(status, body) is called once, now or
 -- when a deferred request completes.
-local function internalRequest(owner, authority, method, path, body, onDone)
+local function internalRequest(owner, authority, method, path, body, onDone, ownerQuery)
     local player = owner.kind == "player" and owner.faction
                    or {index = authority.index, name = authority.name, alliance = owner.faction}
 
@@ -253,7 +259,7 @@ local function internalRequest(owner, authority, method, path, body, onDone)
         requestId = "program",
         method = method,
         path = path,
-        query = {owner = owner.kind},
+        query = {owner = ownerQuery or owner.kind},
         body = body,
         playerIndex = authority.index,
         player = player,
@@ -280,6 +286,7 @@ local function requestFor(shipName, action)
     if action.type == "orders" then return base .. "/orders", body end
     if action.type == "standing" then return base .. "/automation", body end
     if action.type == "travel" then return base .. "/travel", body end
+    if action.type == "transfer" then return base .. "/transfer", body end
 
     return nil
 end
@@ -328,6 +335,28 @@ local function gatherFacts(owner, shipName, run, step)
         end
     end
 
+    -- The transfer this step sent: over once the ship reports how it went. One that is
+    -- neither reported over nor on its way after the grace period was lost - another
+    -- transfer overwrote the report, or the ship never got it - and counts as over too.
+    -- A station's transfer is carried out by the ship at the other end, and reported there.
+    local transferFeed = automation
+    if run.transferShip then
+        transferFeed = ShipEvents.latestAutomation(run.transferShip.index, run.transferShip.name)
+    end
+
+    if run.transferId and not run.transferEnded and transferFeed then
+        local last = transferFeed.lastTransfer
+        local current = transferFeed.transfer
+        if type(last) == "table" and last.id == run.transferId then
+            run.transferEnded = true
+            run.transferOutcome = last.outcome
+        elseif not (type(current) == "table" and current.id == run.transferId)
+               and run.dispatchedAt and t - run.dispatchedAt >= Config.programOrdersGrace then
+            run.transferEnded = true
+            run.transferOutcome = "unknown"
+        end
+    end
+
     facts.planEnded = run.planEnded
     facts.arrived = run.arrived
     facts.bossKills = (run.killsBefore or 0) + (run.planKills or 0)
@@ -356,6 +385,8 @@ local function gatherFacts(owner, shipName, run, step)
         facts.naturalEnd = run.returned
     elseif natural == "immediate" then
         facts.naturalEnd = true
+    elseif natural == "transfer" then
+        facts.naturalEnd = run.transferEnded
     end
 
     return facts
@@ -468,11 +499,34 @@ local function startStep(owner, index, shipName, program, run, authority)
 
         if run.token ~= token then return end
         run.planId = response.planId
+        run.transferId = response.transferId
+        local by = type(response.carriedOutBy) == "table" and response.carriedOutBy or nil
+        if by and by.name ~= shipName and type(by.owner) == "table" then
+            run.transferShip = {index = by.owner.index, name = by.name}
+        end
+
+        -- a target in reach is served inside the confirmation window
+        if action.type == "transfer" and type(response.result) == "table" then
+            run.transferEnded = true
+            run.transferOutcome = response.result.outcome
+        end
 
         local what = action.type == "route" and string.format("Flying to (%d:%d).", action.to.x, action.to.y)
                      or action.type == "farm" and "Farming bosses."
                      or action.type == "orders" and "Orders dispatched."
                      or action.type == "travel" and string.format("Travelling to (%d:%d).", action.to.x, action.to.y)
+                     or action.type == "transfer" and (function()
+                            local text = "Cargo: " .. TransferRules.describe(action, action.target) .. "."
+                            local result = response.result
+                            if type(result) == "table" then
+                                text = text .. string.format(" %s, %d units moved.", tostring(result.outcome),
+                                                             Serialize.number(result.total, 0))
+                            elseif response.phase then
+                                text = text .. " The target is out of reach; the ship is "
+                                       .. tostring(response.phase) .. "."
+                            end
+                            return text
+                        end)()
                      or "Standing orders set."
         if status == 202 then what = what .. " The ship did not confirm it yet." end
 
@@ -500,19 +554,22 @@ local function leaveStep(owner, index, shipName, program, run, authority, reason
         enterStep(index, shipName, run, nextIndex)
     end
 
-    -- A route or farm still flying would carry on underneath whatever comes next.
-    if (step.action.type == "route" or step.action.type == "farm") and run.planId
-       and not run.planEnded then
+    -- A route or farm still flying would carry on underneath whatever comes next, and so
+    -- would a transfer still on its way to the target.
+    if ((step.action.type == "route" or step.action.type == "farm") and run.planId and not run.planEnded)
+       or (step.action.type == "transfer" and run.transferId and not run.transferEnded) then
         local token = run.token
+        local stopping = run.transferShip and run.transferShip.name or shipName
         run.busy = true
         run.busyUntil = now() + Config.programDispatchTimeout
         internalRequest(owner, authority, "POST",
-                        "/ships/" .. encodeSegment(shipName) .. "/automation/stop", {},
+                        "/ships/" .. encodeSegment(stopping) .. "/automation/stop", {},
                         function()
                             if run.token ~= token then return end
                             run.busy = false
                             onward()
-                        end)
+                        end,
+                        run.transferShip and "all" or nil)
         return
     end
 

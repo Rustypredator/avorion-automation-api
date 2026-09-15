@@ -34,7 +34,8 @@ data/scripts/                   everything the game loads
   entity/orderchain.lua         APPENDED onto vanilla orderchain.lua (wraps updateServer,
                                 getOrderInfo, secure, restore): route plans, enemy
                                 handling, standing orders (enemies/loot, idle or
-                                interrupt+resume), boss farming run on the ship
+                                interrupt+resume), boss farming, cargo transfers
+                                (move goods, dock/fly into reach) run on the ship
   commands/apikey.lua           /apikey chat command (new/list/revoke keys)
   galaxy/automationapi/bridge.lua   Galaxy script: transport loop, auth, router, all reads,
                                     job queue for writes, stats console line
@@ -54,6 +55,7 @@ data/scripts/                   everything the game loads
     missiontypes.lua  API mission keys <-> vanilla command UUIDs, config/area building
     missionrules.lua  pure arithmetic for mission automation limits/candidates
     programrules.lua  order program vocabulary: actions, conditions, validation, evaluation
+    transferrules.lua cargo transfer request vocabulary, shared by /transfer and program steps
     analysis.lua      background area analysis runner (async, deferred responses)
     factionscope.lua  fakes getParentFaction() while vanilla command code runs
     routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates
@@ -72,6 +74,7 @@ data/scripts/                   everything the game loads
                             internal router:dispatch requests to the real endpoints
       movement.lua          /travel (mission alias), /orders (in-sector order chain)
       navigation.lua        /route, /farm, /automation (talks to entity/orderchain.lua)
+      transfer.lua          /ships/{name}/transfer: holds to pick from, cargo moves via the ship
       map.lua               /galaxy/*, /map/* (sliced scans across ticks)
       economy.lua           /stations, /stations/{name}, /economy
 docs/
@@ -90,7 +93,8 @@ web/                            browser console, no build step, no deps, NOT shi
   index.html, app.css
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (~7.4k lines: fleet, missions, orders + standing orders,
-              Automation tab (programs + mission rules + standing orders per craft), economy,
+              cargo transfer, Automation tab (programs + mission rules + standing orders per
+              craft), economy,
               industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/

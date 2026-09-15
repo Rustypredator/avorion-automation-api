@@ -105,6 +105,14 @@
     industry: { stations: null, error: null, sector: null, history: {} },
 
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
+
+    /* Cargo transfers. `transferData` is GET /ships/{name}/transfer per craft - its own hold
+       and every craft it could transfer with, each with theirs - which the Orders tab and
+       the program editor both pick goods from. `transfer` is the Orders tab's form. */
+    transferData: {},
+    transfer: { ship: null, target: '', direction: 'give', all: false, picks: {}, approach: true,
+                sending: false, result: null },
+
     busy: {}
   };
 
@@ -425,6 +433,18 @@
     'one-shot':
       'Each of these is an engine wrapper that clears the chain, adds one order and runs '
       + 'it, so it cannot be combined with anything. Mine and salvage need a captain.',
+
+    'cargo-transfer':
+      '<p>Moves goods between this craft and another of yours or your alliance\'s in the same '
+      + 'sector, as the game\'s own transfer window does. <b>Give</b> fills the other hold, '
+      + '<b>take</b> empties it into this one. What fits is moved; the rest stays and is reported.</p>'
+      + '<p>The craft have to be within 20 of each other, or of the longer transporter\'s reach. '
+      + 'Further apart, <b>approach</b> sends the ship: it docks at a station, or flies alongside a '
+      + 'ship. That is an order, so it needs a captain and nobody at the controls, and it ends a '
+      + 'route or farm the ship was flying. In reach, the ship\'s orders are not touched.</p>'
+      + '<p>A station cannot fly: picked here, the ship at the other end carries the transfer out. '
+      + 'The holds shown are the ship database\'s, which can trail a loaded craft by a moment; '
+      + 'the ship moves what it really has.</p>',
 
     'log-not-recording':
       'No player whose agent watches this craft is online. A quiet log means nobody was '
@@ -1103,7 +1123,7 @@
 
     if (name === 'mission' && S.selected && !S.catalog) { loadCatalog(); }
     if (name === 'travel' && S.selected) { renderTravel(); loadAutomation(); }
-    if (name === 'orders' && S.selected) { renderStanding(); loadAutomation(); }
+    if (name === 'orders' && S.selected) { renderStanding(); loadAutomation(); loadTransfer(S.selected); }
     if (name === 'cargo') { renderCargo(); }
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
@@ -1447,6 +1467,7 @@
     renderOrders();
     renderTravel();
     if (S.sub === 'travel' || S.sub === 'orders' || S.view === 'automation') { loadAutomation(); }
+    if (S.sub === 'orders') { loadTransfer(name); }
     renderAutomationView();
     renderShipLog();
 
@@ -3152,7 +3173,8 @@
     if (entry && entry.rule) { return true; }
     if (programFor(ship.name)) { return true; }
     var automation = shipAutomation(ship.name);
-    return !!(automation && (automation.plan || automation.reaction || standingOn(automation).length));
+    return !!(automation && (automation.plan || automation.reaction || automation.transfer
+                             || standingOn(automation).length));
   }
 
   function shipAutomationBadges(ship) {
@@ -3167,6 +3189,10 @@
     if (automation.reaction) {
       out.push('<span class="badge ' + ((REACTION_PHASES[automation.reaction.phase] || [])[0] || 'info') + '">'
         + esc(automation.reaction.kind) + ' · ' + esc(automation.reaction.phase) + '</span>');
+    }
+    if (automation.transfer) {
+      out.push('<span class="badge info" title="' + esc(transferText(automation.transfer, true)) + '">transfer · '
+        + esc(automation.transfer.phase || 'moving') + '</span>');
     }
     var on = standingOn(automation);
     if (on.length) {
@@ -3269,6 +3295,7 @@
     ['mission', 'go on a mission'],
     ['travel', 'travel (mission)'],
     ['standing', 'set standing orders'],
+    ['transfer', 'transfer cargo'],
     ['wait', 'wait']
   ];
 
@@ -3287,7 +3314,8 @@
 
   /* Actions that end by themselves; the rest need a condition. */
   var PROGRAM_NATURAL_END = { route: 'when it arrives', orders: 'when the chain runs out',
-                              mission: 'when it is back', travel: 'when it arrives', standing: 'at once' };
+                              mission: 'when it is back', travel: 'when it arrives', standing: 'at once',
+                              transfer: 'when the cargo has moved' };
 
   /* The Travel mission's swiftness, as the order window offers it. */
   var SWIFTNESS = [['0', 'careful'], ['1', 'cautious'], ['2', 'swift'], ['3', 'reckless']];
@@ -3382,6 +3410,9 @@
       });
       if (action.attackCivilians != null) { parts.push('civilians ' + (action.attackCivilians ? 'count' : 'spared')); }
       return 'standing orders: ' + esc(parts.join(', ') || 'unchanged');
+    }
+    if (action.type === 'transfer') {
+      return transferText(action);
     }
     return 'wait';
   }
@@ -3515,6 +3546,15 @@
     if (type === 'farm') { action.boss = 'auto'; }
     if (type === 'orders') { action.orders = [{ type: 'patrol' }]; }
     if (type === 'standing') { action.standing = { enemies: { enabled: true, mode: 'interrupt' } }; }
+    if (type === 'transfer') {
+      var here = transferTargets(S.selected).filter(function (t) { return t.sameSector; })[0];
+      action.target = here ? here.name : '';
+      if (here) { action.targetOwner = here.owner.kind; }
+      action.direction = 'give';
+      action.all = true;
+      action.approach = true;
+      if (!S.transferData[S.selected]) { loadTransfer(S.selected); }
+    }
 
     var needs = !PROGRAM_NATURAL_END[type];
     return {
@@ -3598,6 +3638,22 @@
         + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
         + pfSelect(p + 'swiftness', a.swiftness == null ? 2 : a.swiftness, SWIFTNESS, 'data-pf-num');
     }
+    if (a.type === 'transfer') {
+      var slot = S.transferData[S.selected];
+      if (!slot) { loadTransfer(S.selected); }
+      var targets = transferTargets(S.selected);
+      var options = [['', slot && slot.loading ? 'loading craft…' : 'pick a craft…']].concat(targets.map(function (t) {
+        return [t.name, t.name + (t.owner.kind === 'alliance' ? ' (alliance)' : '')
+          + (t.sameSector ? ' · here' : ' · ' + coords(t.position))];
+      }));
+      if (a.target && !targets.some(function (t) { return t.name === a.target; })) { options.push([a.target, a.target]); }
+      return pfSelect(p + 'target', a.target || '', options, 'data-pf-rerender data-pf-transfer-target')
+        + pfSelect(p + 'direction', a.direction || 'give', [['give', 'give to it'], ['take', 'take from it']], 'data-pf-rerender')
+        + '<label class="check"><input type="checkbox" data-pf="' + p + 'all" data-pf-bool data-pf-rerender'
+        + (a.all ? ' checked' : '') + '><span>everything</span></label>'
+        + '<label class="check" title="Dock at a station, or fly alongside a ship, when it is out of reach"><input type="checkbox" data-pf="'
+        + p + 'approach" data-pf-bool' + (a.approach === false ? '' : ' checked') + '><span>approach</span></label>';
+    }
     if (a.type === 'standing') {
       return STANDING.map(function (spec) {
         var order = a.standing && a.standing[spec.key];
@@ -3610,6 +3666,57 @@
       }).join('');
     }
     return '';
+  }
+
+  /* Fields an action needs below its row: a transfer's goods, picked from the hold they
+     come out of as it is now, or named for whatever it will hold when the step runs. */
+  function actionBlock(step, i) {
+    var a = step.action;
+    if (a.type !== 'transfer') { return ''; }
+
+    var p = 'steps.' + i + '.action.';
+    var source = transferSource(S.selected, a.target, a.targetOwner, a.direction);
+    var held = source && source.cargo ? source.cargo.goods || [] : [];
+    var sourceName = !source ? '' : source.name;
+
+    var heldHtml = source
+      ? '<span class="mute2">' + esc(sourceName) + ' holds now:</span>'
+        + (held.length
+          ? held.map(function (g) {
+              return '<button class="chip" data-prog-good-pick="' + i + '" data-good="' + esc(g.name) + '"'
+                + (g.stolen ? ' data-stolen="1"' : '') + (a.all ? ' disabled' : '')
+                + ' title="add to the goods">+ ' + esc(g.name) + (g.stolen ? ' (stolen)' : '') + ' ' + num(g.amount) + '</button>';
+            }).join('')
+          : '<span class="mute2">nothing</span>')
+      : '<span class="mute2">pick a craft to see what the hold it comes out of has</span>';
+
+    if (a.all) {
+      return '<div class="row tight program-condition">' + heldHtml + '</div>';
+    }
+
+    var goods = a.goods || [];
+    var names = {};
+    held.forEach(function (g) { names[g.name] = true; });
+
+    return '<datalist id="pf-goods-' + i + '">' + Object.keys(names).map(function (n) {
+        return '<option value="' + esc(n) + '">';
+      }).join('') + '</datalist>'
+      + goods.map(function (g, j) {
+          var have = held.filter(function (h) {
+            return h.name === g.name && (g.stolen == null || !!h.stolen === g.stolen);
+          }).reduce(function (sum, h) { return sum + (h.amount || 0); }, 0);
+          return '<div class="row tight program-condition">'
+            + '<span class="mute2">good</span>'
+            + pfInput(p + 'goods.' + j + '.name', g.name, 'type="text" list="pf-goods-' + i + '" placeholder="good, e.g. Iron" style="width:150px"')
+            + pfInput(p + 'goods.' + j + '.amount', g.amount == null ? '' : g.amount,
+                      'type="number" min="1" step="1" placeholder="all of it" data-pf-optnum style="width:96px"')
+            + (g.stolen ? '<span class="badge warn">stolen only</span>' : g.stolen === false ? '<span class="badge">not stolen</span>' : '')
+            + (source && g.name ? '<span class="mute2">' + num(have) + ' there now</span>' : '')
+            + '<button class="ghost small" data-prog-good-del="' + i + ':' + j + '">×</button></div>';
+        }).join('')
+      + '<div class="row tight program-condition">'
+      + '<button class="ghost small" data-prog-good-add="' + i + '">+ good</button>'
+      + heldHtml + '</div>';
   }
 
   function conditionFields(c, i, j) {
@@ -3656,6 +3763,7 @@
         + '<span class="spacer"></span>'
         + '<button class="ghost small" data-prog-step-up="' + i + '"' + (i ? '' : ' disabled') + '>↑</button>'
         + '<button class="ghost small" data-prog-step-del="' + i + '"' + (count > 1 ? '' : ' disabled') + '>×</button></div>'
+        + actionBlock(step, i)
         + '<div class="row tight" style="margin-top:6px"><span class="mute2">until</span>'
         + (until.conditions.length > 1 ? pfSelect('steps.' + i + '.until.match', until.match, [['any', 'any of'], ['all', 'all of']]) : '')
         + (until.conditions.length ? '' : '<span class="mute2">' + esc(PROGRAM_NATURAL_END[step.action.type] || 'a condition is needed') + '</span>')
@@ -3724,6 +3832,16 @@
     if (!path) { return false; }
 
     var value = node.value;
+    if (node.dataset.pfOptnum !== undefined) {
+      var parent = path.split('.');
+      var leaf = parent.pop();
+      var holder = form;
+      parent.forEach(function (key) { holder = holder == null ? null : holder[key]; });
+      if (!holder) { return false; }
+      if (value === '' || !isFinite(Number(value)) || Number(value) < 1) { delete holder[leaf]; }
+      else { holder[leaf] = Math.round(Number(value)); }
+      return false;
+    }
     if (node.dataset.pfBool !== undefined) { value = node.checked; }
     else if (node.dataset.pfBoolsel !== undefined) { value = value === 'true'; }
     else if (node.dataset.pfNum !== undefined) {
@@ -3750,6 +3868,13 @@
     }
 
     if (path === 'name') { form.name = value; return false; }
+    if (node.dataset.pfTransferTarget !== undefined) {
+      var transferAction = form.steps[Number(path.split('.')[1])].action;
+      var picked = transferTargets(S.selected).filter(function (t) { return t.name === value; })[0];
+      transferAction.target = value;
+      if (picked) { transferAction.targetOwner = picked.owner.kind; } else { delete transferAction.targetOwner; }
+      return true;
+    }
     if (/^steps\.\d+\.action\.library$/.test(path) && !value) {
       delete form.steps[Number(path.split('.')[1])].action.library;
       return true;
@@ -3773,6 +3898,22 @@
         copy.action.orders = copy.action.orders.map(function (o) {
           return o.type === 'jump' ? { type: 'jump', to: o.to || { x: 0, y: 0 } } : { type: o.type };
         });
+      }
+      if (copy.action.type === 'transfer') {
+        if (copy.action.all) {
+          delete copy.action.goods;
+        } else {
+          delete copy.action.all;
+          copy.action.goods = (copy.action.goods || []).filter(function (g) {
+            return g.name && String(g.name).trim();
+          }).map(function (g) {
+            var good = { name: String(g.name).trim() };
+            if (g.amount) { good.amount = Math.round(g.amount); }
+            if (g.stolen != null) { good.stolen = g.stolen; }
+            return good;
+          });
+        }
+        if (!copy.action.targetOwner) { delete copy.action.targetOwner; }
       }
       if (!copy['until'].conditions.length) { copy['repeat'] = false; }
       return copy;
@@ -3904,6 +4045,29 @@
     if (button.dataset.progCondDel !== undefined) {
       var at = button.dataset.progCondDel.split(':');
       form.steps[Number(at[0])]['until'].conditions.splice(Number(at[1]), 1);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodAdd !== undefined) {
+      var adding = form.steps[Number(button.dataset.progGoodAdd)].action;
+      adding.goods = adding.goods || [];
+      adding.goods.push({ name: '' });
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodPick !== undefined) {
+      var picking = form.steps[Number(button.dataset.progGoodPick)].action;
+      var stolen = button.dataset.stolen === '1';
+      picking.goods = (picking.goods || []).filter(function (g) { return g.name; });
+      if (!picking.goods.some(function (g) { return g.name === button.dataset.good && !!g.stolen === stolen; })) {
+        picking.goods.push(stolen ? { name: button.dataset.good, stolen: true } : { name: button.dataset.good });
+      }
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodDel !== undefined) {
+      var spot = button.dataset.progGoodDel.split(':');
+      form.steps[Number(spot[0])].action.goods.splice(Number(spot[1]), 1);
       redrawProgram();
       return true;
     }
@@ -4644,9 +4808,12 @@
 
     out.push('<div id="order-result"></div>');
 
+    out.push('<div id="transfer-section"></div>');
+
     out.push('<div id="standing-orders" data-standing-orders></div>');
 
     $('#sv-orders').innerHTML = out.join('');
+    renderTransfer();
     renderStanding();
   }
 
@@ -4889,6 +5056,494 @@
     // The chain moved, so the summary and the event feed are both stale.
     refreshFleet(true);
     sweepEvents();
+  }
+
+  /* ---------------------------- cargo transfer ----------------------------- */
+
+  var TRANSFER_PHASES = {
+    docking: 'docking to get in reach',
+    approaching: 'flying alongside to get in reach'
+  };
+
+  var TRANSFER_OUTCOMES = {
+    done: ['good', 'moved'],
+    partial: ['warn', 'partly moved'],
+    nothing_moved: ['warn', 'nothing moved'],
+    refused: ['bad', 'refused'],
+    replaced: ['warn', 'replaced'],
+    stopped: ['warn', 'stopped']
+  };
+
+  var TRANSFER_REASONS = {
+    not_held: 'not in the hold',
+    no_space: 'no room left',
+    not_enough: 'less there than asked',
+    target_not_here: 'the other craft is not in the sector',
+    target_gone: 'the other craft left',
+    out_of_range: 'out of reach',
+    needs_captain: 'no captain to fly there',
+    piloted: 'someone is at the controls',
+    not_permitted: 'not allowed',
+    timeout: 'never got in reach',
+    empty_hold: 'the hold was empty'
+  };
+
+  function transferTargets(name) {
+    var slot = S.transferData[name];
+    return slot && slot.body ? slot.body.targets || [] : [];
+  }
+
+  function findTransferTarget(name, target, ownerKind) {
+    return transferTargets(name).filter(function (t) {
+      return t.name === target && (!ownerKind || t.owner.kind === ownerKind);
+    })[0] || null;
+  }
+
+  /* The craft goods come out of: the ship when it gives, the other craft when it takes. */
+  function transferSource(name, target, ownerKind, direction) {
+    var slot = S.transferData[name];
+    if (!slot || !slot.body) { return null; }
+    if (direction !== 'take') { return slot.body.ship; }
+    return findTransferTarget(name, target, ownerKind);
+  }
+
+  function transferText(transfer, plain) {
+    var goods = transfer.all ? 'everything' : (transfer.goods || []).map(function (g) {
+      return (g.amount ? numText(g.amount) + ' ' : 'all ') + g.name + (g.stolen ? ' (stolen)' : '');
+    }).join(', ');
+    var target = transfer.target || '?';
+    var text = transfer.direction === 'take' ? 'take ' + goods + ' from ' : 'give ' + goods + ' to ';
+    if (plain) { return text + target; }
+    return esc(text) + '<b>' + esc(target) + '</b>'
+      + (transfer.approach === false ? ' <span class="mute2">only if in reach</span>' : '');
+  }
+
+  function movedText(list) {
+    return (list || []).map(function (g) {
+      return numText(g.amount) + ' ' + g.name + (g.stolen ? ' (stolen)' : '');
+    }).join(', ');
+  }
+
+  function shortText(list) {
+    return (list || []).map(function (g) {
+      var reason = TRANSFER_REASONS[g.reason] || g.reason;
+      return g.name ? g.name + ': ' + reason + (g.moved ? ' (' + numText(g.moved) + ' moved)' : '') : reason;
+    }).join('; ');
+  }
+
+  function lastTransferHtml(last) {
+    var tone = TRANSFER_OUTCOMES[last.outcome] || ['info', last.outcome];
+    return '<span class="badge ' + tone[0] + '">' + esc(tone[1]) + '</span> '
+      + esc((last.direction === 'take' ? 'from ' : 'to ') + (last.target || '?'))
+      + (last.moved ? ' · ' + esc(movedText(last.moved)) : '')
+      + (last.short ? ' <span class="mute2">' + esc(shortText(last.short)) + '</span>' : '')
+      + (last.reason ? ' <span class="mute2">' + esc(TRANSFER_REASONS[last.reason] || last.reason) + '</span>' : '');
+  }
+
+  function loadTransfer(name, userInitiated) {
+    if (!name) { return Promise.resolve(); }
+
+    var slot = S.transferData[name] || { body: null };
+    slot.loading = true;
+    S.transferData[name] = slot;
+
+    return Api.get('/ships/' + Api.seg(name) + '/transfer', { owner: ownerParamFor(name) },
+                   { priority: userInitiated ? Api.P.USER : Api.P.DETAIL, label: 'transfer holds' })
+      .then(function (body) {
+        S.transferData[name] = { body: body, error: null, loading: false };
+        if (S.selected !== name) { return; }
+        renderTransfer();
+        if (S.progForm && S.progForm.ship === name) { redrawProgram(); }
+      })
+      .catch(function (error) {
+        slot.loading = false;
+        if (error.code === 'cancelled') { return; }
+        slot.error = error;
+        if (S.selected === name) { renderTransfer(); }
+      });
+  }
+
+  function transferForm() {
+    if (S.transfer.ship !== S.selected) {
+      S.transfer = { ship: S.selected, target: '', direction: 'give', all: false, picks: {}, approach: true,
+                     sending: false, result: null };
+    }
+    return S.transfer;
+  }
+
+  function goodKey(good) { return good.name + (good.stolen ? '|stolen' : ''); }
+
+  function holdCard(craft, role) {
+    var cargo = craft.cargo || {};
+    return '<div class="card"><h3>' + esc(role) + ' <span class="mute2">' + esc(craft.name)
+      + (craft.type ? ' · ' + esc(craft.type.toLowerCase()) : '')
+      + (craft.owner && craft.owner.kind === 'alliance' ? ' · alliance' : '') + '</span></h3>'
+      + '<div class="mute2">' + num(cargo.used) + ' of ' + num(cargo.capacity) + ' used &middot; '
+      + num(cargo.free) + ' free</div>'
+      + cargoBar({ used: cargo.used || 0, capacity: cargo.capacity || 0, free: cargo.free })
+      + '<div class="mute2" style="margin-top:4px">' + ((cargo.goods || []).length
+        ? esc((cargo.goods || []).map(function (g) {
+            return g.name + (g.stolen ? ' (stolen)' : '') + ' ' + numText(g.amount);
+          }).join(', '))
+        : 'empty') + '</div></div>';
+  }
+
+  function renderTransfer() {
+    var node = $('#transfer-section');
+    if (!node || !S.selected) { return; }
+
+    var name = S.selected;
+    var form = transferForm();
+    var slot = S.transferData[name];
+    var head = '<div class="section"><h2>Cargo transfer ' + explain('cargo-transfer')
+      + ' <button class="ghost small" data-act="transfer-refresh">refresh</button></h2>';
+
+    if (!slot || (!slot.body && !slot.error)) {
+      node.innerHTML = head + '<p class="muted">loading…</p></div>';
+      return;
+    }
+    if (!slot.body) {
+      node.innerHTML = head + (slot.error.status === 404 && slot.error.code === 'not_found'
+        ? '<div class="note warn">This server runs a mod version without cargo transfers.</div>'
+        : errorBox('Could not read the holds', slot.error)) + '</div>';
+      return;
+    }
+
+    var ship = slot.body.ship;
+    var fromStation = isStation(ship);
+    var here = (slot.body.targets || []).filter(function (t) {
+      return t.sameSector && !(fromStation && isStation(t));
+    });
+
+    if (ship.availability === 'InBackground') {
+      node.innerHTML = head + '<div class="note warn">Out on a captain mission &mdash; its hold is with it.</div></div>';
+      return;
+    }
+    if (!here.length) {
+      node.innerHTML = head + '<div class="note">No other craft of yours or your alliance\'s '
+        + (fromStation ? 'that could fly a transfer ' : '') + 'is in ' + esc(coords(ship.sector || ship.position))
+        + '. A program can fly the ship to one and transfer there &mdash; see the Automation tab.</div>'
+        + '<div id="transfer-state"></div></div>';
+      renderTransferState();
+      return;
+    }
+
+    var target = here.filter(function (t) { return t.owner.kind + ':' + t.name === form.target; })[0];
+    if (!target) {
+      target = here[0];
+      form.target = target.owner.kind + ':' + target.name;
+      form.picks = {};
+    }
+
+    var giving = form.direction !== 'take';
+    var sender = giving ? ship : target;
+    var receiver = giving ? target : ship;
+    var goods = (sender.cargo && sender.cargo.goods) || [];
+    var off = form.sending ? ' disabled' : '';
+
+    var out = [head];
+
+    out.push('<div class="row" style="margin-bottom:10px">'
+      + '<span class="mute2">with</span>'
+      + '<select data-transfer-target' + off + '>' + here.map(function (t) {
+          var value = t.owner.kind + ':' + t.name;
+          return '<option value="' + esc(value) + '"' + (value === form.target ? ' selected' : '') + '>'
+            + esc(t.name) + (t.type ? ' · ' + esc(t.type.toLowerCase()) : '')
+            + (t.owner.kind === 'alliance' ? ' (alliance)' : '') + '</option>';
+        }).join('') + '</select>'
+      + '<div class="chips">'
+      + '<button class="chip' + (giving ? ' on' : '') + '" data-transfer-dir="give"' + off + '>give &rarr; to it</button>'
+      + '<button class="chip' + (giving ? '' : ' on') + '" data-transfer-dir="take"' + off + '>take &larr; from it</button>'
+      + '</div>'
+      + '<label class="check" title="Dock at a station, or fly alongside a ship, when it is out of reach">'
+      + '<input type="checkbox" data-transfer-approach' + (form.approach ? ' checked' : '') + off
+      + '><span>approach if out of reach</span></label>'
+      + '</div>');
+
+    out.push('<div class="cards" style="margin-bottom:10px">'
+      + holdCard(sender, 'from') + holdCard(receiver, 'into') + '</div>');
+
+    if (!goods.length) {
+      out.push('<div class="note">' + esc(sender.name) + '\'s hold is empty.</div>');
+    } else {
+      out.push('<div class="scroll-x"><table class="transfer-goods"><thead><tr>'
+        + '<th><label class="check"><input type="checkbox" data-transfer-all' + (form.all ? ' checked' : '') + off
+        + ' title="the whole hold, whatever is in it when the ship gets there"><span>all</span></label></th>'
+        + '<th>Good</th><th class="num">In hold</th><th class="num">Move</th><th class="num">Volume</th>'
+        + '</tr></thead><tbody>'
+        + goods.map(function (g) {
+            var key = goodKey(g);
+            var picked = form.all || form.picks[key] != null;
+            var amount = form.all ? g.amount : form.picks[key];
+            return '<tr>'
+              + '<td><input type="checkbox" data-transfer-pick="' + esc(key) + '"' + (picked ? ' checked' : '')
+              + (form.all ? ' disabled' : off) + '></td>'
+              + '<td>' + esc(g.name) + (g.stolen ? ' <span class="badge warn">stolen</span>' : '')
+              + (g.illegal ? ' <span class="badge warn">illegal</span>' : '') + '</td>'
+              + '<td class="num">' + num(g.amount) + '</td>'
+              + '<td class="num"><input type="number" min="1" step="1" style="width:96px" data-transfer-amount="' + esc(key) + '"'
+              + ' value="' + (picked && amount != null ? amount : '') + '" placeholder="' + num(g.amount) + '"'
+              + (form.all ? ' disabled' : off) + '>'
+              + ' <button class="ghost small" data-transfer-max="' + esc(key) + '"' + (form.all ? ' disabled' : off) + '>all</button></td>'
+              + '<td class="num mute2">' + (g.size != null ? num(g.size * (picked && amount != null ? amount : 0), 1) : '—') + '</td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>');
+    }
+
+    out.push('<div class="row" style="margin-top:9px">'
+      + '<span data-transfer-summary>' + transferSummaryHtml(form, goods, receiver) + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="primary" data-act="transfer-send"' + (form.sending || !goods.length ? ' disabled' : '') + '>'
+      + (form.sending ? 'Transferring…' : 'Transfer') + '</button>'
+      + '</div>');
+
+    out.push('<div id="transfer-result">' + transferResultHtml(form.result) + '</div>');
+    out.push('<div id="transfer-state"></div>');
+    out.push('</div>');
+
+    node.innerHTML = out.join('');
+    renderTransferState();
+  }
+
+  /* What is picked and whether it fits, patched in place while amounts are typed. */
+  function transferSummaryHtml(form, goods, receiver) {
+    var units = 0;
+    var volume = 0;
+    goods.forEach(function (g) {
+      var amount = form.all ? g.amount : form.picks[goodKey(g)];
+      if (amount == null) { return; }
+      amount = Math.min(amount, g.amount);
+      units += amount;
+      volume += amount * (g.size || 0);
+    });
+
+    var free = (receiver.cargo && receiver.cargo.free) || 0;
+    if (!units) { return '<span class="mute2">pick goods to move, or all</span>'; }
+
+    return num(units) + ' units, ' + num(volume, 1) + ' volume'
+      + (volume > free
+        ? ' <span class="badge warn" title="What does not fit stays where it is.">only ' + num(free, 1) + ' free in ' + esc(receiver.name) + '</span>'
+        : ' <span class="mute2">of ' + num(free, 1) + ' free</span>');
+  }
+
+  function refreshTransferSummary() {
+    var node = $('#sv-orders [data-transfer-summary]');
+    var slot = S.transferData[S.selected];
+    if (!node || !slot || !slot.body) { return; }
+
+    var form = transferForm();
+    var ship = slot.body.ship;
+    var target = findTransferTarget(S.selected, form.target.split(':').slice(1).join(':'), form.target.split(':')[0]);
+    if (!target) { return; }
+
+    var giving = form.direction !== 'take';
+    var sender = giving ? ship : target;
+    node.innerHTML = transferSummaryHtml(form, (sender.cargo && sender.cargo.goods) || [], giving ? target : ship);
+  }
+
+  function transferResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.error) { return errorBox('Transfer refused', result.error); }
+
+    var body = result.body;
+    var outcome = body.result;
+    var by = body.carriedOutBy && body.carriedOutBy.name !== body.ship
+      ? ' <span class="mute2">carried out by ' + esc(body.carriedOutBy.name) + '</span>' : '';
+
+    if (outcome) {
+      var tone = TRANSFER_OUTCOMES[outcome.outcome] || ['info', outcome.outcome];
+      return '<div class="' + (tone[0] === 'good' ? 'okbox' : 'errbox') + '">'
+        + '<b>' + esc(tone[1].charAt(0).toUpperCase() + tone[1].slice(1)) + '</b>' + by
+        + (outcome.moved ? '<div>' + esc(movedText(outcome.moved)) + '</div>' : '')
+        + (outcome.short ? '<div class="mute2">' + esc(shortText(outcome.short)) + '</div>' : '')
+        + '</div>';
+    }
+    if (body.done === false) {
+      return '<div class="okbox"><b>On its way</b>' + by + '<div>' + esc(body.summary || '') + ' &mdash; '
+        + esc(TRANSFER_PHASES[body.phase] || body.phase || 'getting in reach')
+        + '; the cargo moves once the craft are close.</div></div>';
+    }
+    return '<div class="errbox"><b>Dispatched, not confirmed</b><div>' + esc(body.summary || '') + '</div>'
+      + '<div class="mute2">unconfirmed ' + explain('orders-unconfirmed') + '</div></div>';
+  }
+
+  /* The ship's own report of a transfer on its way, and of the last one. Redrawn on its own,
+     since the ship reports in while amounts above it may be half typed. */
+  function renderTransferState() {
+    var node = $('#transfer-state');
+    if (!node) { return; }
+
+    var a = S.nav.automation && S.nav.automation.ship === S.selected && S.nav.automation.automation;
+    if (!a || !(a.transfer || a.lastTransfer)) { node.innerHTML = ''; return; }
+
+    var rows = [];
+    if (a.transfer) {
+      rows.push('<div class="row" style="margin-top:8px"><span class="badge info">transfer · '
+        + esc(a.transfer.phase || 'moving') + '</span><span>' + transferText(a.transfer) + '</span>'
+        + '<span class="mute2">' + esc(TRANSFER_PHASES[a.transfer.phase] || '') + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-act="transfer-stop" title="Give up on it; nothing has moved yet">stop</button></div>');
+    }
+    if (a.lastTransfer) {
+      rows.push('<div class="mute2" style="margin-top:6px">last transfer: ' + lastTransferHtml(a.lastTransfer) + '</div>');
+    }
+    node.innerHTML = rows.join('');
+  }
+
+  function transferBody(form) {
+    var slot = S.transferData[S.selected];
+    var kind = form.target.split(':')[0];
+    var targetName = form.target.split(':').slice(1).join(':');
+    var body = { target: targetName, targetOwner: kind, direction: form.direction, approach: form.approach };
+
+    if (form.all) {
+      body.all = true;
+      return body;
+    }
+
+    var target = findTransferTarget(S.selected, targetName, kind);
+    var sender = form.direction === 'take' ? target : slot.body.ship;
+    var goods = (sender && sender.cargo && sender.cargo.goods) || [];
+
+    body.goods = goods.filter(function (g) { return form.picks[goodKey(g)] != null; }).map(function (g) {
+      var amount = form.picks[goodKey(g)];
+      var good = { name: g.name, stolen: !!g.stolen };
+      // all of it when all of it is asked for: the hold may have grown since it was read
+      if (amount < g.amount) { good.amount = amount; }
+      return good;
+    });
+
+    return body;
+  }
+
+  function sendTransfer(button) {
+    var name = S.selected;
+    var form = transferForm();
+    if (!name || form.sending) { return; }
+
+    var body = transferBody(form);
+    if (!body.all && !body.goods.length) {
+      toast('warn', 'Nothing to transfer', 'Pick at least one good, or all.');
+      return;
+    }
+
+    form.sending = true;
+    form.result = null;
+    renderTransfer();
+
+    Api.post('/ships/' + Api.seg(name) + '/transfer', body, { owner: ownerParamFor(name) },
+             { priority: Api.P.USER, label: 'transfer' })
+      .then(function (result) {
+        form.sending = false;
+        form.result = { body: result };
+        form.picks = {};
+
+        var outcome = result.result;
+        if (outcome) {
+          var tone = TRANSFER_OUTCOMES[outcome.outcome] || ['info', outcome.outcome];
+          toast(tone[0] === 'bad' ? 'bad' : tone[0], 'Cargo ' + tone[1], name + ': ' + (movedText(outcome.moved) || shortText(outcome.short) || result.summary));
+        } else if (result.done === false) {
+          toast('info', 'Transfer on its way', name + ': ' + (TRANSFER_PHASES[result.phase] || result.phase || 'getting in reach') + '.');
+        } else {
+          toast('warn', 'Transfer sent', name + ' did not confirm it.');
+        }
+
+        if (!result.carriedOutBy || result.carriedOutBy.name === name) { tookAutomation(name, result); }
+        else { refreshFleet(true); sweepEvents(); }
+
+        renderTransfer();
+        // the database mirrors a loaded craft's hold a moment behind
+        loadTransfer(name);
+        setTimeout(function () { if (S.selected === name) { loadTransfer(name); loadDetail(true); } }, 2500);
+      })
+      .catch(function (error) {
+        form.sending = false;
+        form.result = { error: error };
+        renderTransfer();
+        apiFailed(error, 'Transfer refused');
+      });
+  }
+
+  /* Clicks and changes on the transfer section. Each answers whether it was one of its own. */
+  function transferClick(button) {
+    var form = transferForm();
+
+    if (button.dataset.act === 'transfer-send') { sendTransfer(button); return true; }
+    if (button.dataset.act === 'transfer-refresh') { loadTransfer(S.selected, true); loadAutomation(); return true; }
+    if (button.dataset.act === 'transfer-stop') { stopAutomation(button); return true; }
+    if (button.dataset.transferDir) {
+      if (form.direction !== button.dataset.transferDir) {
+        form.direction = button.dataset.transferDir;
+        form.picks = {};
+        form.all = false;
+        renderTransfer();
+      }
+      return true;
+    }
+    if (button.dataset.transferMax !== undefined) {
+      var good = transferSenderGoods().filter(function (g) { return goodKey(g) === button.dataset.transferMax; })[0];
+      if (good) { form.picks[goodKey(good)] = good.amount; renderTransfer(); }
+      return true;
+    }
+    return false;
+  }
+
+  function transferSenderGoods() {
+    var form = transferForm();
+    var slot = S.transferData[S.selected];
+    if (!slot || !slot.body) { return []; }
+    var kind = form.target.split(':')[0];
+    var sender = form.direction === 'take'
+      ? findTransferTarget(S.selected, form.target.split(':').slice(1).join(':'), kind)
+      : slot.body.ship;
+    return (sender && sender.cargo && sender.cargo.goods) || [];
+  }
+
+  function transferChange(node) {
+    var form = transferForm();
+
+    if (node.dataset.transferTarget !== undefined) {
+      form.target = node.value;
+      form.picks = {};
+      renderTransfer();
+      return true;
+    }
+    if (node.dataset.transferAll !== undefined) { form.all = node.checked; renderTransfer(); return true; }
+    if (node.dataset.transferApproach !== undefined) { form.approach = node.checked; return true; }
+    if (node.dataset.transferPick !== undefined) {
+      var key = node.dataset.transferPick;
+      if (node.checked) {
+        var good = transferSenderGoods().filter(function (g) { return goodKey(g) === key; })[0];
+        form.picks[key] = good ? good.amount : 1;
+      } else {
+        delete form.picks[key];
+      }
+      renderTransfer();
+      return true;
+    }
+    // Redrawing here would replace the Transfer button between the press and the click that
+    // blurred this field, and the click would be lost; `input` has kept the form already.
+    if (node.dataset.transferAmount !== undefined) { transferInput(node); return true; }
+    return false;
+  }
+
+  /* Typing an amount picks the good, and is kept without a redraw so the field keeps focus. */
+  function transferInput(node) {
+    if (node.dataset.transferAmount === undefined) { return false; }
+
+    var form = transferForm();
+    var key = node.dataset.transferAmount;
+    var good = transferSenderGoods().filter(function (g) { return goodKey(g) === key; })[0];
+    var value = Math.round(Number(node.value));
+
+    if (node.value === '' || !isFinite(value) || value < 1) { delete form.picks[key]; }
+    else { form.picks[key] = good ? Math.min(value, good.amount) : value; }
+
+    var box = $('#sv-orders [data-transfer-pick="' + key.replace(/"/g, '\\"') + '"]');
+    if (box) { box.checked = form.picks[key] != null; }
+    refreshTransferSummary();
+    return true;
   }
 
   /* ================================= TRAVEL ================================ */
@@ -5191,6 +5846,14 @@
         + (a.autoAggressive ? 'on' : 'off') + '</span>');
     }
 
+    if (a.transfer) {
+      badges.push('<span class="badge info">transfer · ' + esc(a.transfer.phase || 'moving') + '</span>');
+      rows.push(['cargo transfer', transferText(a.transfer) + ' <span class="mute2">'
+        + esc(TRANSFER_PHASES[a.transfer.phase] || a.transfer.phase || '') + '</span>']);
+    }
+    if (a.lastTransfer) {
+      rows.push(['last transfer', lastTransferHtml(a.lastTransfer)]);
+    }
     if (a.last) {
       rows.push(['last plan', esc(a.last.kind + ' · ' + a.last.outcome)
         + (a.last.reason ? ' <span class="mute2">' + esc(a.last.reason) + '</span>' : '')]);
@@ -5203,7 +5866,7 @@
     return head
       + '<div class="row" style="margin-bottom:8px"><div class="badges">' + badges.join('') + '</div>'
       + '<span class="spacer"></span>'
-      + (plan || a.reaction ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
+      + (plan || a.reaction || a.transfer ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
       + '</div>'
       + kv(rows)
       + '</div>';
@@ -5385,6 +6048,7 @@
       S.nav.automationError = null;
       renderTravel();
       renderStanding();
+      renderTransferState();
     }
     refreshFleet(true);
     sweepEvents();
@@ -5403,6 +6067,7 @@
         S.nav.automationError = null;
         if (S.sub === 'travel') { renderTravel(); }
         renderStanding();
+        renderTransferState();
         renderAutomationList();
       })
       .catch(function (error) {
@@ -8060,6 +8725,7 @@
       }
 
       if (standingClick(button)) { return; }
+      if (transferClick(button)) { return; }
 
       var act = button.dataset.act;
       var i = Number(button.dataset.i);
@@ -8078,6 +8744,7 @@
       var i;
 
       if (standingChange(node)) { return; }
+      if (transferChange(node)) { return; }
 
       if (node.dataset.rowType !== undefined) {
         i = Number(node.dataset.rowType);
@@ -8093,6 +8760,8 @@
         S.orderRows[Number(node.dataset.rowFin)].canFinish = node.checked;
       }
     });
+
+    $('#sv-orders').addEventListener('input', function (e) { transferInput(e.target); });
 
     /* --- travel tab --------------------------------------------------- */
     $('#sv-travel').addEventListener('click', function (e) {

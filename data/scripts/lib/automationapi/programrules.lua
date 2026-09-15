@@ -2,7 +2,7 @@
 --
 -- A program is a list of steps a craft works through by itself. Each step does one thing -
 -- fly a route, farm bosses, run an order chain, go out on a mission, change its standing
--- orders, or wait - until its conditions are met, and then moves on: to the next step, to
+-- orders, move cargo to or from another craft, or wait - until its conditions are met, and then moves on: to the next step, to
 -- a step named by number (which is how a program loops), or to its end.
 --
 --   farm bosses                 until cargo >= 80%          then next
@@ -16,6 +16,7 @@
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
 local MissionRules = include("automationapi/missionrules")
+local TransferRules = include("automationapi/transferrules")
 
 local ProgramRules = {}
 
@@ -80,6 +81,7 @@ end
 --   mission   the craft is back from the mission
 --   travel    the craft is back from the Travel mission: at its destination, available again
 --   standing  at once - the ship keeps the orders after the step
+--   transfer  the ship reports the transfer over: moved, refused, or given up on the way
 --   wait      never: it needs an elapsed condition, or another that ends it
 
 local ON_ENEMIES = {fight = true, hold = true, continue = true}
@@ -196,6 +198,28 @@ ProgramRules.actions =
                 fail("A standing step sets 'action.standing' and/or 'action.attackCivilians'.")
             end
             return action
+        end,
+    },
+    -- POST /ships/{name}/transfer: goods into or out of another craft in the ship's sector.
+    -- The target is named, as a craft is everywhere else; whether it is in the sector is
+    -- the endpoint's check when the step runs, so a program can fly the ship there first.
+    transfer =
+    {
+        naturalEnd = "transfer",
+        normalize = function(spec)
+            local function transferFail(_, message) fail(message) end
+            local target, targetOwner = TransferRules.target(spec, transferFail, "action.")
+            local transfer = TransferRules.normalize(spec, transferFail, "action.")
+            return
+            {
+                type = "transfer",
+                target = target,
+                targetOwner = targetOwner,
+                direction = transfer.direction,
+                all = transfer.all or nil,
+                goods = transfer.goods,
+                approach = transfer.approach,
+            }
         end,
     },
     wait =

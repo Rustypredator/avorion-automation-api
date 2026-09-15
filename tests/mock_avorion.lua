@@ -392,8 +392,41 @@ function M.install()
             ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
             ship.automation.plan = nil
             ship.automation.reaction = nil
+            ship.automation.transfer = nil
             ship.chain = {}
             ship.chainIndex = 0
+        end,
+        -- A target in reach is served at once and reported in lastTransfer; with
+        -- `transferApproach` set the target is out of reach and the ship docks first. The
+        -- goods are not moved: what the ship does with a hold is test_orderchain.lua's.
+        automationApiTransfer = function(ship, payload)
+            local spec = Json.decode(payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.receivedTransfers = ship.receivedTransfers or {}
+            ship.receivedTransfers[#ship.receivedTransfers + 1] = spec
+
+            if M.refuseTransfer then
+                ship.automation.lastTransfer = {id = spec.id, target = spec.target.name,
+                                                outcome = "refused", reason = M.refuseTransfer, total = 0}
+                return
+            end
+
+            if M.transferApproach then
+                ship.chain = {{name = "Dock", action = 19}}
+                ship.chainIndex = 1
+                ship.automation.transfer = {id = spec.id, target = spec.target.name,
+                                            direction = spec.direction, phase = "docking"}
+                return
+            end
+
+            local moved, total = {}, 0
+            for _, good in ipairs(spec.goods or {}) do
+                moved[#moved + 1] = {name = good.name, amount = good.amount or 10}
+                total = total + (good.amount or 10)
+            end
+            ship.automation.lastTransfer = {id = spec.id, target = spec.target.name,
+                                            direction = spec.direction, outcome = "done",
+                                            moved = moved, total = total}
         end,
     }
 
@@ -1038,6 +1071,8 @@ function M.reset()
     M.controlledSectors = {}
     M.obstruction = nil
     M.refusePlan = nil
+    M.refuseTransfer = nil
+    M.transferApproach = nil
     M.noOrderChainExtension = false
     M.jumpUnobstructed = true
     M.routeResult = nil

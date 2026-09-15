@@ -613,6 +613,7 @@ function Navigation.register(router)
                             {ship = params.name, owner = Owner.describe(owner)},
                             function(automation)
                                 return automation.plan == nil and automation.reaction == nil
+                                       and automation.transfer == nil
                             end)
     end)
 

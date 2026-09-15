@@ -378,7 +378,38 @@ function saveLibraryMission(name) {
     };
 }
 
+/* Ore Hound's hold and the craft it could transfer with: the refinery shares its sector,
+   Far Scout does not. The mod answers a transfer in reach with what it moved. */
+const transferHolds = {
+    ship: { name: 'Ore Hound', type: 'Ship', owner: { kind: 'player', index: 1, name: 'Rusty' },
+            position: { x: 1, y: 2 }, sector: { x: 1, y: 2 }, availability: 'Available', captain: true,
+            cargo: { capacity: 500, free: 180, used: 320, goods: [
+                { name: 'Iron', amount: 300, size: 1, price: 10 },
+                { name: 'Iron', amount: 20, size: 1, price: 10, stolen: true }
+            ] } },
+    targets: [
+        { name: 'Rusty Refinery', type: 'Station', owner: { kind: 'player', index: 1, name: 'Rusty' },
+          position: { x: 1, y: 2 }, availability: 'Available', sameSector: true,
+          cargo: { capacity: 12000, free: 5000, used: 7000, goods: [{ name: 'Oil', amount: 900, size: 2 }] } },
+        { name: 'Far Scout', type: 'Ship', owner: { kind: 'player', index: 1, name: 'Rusty' },
+          position: { x: 40, y: 40 }, availability: 'Available', sameSector: false,
+          cargo: { capacity: 50, free: 50, used: 0, goods: [] } }
+    ],
+    count: 2
+};
+
+function sendTransfer(sent) {
+    const moved = sent.all ? [{ name: 'Oil', amount: 900 }]
+        : sent.goods.map((g) => ({ name: g.name, amount: g.amount || 300 }));
+    return {
+        ship: 'Ore Hound', transferId: 't1', summary: 'a transfer', confirmed: true, done: true,
+        carriedOutBy: { name: 'Ore Hound', owner: { kind: 'player' } },
+        result: { id: 't1', outcome: 'done', moved: moved, total: 1, target: sent.target, direction: sent.direction }
+    };
+}
+
 const dynamic = {
+    '/ships/Ore%20Hound/transfer': sendTransfer,
     '/automation/missions/library/Trade%20run': saveLibraryMission('Trade run'),
     '/ships/Ore%20Hound/program': saveProgram,
     '/ships/Ore%20Hound/program/control': controlProgram,
@@ -403,6 +434,7 @@ const routes = {
     },
     '/ships/Ore%20Hound/mission': { active: null },
     '/ships/Ore%20Hound/automation': houndAutomation,
+    '/ships/Ore%20Hound/transfer': transferHolds,
     get '/automation/missions'() { return automationList(); },
     get '/automation/missions/library'() { return { missions: Object.values(libraryStore), maxName: 48 }; },
     get '/automation/programs'() {
@@ -642,6 +674,66 @@ const ready = window.document.readyState === 'loading'
     sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
     check(sentStanding.body.attackCivilians === true && sentStanding.body.standing === undefined,
           'and civilians are one setting for both');
+
+    console.log('\ncargo transfer');
+
+    const transfer = () => $('#transfer-section');
+    const targetPick = transfer().querySelector('[data-transfer-target]');
+    check(targetPick && Array.from(targetPick.options).map((o) => o.value).join('|') === 'player:Rusty Refinery',
+          'only craft in the same sector are offered to transfer with');
+    check(/Rusty Refinery/.test(transfer().textContent) && /Oil 900/.test(transfer().textContent),
+          'and the other hold is shown with what is in it');
+    check(transfer().querySelectorAll('[data-transfer-pick]').length === 2,
+          'giving lists the ship\'s goods, stolen ones apart');
+
+    const ironAmount = transfer().querySelector('[data-transfer-amount="Iron"]');
+    ironAmount.value = '120';
+    ironAmount.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(20);
+    check(transfer().querySelector('[data-transfer-pick="Iron"]').checked
+          && /120 units/.test(transfer().querySelector('[data-transfer-summary]').textContent),
+          'typing an amount picks the good and counts it');
+    ironAmount.dispatchEvent(new window.Event('change', { bubbles: true }));
+    const sendButton = transfer().querySelector('[data-act="transfer-send"]');
+    check(sendButton && sendButton.isConnected, 'without redrawing the button away from under the click');
+
+    posts.length = 0;
+    sendButton.click();
+    await settle(500);
+    let sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.target === 'Rusty Refinery' && sentTransfer.body.targetOwner === 'player'
+          && sentTransfer.body.direction === 'give' && sentTransfer.body.approach === true
+          && sentTransfer.body.goods.length === 1 && sentTransfer.body.goods[0].name === 'Iron'
+          && sentTransfer.body.goods[0].amount === 120 && sentTransfer.body.goods[0].stolen === false,
+          'the transfer names the target, the good, the amount and that it is not the stolen kind');
+    check(/Moved/.test($('#transfer-result').textContent) && /120 Iron/.test($('#transfer-result').textContent),
+          'and what the ship moved is shown');
+
+    transfer().querySelector('[data-transfer-max="Iron|stolen"]').click();
+    await settle(20);
+    posts.length = 0;
+    transfer().querySelector('[data-act="transfer-send"]').click();
+    await settle(500);
+    sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.goods[0].stolen === true && sentTransfer.body.goods[0].amount === undefined,
+          'all of a good is sent as all of it, not as the amount last read');
+
+    transfer().querySelector('[data-transfer-dir="take"]').click();
+    await settle(20);
+    check(transfer().querySelectorAll('[data-transfer-pick]').length === 1
+          && /Oil/.test(transfer().querySelector('.transfer-goods').textContent),
+          'taking lists the other hold\'s goods');
+    const takeAll = transfer().querySelector('[data-transfer-all]');
+    takeAll.checked = true;
+    takeAll.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(20);
+    posts.length = 0;
+    transfer().querySelector('[data-act="transfer-send"]').click();
+    await settle(500);
+    sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.direction === 'take' && sentTransfer.body.all === true
+          && sentTransfer.body.goods === undefined,
+          'and all takes the whole hold');
 
 
     tab('overview').click();
@@ -1145,6 +1237,25 @@ const ready = window.document.readyState === 'loading'
     typed(editor().querySelector('[data-pf="steps.3.action.to.x"]'), '-300');
     change(editor().querySelector('[data-pf="steps.3.action.swiftness"]'), '0');
 
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.4.action.type"]'), 'transfer');
+    await settle(300);
+    const transferTarget = editor().querySelector('[data-pf="steps.4.action.target"]');
+    check(transferTarget && Array.from(transferTarget.options).some((o) => o.value === 'Far Scout'),
+          'a transfer step offers every craft, since the program can fly there first');
+    change(transferTarget, 'Rusty Refinery');
+    await settle(50);
+    const everything = editor().querySelector('[data-pf="steps.4.action.all"]');
+    everything.checked = false;
+    change(everything);
+    await settle(50);
+    const pickIron = editor().querySelector('[data-prog-good-pick="4"][data-good="Iron"]:not([data-stolen])');
+    check(pickIron && /300/.test(pickIron.textContent), 'the goods in the hold they come out of are offered');
+    click(pickIron);
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.4.action.goods.0.amount"]'), '50');
+
     posts.length = 0;
     click(editor().querySelector('[data-prog-act="save"]'));
     await settle(400);
@@ -1153,9 +1264,16 @@ const ready = window.document.readyState === 'loading'
           'the mission step is saved naming the library mission');
     check(libSteps && libSteps[3].action.type === 'travel' && libSteps[3].action.to.x === -300
           && libSteps[3].action.swiftness === 0, 'and the travel step with its destination and swiftness');
+    const transferStep = libSteps && libSteps[4] && libSteps[4].action;
+    check(transferStep && transferStep.type === 'transfer' && transferStep.target === 'Rusty Refinery'
+          && transferStep.targetOwner === 'player' && transferStep.direction === 'give' && transferStep.all === undefined
+          && transferStep.goods.length === 1 && transferStep.goods[0].name === 'Iron' && transferStep.goods[0].amount === 50,
+          'and the transfer step with its target and the goods picked');
     const listedSteps = $$('#automation-pane .program-step');
     check(/Trade run/.test(listedSteps[2].textContent) && /travel to -300/.test(listedSteps[3].textContent),
           'both read back in the step list');
+    check(listedSteps[4] && /give 50 Iron to Rusty Refinery/.test(listedSteps[4].textContent),
+          'as does the transfer');
 
     $('[data-view="fleet"]').click();
     await settle(50);

@@ -494,6 +494,7 @@ station, go back to step 1.
 | `mission` | optionally `library`, the name of a [library mission](#mission-library), or `rule`, a mission automation rule of its own; with neither, the craft's stored rule | when the craft is back |
 | `travel` | `to {x, y}`, optionally `swiftness` (0-3) as for `/travel` | when the craft is back, at the destination |
 | `standing` | `standing`, `attackCivilians` as for `POST /ships/{name}/automation` | at once |
+| `transfer` | `target`, `targetOwner`, `direction`, `goods` or `all`, `approach` as for [`/transfer`](#post-shipsnametransfer) | when the ship reports the transfer over - moved, refused on the way, or given up. A target that is not in the sector yet is retried, so a route step before it can fly the ship there |
 | `wait` | - | never - needs a condition |
 
 A step with no conditions ends with its action. One with conditions ends when `any` (the
@@ -947,6 +948,8 @@ What the ship's automation is doing, as the ship itself last reported it.
 | `reaction` | a standing order holding the ship right now: `{kind, mode, phase, resumes, loot, lootResult}`. `phase` is `fighting`, `looting` or `returning`; `resumes` says whether an interrupted chain comes back afterwards. Absent when there is none, and never alongside `plan` |
 | `lastReaction.outcome` | `done`, `replaced` (orders from elsewhere; the old chain is not put back), `switched_off` (the chain is put back), `stopped` |
 | `defenceFights`, `lootRuns` | fights and loot runs started by standing orders, over the life of the ship |
+| `transfer` | a [cargo transfer](#post-shipsnametransfer) on its way to a craft out of reach: `{id, target, direction, all, goods, phase}`, `phase` `docking` or `approaching`. Absent when there is none |
+| `lastTransfer` | how the last transfer ended: `{id, target, direction, outcome, reason, message, moved, short, total, approached, sector}` - see [the outcomes](#post-shipsnametransfer) |
 
 Works offline, from the database copy.
 
@@ -1006,9 +1009,116 @@ order - `details.known` lists them - or an order that sets nothing), `400 bad_st
 
 ## POST /ships/{name}/automation/stop
 
-Ends the ship's plan, or a standing order holding the ship, and clears its order chain. The
-standing orders are settings and stay as they were. Answered once the ship reports it has
-neither.
+Ends the ship's plan, a standing order holding the ship, or a cargo transfer on its way to its
+target, and clears its order chain. The standing orders are settings and stay as they were.
+Answered once the ship reports it has none of them.
+
+**Requires the owning player to be logged in.**
+
+## GET /ships/{name}/transfer
+
+The craft's hold, and every other craft of yours and of your alliance with theirs: what a
+[transfer](#post-shipsnametransfer) could move, and where to. Alliance craft are listed only
+when your rank has ManageShips. Read from the ship database, so it works offline - and for a
+craft in a loaded sector, the hold can trail the craft by a moment.
+
+| query | notes |
+|---|---|
+| `sameSector` | `true` lists only craft in the same sector, the ones a transfer can reach now |
+
+```json
+{
+  "ship": {
+    "name": "Ore Hound", "type": "Ship", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+    "position": {"x": 12, "y": -4}, "sector": {"x": 12, "y": -4},
+    "availability": "Available", "captain": true,
+    "cargo": {"capacity": 500, "free": 180, "used": 320,
+              "goods": [{"name": "Iron", "amount": 300, "size": 1, "price": 10, "stolen": false, "...": "..."}]}
+  },
+  "targets": [
+    {"name": "Rusty Refinery", "type": "Station", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+     "position": {"x": 12, "y": -4}, "availability": "Available", "sameSector": true,
+     "cargo": {"capacity": 12000, "free": 5000, "used": 7000, "goods": ["..."]}}
+  ],
+  "count": 1
+}
+```
+
+Targets in the same sector come first, then the rest by name.
+
+## POST /ships/{name}/transfer
+
+Moves goods between the craft and another of yours or of your alliance in the same sector,
+as the game's own transfer window does.
+
+```jsonc
+{
+  "target": "Rusty Refinery",
+  "targetOwner": "player",          // optional: player or alliance, when both own a craft of that name
+  "direction": "give",              // give: into the target (default), take: out of it
+  "goods": [
+    {"name": "Iron", "amount": 120},  // amount left out (or null): all of that good
+    {"name": "Iron", "stolen": true}  // stolen: true only stolen ones, false only clean ones
+  ],
+  "approach": true                  // default true; see below
+}
+```
+
+`"all": true` instead of `goods` moves the whole hold, whatever it holds when the ship gets to
+it. A good named without `stolen` takes the clean ones first. What does not fit in the
+receiving hold stays where it is and is reported; nothing is lost.
+
+The transfer is carried out by the ship, which reads both holds as they really are - the
+request is not checked against the database's copy of either. Vanilla's rule decides whether
+the two are in reach: their nearest points at most 20 apart, or as far as the longer
+transporter reaches. Out of reach, with `approach`:
+
+- a **station** is docked with, with the game's own dock order;
+- a **ship** is flown to, until the two are in reach;
+
+and the goods move the moment they are, which the ship reports in its automation state. An
+approach is an order: it needs a captain and nobody at the controls, it ends a route, farm or
+standing order holding the ship, and it gives up after five minutes. Orders given to the ship
+meanwhile end it, as does [stop](#post-shipsnameautomationstop). A transfer in reach touches
+nothing the ship is doing, and needs no captain.
+
+A **station** in the path is served by the ship at the other end, the other way round: a
+station that gives is a ship that takes. The ship is then the one that has to be orderable,
+and its event feed is where the transfer is reported (`carriedOutBy`). Two stations cannot
+transfer between themselves.
+
+The answer is held until the ship reports the transfer done, refused, or under way:
+
+```json
+{
+  "ship": "Ore Hound", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "target": {"name": "Rusty Refinery", "owner": {"kind": "player", "index": 1, "name": "Rusty"}},
+  "sector": {"x": 12, "y": -4}, "transferId": "t3-8120",
+  "direction": "give", "all": false, "goods": [{"name": "Iron", "amount": 120}], "approach": true,
+  "summary": "give 120 Iron to Rusty Refinery",
+  "carriedOutBy": {"name": "Ore Hound", "owner": {"kind": "player", "index": 1, "name": "Rusty"}},
+  "confirmed": true, "done": true,
+  "result": {"id": "t3-8120", "outcome": "done", "total": 120, "approached": false,
+             "moved": [{"name": "Iron", "amount": 120}], "target": "Rusty Refinery", "direction": "give"}
+}
+```
+
+| field | notes |
+|---|---|
+| `done` | `true` with `result` once it is over; `false` with `phase` (`docking`, `approaching`) while the ship gets in reach |
+| `result.outcome` | `done`, `partial` (some moved, see `short`), `nothing_moved`, `refused`; later, in the automation state, also `replaced` and `stopped` |
+| `result.moved` | `[{name, amount, stolen?}]` per kind of good moved |
+| `result.short` | `[{name, wanted, moved, reason}]` for what was not: `not_held`, `no_space`, `not_enough`; with `all`, `[{reason: "no_space"}]` |
+| `result.reason` | why it was refused or given up: `target_not_here`, `target_gone`, `same_craft`, `not_permitted`, `out_of_range`, `needs_captain`, `piloted`, `timeout`, `no_goods`; `empty_hold` when `all` found nothing |
+
+Refused by the ship, the answer is `422` with `error.code` set to the reason. Errors checked
+before anything is sent: `400 no_target`, `400 no_goods`, `400 bad_goods`, `400 bad_direction`,
+`400 conflicting_goods`, `400 bad_approach`, `400 bad_target_owner`, `404 no_such_target`,
+`403 missing_privilege` (either craft is the alliance's, and your rank lacks ManageShips),
+`409 target_in_background`, `422 same_craft`, `422 not_same_sector` (`details` has both
+sectors), `422 no_ship`, and the world checks every order has: `409 owner_offline`,
+`409 ship_in_background`, `409 sector_not_loaded`. A `202` means the ship did not report
+back in time, as for [orders](#post-shipsnameorders).
 
 **Requires the owning player to be logged in.**
 
