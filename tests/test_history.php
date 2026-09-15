@@ -80,7 +80,7 @@ register_shutdown_function(static function () use (&$madeKeys, &$madeFactions): 
         $db = Db::connect();
         $factions = '{' . implode(',', $madeFactions) . '}';
         foreach (['visits', 'events', 'station_samples', 'faction_samples', 'event_marks',
-                  'manifests'] as $table) {
+                  'manifests', 'station_events'] as $table) {
             $db->prepare("DELETE FROM {$table} WHERE faction = ANY(CAST(:f AS bigint[]))")
                ->execute([':f' => $factions]);
         }
@@ -766,6 +766,217 @@ $left = $economy->economySummary([])['stations'];
 check(count($left) === 1 && $left[0]['ship'] === 'Alliance Exchange',
       'clearing takes the player\'s samples and leaves the alliance\'s');
 
+echo "\nstation activity\n";
+
+/*
+ * The mod's station feed, as GET /economy/events answers it: pages of trades, production
+ * windows and reload catch-ups, numbered once per server run across every faction. Each
+ * event names the faction that owns its station, and that is who the row belongs to.
+ */
+$tycoon = freshFaction();
+$tycoonGuild = freshFaction();
+$activity = member($tycoon, $tycoonGuild, 'Rusty');
+$partner = member(freshFaction(), $tycoonGuild);
+$outsider = member(freshFaction(), null);
+
+$mine = owner('player', $tycoon, 'Rusty');
+$ours = owner('alliance', $tycoonGuild);
+
+// The feed's run ids are global, so a run of this test must not share one with another.
+$bootA = 'boot-A-' . bin2hex(random_bytes(4));
+$bootB = 'boot-B-' . bin2hex(random_bytes(4));
+
+function feedPage(string $boot, float $now, int $cursor, bool $more, array $events): stdClass
+{
+    return (object) ['boot' => $boot, 'now' => $now, 'cursor' => $cursor, 'more' => $more,
+                     'gap' => false, 'events' => $events];
+}
+
+function tradeEvent(int $seq, float $at, stdClass $owner, string $station, string $direction,
+                    string $good, float $units, float $price, bool $internal = false): stdClass
+{
+    return (object) [
+        'seq' => $seq, 'at' => $at, 'kind' => 'trade', 'station' => $station,
+        'owner' => $owner, 'faction' => $owner->index,
+        'sector' => (object) ['x' => 12, 'y' => -4],
+        'direction' => $direction, 'good' => $good, 'units' => $units, 'price' => $price,
+        'unitPrice' => $units > 0 ? $price / $units : 0, 'internal' => $internal,
+        'channel' => 'docked',
+    ];
+}
+
+function recipeOf(): array
+{
+    return [
+        'results' => [(object) ['name' => 'Oil', 'amount' => 5]],
+        'ingredients' => [(object) ['name' => 'Raw Oil', 'amount' => 10],
+                          (object) ['name' => 'Fuel', 'amount' => 2, 'optional' => true]],
+        'garbage' => [],
+    ];
+}
+
+$window = (object) ([
+    'seq' => 3, 'at' => 1000.0, 'kind' => 'production', 'station' => 'Rusty Refinery',
+    'owner' => $mine, 'sector' => (object) ['x' => 12, 'y' => -4],
+    'seconds' => 60, 'slotSeconds' => 180, 'busySlotSeconds' => 80, 'starvedSeconds' => 40,
+    'blockedSeconds' => 20, 'idleSeconds' => 0, 'cycles' => 2, 'boosted' => 1, 'slots' => 3,
+    'cycleSeconds' => 30,
+] + recipeOf());
+
+check($activity->stationEventCursor() === ['boot' => null, 'cursor' => 0],
+      'a key that has never collected starts from zero');
+
+$first = feedPage($bootA, 1000.0, 3, true, [
+    tradeEvent(1, 400.0, $mine, 'Rusty Refinery', 'bought', 'Raw Oil', 200, 14000),
+    tradeEvent(2, 700.0, $mine, 'Rusty Refinery', 'sold', 'Oil', 50, 17000),
+    $window,
+]);
+
+$activity->recordStationEvents($first, true, 0);
+$log = $activity->stationEvents([]);
+
+check(count($log) === 3, 'a page of the feed is stored event by event');
+check(abs($log[0]['t'] - (time() - 600)) <= 2,
+      'dated off the server clock the page carries, not the time it arrived');
+check($log[0]['direction'] === 'bought' && $log[0]['good'] === 'Raw Oil',
+      'with the trade itself kept');
+check($activity->stationEventCursor() === ['boot' => $bootA, 'cursor' => 3],
+      'and an in-order page moves the collector\'s cursor');
+
+$activity->recordStationEvents($first, true, 0);
+check(count($activity->stationEvents([])) === 3, 'collecting the same page twice stores nothing new');
+
+$catchup = (object) ([
+    'seq' => 4, 'at' => 1500.0, 'kind' => 'catchup', 'station' => 'Rusty Refinery',
+    'owner' => $mine, 'sector' => (object) ['x' => 12, 'y' => -4],
+    'seconds' => 3600, 'cycles' => 120,
+] + recipeOf());
+
+$activity->recordStationEvents(feedPage($bootA, 1600.0, 5, false, [
+    $catchup,
+    tradeEvent(5, 1550.0, $mine, 'Rusty Refinery', 'bought', 'Raw Oil', 25, 0, true),
+]), true, 3);
+check($activity->stationEventCursor()['cursor'] === 5, 'the next page continues it');
+
+// A console opening one station's newest events: stored, but no continuation.
+$newest = (object) ['boot' => $bootA, 'now' => 2000.0, 'cursor' => 9, 'more' => false,
+                    'station' => 'Rusty Refinery', 'owner' => $mine,
+                    'events' => [(object) ['seq' => 9, 'at' => 1990.0, 'kind' => 'trade',
+                                           'direction' => 'sold', 'good' => 'Oil', 'units' => 40,
+                                           'price' => 13600, 'internal' => false]]];
+$activity->recordStationEvents($newest);
+check($activity->stationEventCursor()['cursor'] === 5,
+      'a page that is not an in-order continuation leaves the cursor alone');
+check(count($activity->stationEvents(['ship' => 'Rusty Refinery'])) === 6,
+      'while the events on it are still kept, station and owner taken off the page');
+
+// The server restarts: the new run numbers from zero again.
+$restarted = feedPage($bootB, 50.0, 2, false, [
+    tradeEvent(1, 40.0, $ours, 'Alliance Exchange', 'sold', 'Ore', 100, 3000),
+]);
+$restarted->events[0]->sector = (object) ['x' => 30, 'y' => 30];
+
+$activity->recordStationEvents($restarted, true, 5);
+check($activity->stationEventCursor() === ['boot' => $bootA, 'cursor' => 5],
+      'a page from another server run does not move a cursor it was not asked from');
+
+$activity->recordStationEvents($restarted, true, 0);
+check($activity->stationEventCursor() === ['boot' => $bootB, 'cursor' => 2],
+      'starting that run over from zero does');
+check(count($activity->stationEvents(['ship' => 'Alliance Exchange'])) === 1,
+      'and the same seq under a new run is a new event, stored once');
+
+echo "\nstation activity belongs to the station's owner\n";
+
+check(array_column($partner->stationEvents([]), 'station') === ['Alliance Exchange'],
+      'another member reads the alliance\'s station activity, and none of the player\'s');
+check($outsider->stationEvents([]) === [] && $outsider->economyObserved([])['stations'] === [],
+      'someone outside the alliance reads none of it');
+
+$partner->recordStationEvents($restarted, true, 0);
+check(count($partner->stationEvents([])) === 1,
+      'a second member collecting the same page stores nothing new');
+check($partner->stationEventCursor() === ['boot' => $bootB, 'cursor' => 2]
+      && $activity->stationEventCursor() === ['boot' => $bootB, 'cursor' => 2],
+      'while each key keeps its own cursor');
+
+$nameless = feedPage($bootB, 60.0, 3, false, [
+    (object) ['seq' => 3, 'at' => 55.0, 'kind' => 'trade', 'station' => 'Somewhere',
+              'owner' => (object) ['kind' => 'alliance'], 'direction' => 'sold', 'good' => 'Ore',
+              'units' => 1, 'price' => 30, 'internal' => false],
+]);
+$activity->recordStationEvents($nameless);
+check($activity->stationEvents(['ship' => 'Somewhere']) === [],
+      'an alliance event that does not say which alliance is not guessed at');
+
+echo "\nobserved economy\n";
+
+$observed = $activity->economyObserved(['ship' => 'Rusty Refinery']);
+check(count($observed['stations']) === 1, 'one row per station');
+
+$refinery = $observed['stations'][0];
+$production = $refinery['production'];
+
+check($production['cycles'] == 2 && $production['catchupCycles'] == 120,
+      'live and catch-up cycles are counted apart');
+check(abs($production['utilization'] - 80 / 180) < 0.001, 'utilisation is busy slot time over slot time');
+check($production['starvedSeconds'] == 40 && $production['blockedSeconds'] == 20,
+      'with the reasons for idle slots summed');
+check(abs($production['cyclesPerHour'] - 122 * 3600 / 3660) < 0.01,
+      'and a rate over running and catch-up time together');
+check($production['slots'] === 3 && $production['cycleSeconds'] == 30,
+      'and the line described as its latest window reports it');
+check($refinery['span'] == 3660, 'span is that same running time');
+
+$byGood = [];
+foreach ($refinery['goods'] as $row) {
+    $byGood[$row['good']] = $row;
+}
+
+check($byGood['Oil']['made'] == 610, 'units made are cycles times the recipe each window carried');
+check($byGood['Raw Oil']['used'] == 1220, 'and so are units used');
+check($byGood['Fuel']['used'] == 2, 'an optional ingredient only on boosted cycles, and never on catch-up');
+check($byGood['Raw Oil']['bought']['units'] == 200 && $byGood['Raw Oil']['bought']['unitPrice'] == 70,
+      'trades are summed per good with the price they happened at');
+check($byGood['Raw Oil']['internalIn'] == 25, 'an internal delivery is movement and not a price');
+check($byGood['Oil']['sold']['units'] == 90 && $byGood['Oil']['sold']['unitPrice'] == 340,
+      'every recorded sale counts, however it was collected');
+check(abs($byGood['Oil']['madePerHour'] - 610 * 3600 / 3660) < 0.01, 'and made per hour of span');
+
+check($refinery['traded']['net'] == 30600 - 14000, 'traded net is sales less purchases');
+
+check(count($activity->economyObserved(['x' => 30, 'y' => 30])['stations']) === 1,
+      'a sector filter reads one sector');
+check($activity->economyObserved(['owner' => 'alliance'])['stations'][0]['ship'] === 'Alliance Exchange',
+      'and an owner filter one owner');
+check($activity->economyObserved(['ship' => 'Rusty Refinery', 'from' => time() + 60])['stations'] === [],
+      'a window after everything reads empty');
+
+check(count($activity->stationEvents(['kind' => 'production'])) === 1, 'the log can be narrowed to one kind');
+
+// A player and their alliance can each own a station of the same name.
+$activity->recordStationEvents(feedPage($bootB, 100.0, 5, false, [
+    tradeEvent(4, 90.0, $mine, 'Twin Yard', 'sold', 'Steel', 10, 1000),
+    tradeEvent(5, 95.0, $ours, 'Twin Yard', 'sold', 'Steel', 20, 3000),
+]));
+$twins = $activity->economyObserved(['ship' => 'Twin Yard'])['stations'];
+check(count($twins) === 2 && array_sum(array_map(static fn ($t) => $t['traded']['sold'], $twins)) == 4000,
+      'and they are kept apart rather than summed as one');
+
+$shape = $activity->summary();
+check($shape['economy']['events'] === 9 && $shape['economy']['recordedStations'] === 4,
+      'the summary says how much activity is stored');
+
+$activity->clear('Rusty Refinery');
+check($activity->economyObserved(['ship' => 'Rusty Refinery'])['stations'] === [],
+      'clearing a station takes its activity with it');
+
+$activity->clear(null);
+check(array_column($activity->stationEvents([]), 'station') === ['Alliance Exchange', 'Twin Yard'],
+      'and clearing everything takes the player\'s activity and leaves the alliance\'s');
+check($activity->stationEventCursor()['cursor'] === 2,
+      'without rewinding the collector into re-recording what was just thrown away');
+
 echo "\nclearing\n";
 
 $history->clear('Tug');
@@ -881,7 +1092,7 @@ try {
     Db::migrate($old);
 
     $version = (int) $old->query('SELECT version FROM api_schema')->fetch()['version'];
-    check($version === 3, 'the migration brings it to version 3');
+    check($version === 4, 'the migration brings it up to date');
     check((int) $old->query('SELECT COUNT(*) AS n FROM api_keys WHERE legacy')->fetch()['n'] === 3,
           'every existing key is flagged for adoption');
     check((int) $old->query('SELECT COUNT(*) AS n FROM visits WHERE faction IS NULL')->fetch()['n'] === 6,
@@ -960,6 +1171,47 @@ try {
     $swap(null);
     $old->exec('SET search_path TO public');
     $old->exec("DROP SCHEMA {$upgradeSchema} CASCADE");
+}
+
+echo "\nupgrading a database from the first station activity branch\n";
+
+/*
+ * That branch numbered its schema 3 too: version 2 plus key-owned station tables, and none
+ * of the ownership step. Taken on its word it would never get that step at all.
+ */
+$branchSchema = 'upgrade_' . bin2hex(random_bytes(4));
+$old->exec("CREATE SCHEMA {$branchSchema}");
+$old->exec("SET search_path TO {$branchSchema}");
+
+try {
+    foreach ((new ReflectionMethod(Db::class, 'base'))->invoke(null) as $sql) {
+        $old->exec($sql);
+    }
+    $old->exec('CREATE TABLE station_events (id BIGSERIAL PRIMARY KEY,
+                    key_id BIGINT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+                    station TEXT NOT NULL, boot TEXT NOT NULL, seq BIGINT NOT NULL)');
+    $old->exec('CREATE TABLE station_feed_state (key_id BIGINT PRIMARY KEY, boot TEXT NOT NULL,
+                    cursor BIGINT NOT NULL DEFAULT 0)');
+    $old->exec('INSERT INTO api_schema (version) VALUES (3)');
+
+    $swap($old);
+    Db::migrate($old);
+
+    $column = static fn (string $table, string $name): bool => $old->query(
+        "SELECT 1 FROM information_schema.columns WHERE table_schema = '{$branchSchema}'
+           AND table_name = '{$table}' AND column_name = '{$name}'"
+    )->fetch() !== false;
+
+    check((int) $old->query('SELECT version FROM api_schema')->fetch()['version'] === 4,
+          'it is brought up to date');
+    check($column('api_keys', 'legacy') && $column('visits', 'faction'),
+          'including the ownership step it claimed to have');
+    check($column('station_events', 'faction') && !$column('station_events', 'key_id'),
+          'and its key-owned station table is replaced by the owned one');
+} finally {
+    $swap(null);
+    $old->exec('SET search_path TO public');
+    $old->exec("DROP SCHEMA {$branchSchema} CASCADE");
 }
 
 echo "\n";

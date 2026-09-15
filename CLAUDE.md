@@ -36,6 +36,8 @@ data/scripts/                   everything the game loads
                                 handling, standing orders (enemies/loot, idle or
                                 interrupt+resume), boss farming, cargo transfers
                                 (move goods, dock/fly into reach) run on the ship
+  lib/tradingmanager.lua        APPENDED onto vanilla: hands TradingManager to stationhooks
+  entity/merchants/factory.lua  APPENDED onto vanilla: hands production locals to stationhooks
   commands/apikey.lua           /apikey chat command (new/list/revoke keys)
   galaxy/automationapi/bridge.lua   Galaxy script: transport loop, auth, router, all reads,
                                     job queue for writes, stats console line
@@ -51,6 +53,10 @@ data/scripts/                   everything the game loads
     shipdata.lua      ShipDatabaseEntry reads (work offline / unloaded sectors)
     shipevents.lua    in-memory per-ship event ring buffer (200)
     economy.lua       station books from getSecuredScriptValues (TradingManager state)
+    stationhooks.lua  runs INSIDE stations: wraps trade/production functions, pushes each
+                      trade, a production window per minute and reload catch-up to the galaxy
+    stationevents.lua in-memory station feed (ring per faction, one seq per server run/boot)
+                      + per-station running totals
     enums.lua         engine userdata enums -> names
     missiontypes.lua  API mission keys <-> vanilla command UUIDs, config/area building
     missionrules.lua  pure arithmetic for mission automation limits/candidates
@@ -76,7 +82,8 @@ data/scripts/                   everything the game loads
       navigation.lua        /route, /farm, /automation (talks to entity/orderchain.lua)
       transfer.lua          /ships/{name}/transfer: holds to pick from, cargo moves via the ship
       map.lua               /galaxy/*, /map/* (sliced scans across ticks)
-      economy.lua           /stations, /stations/{name}, /economy
+      economy.lua           /stations, /stations/{name}, /economy,
+                            /stations/{name}/events, /economy/events (station feed)
 docs/
   api.md        every endpoint + response shapes, incl. bridge-local /history/*
   protocol.md   file transport, envelopes, status codes, auth, root resolution
@@ -87,7 +94,8 @@ docker/                         deployment only, NOT shipped to Workshop
   Caddyfile, .env.example       plain HTTP site + self-signed HTTPS site (TLS_HOSTS)
   bridge/public/index.php       HTTP <-> file relay, serves /history/*, records history
   bridge/src/db.php             PDO connection + schema/migrations
-  bridge/src/history.php        history store: visits, events, station/faction samples, manifests
+  bridge/src/history.php        history store: visits, events, station/faction samples, manifests,
+                                station events (all rows owned by faction, see Storage in api.md)
   bridge/src/poll.php           poller loop (POLL_KEYS) calling the API over HTTP
 web/                            browser console, no build step, no deps, NOT shipped
   index.html, app.css
@@ -172,7 +180,7 @@ tools/
 - Player names are not identities. Use player indices.
 - Scripts need the `-- namespace X` comment line. Do not remove it.
 - The init overlays copy vanilla files. After an Avorion update, re-diff them (and
-  `orderchain.lua` hooks) against the game's copies.
+  `orderchain.lua`, `tradingmanager.lua` and `factory.lua` hooks) against the game's copies.
 
 ## Running tests
 

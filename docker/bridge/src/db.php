@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 3;
+    private const SCHEMA = 4;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -133,7 +133,7 @@ final class Db
 
         try {
             // Re-read under the lock: whoever held it before us may have just done the work.
-            $current = self::schemaVersion($pdo);
+            $current = self::effectiveVersion($pdo, self::schemaVersion($pdo));
             if ($current < self::SCHEMA) {
                 // One transaction for the lot, so a migration that fails part-way leaves
                 // the previous schema standing rather than half of the next one.
@@ -174,6 +174,41 @@ final class Db
     }
 
     /**
+     * The version a database really is at, which is not always the one it says.
+     *
+     * The first cut of station activity recording was published on its own branch before
+     * rows had owners, and numbered its schema 3 as well: base plus key-owned station_events
+     * and station_feed_state, and none of version 3 as it stands here. A database built by
+     * that branch reads as 3 and would skip the ownership step altogether. It is told apart
+     * by the column version 3 adds to api_keys, and is taken back to 2 - after dropping the
+     * two station tables it made, which hold no owner to move them onto and are copies of a
+     * feed the collector reads again from the mod's buffer anyway.
+     *
+     * Only ever called under the migration lock, and only when an upgrade is due.
+     */
+    private static function effectiveVersion(PDO $pdo, int $version): int
+    {
+        if ($version !== 3) {
+            return $version;
+        }
+
+        $shared = $pdo->query(
+            "SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'api_keys'
+               AND column_name = 'legacy'"
+        )->fetch();
+
+        if ($shared !== false) {
+            return $version;
+        }
+
+        $pdo->exec('DROP TABLE IF EXISTS station_feed_state');
+        $pdo->exec('DROP TABLE IF EXISTS station_events');
+
+        return 2;
+    }
+
+    /**
      * Schema steps by the version they bring the database up to. A database at version N
      * runs every step above N, in order.
      *
@@ -184,7 +219,7 @@ final class Db
      */
     private static function migrations(): array
     {
-        return [2 => self::base(), 3 => self::shared()];
+        return [2 => self::base(), 3 => self::shared(), 4 => self::stationEvents()];
     }
 
     /**
@@ -465,6 +500,81 @@ final class Db
                  taken_at TIMESTAMPTZ NOT NULL,
                  data     JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
                  PRIMARY KEY (faction, ship)
+             )',
+        ];
+    }
+
+    /**
+     * Version 4: what stations actually did, recorded from inside the stations.
+     *
+     * Owned from the start, like every table since version 3: a row carries the faction
+     * that owns the station, so there is nothing for History::adopt to move and no key_id
+     * column at all.
+     *
+     * @return list<string>
+     */
+    private static function stationEvents(): array
+    {
+        return [
+            /*
+             * Trades with the good, units and price they happened at, production windows with
+             * the cycles a line really ran and why its idle slots were idle, and reload
+             * catch-ups. See the mod's automationapi/stationhooks.lua for how it is captured.
+             *
+             * The mod keeps these in a ring buffer that starts over with every server run,
+             * and numbers them from zero each time across every faction, so (boot, seq) is
+             * what identifies one - `boot` is the mod's own id for the run, and replaces the
+             * guesswork recordEvents has to do for ship events.
+             *
+             * good, direction, units and credits are columns because the reads group and sum
+             * on them; the rest of a trade, and every field of a production window, is in
+             * `data`, where the mod can add to it without a migration.
+             */
+            'CREATE TABLE IF NOT EXISTS station_events (
+                 id          BIGSERIAL PRIMARY KEY,
+                 faction     BIGINT      NOT NULL,
+                 station     TEXT        NOT NULL,
+                 owner       TEXT        NOT NULL DEFAULT \'\',
+                 x           INTEGER     NOT NULL DEFAULT 0,
+                 y           INTEGER     NOT NULL DEFAULT 0,
+                 boot        TEXT        NOT NULL,
+                 seq         BIGINT      NOT NULL,
+                 kind        TEXT        NOT NULL,
+                 happened_at TIMESTAMPTZ NOT NULL,
+                 good        TEXT,
+                 direction   TEXT,
+                 internal    BOOLEAN     NOT NULL DEFAULT FALSE,
+                 units       DOUBLE PRECISION NOT NULL DEFAULT 0,
+                 credits     DOUBLE PRECISION NOT NULL DEFAULT 0,
+                 data        JSONB       NOT NULL DEFAULT \'{}\'::jsonb
+             )',
+
+            // Idempotent recording: the poller, an open console and every member of an
+            // alliance collect the same page.
+            'CREATE UNIQUE INDEX IF NOT EXISTS station_events_dedupe_idx
+                 ON station_events (boot, seq)',
+
+            'CREATE INDEX IF NOT EXISTS station_events_window_idx
+                 ON station_events (faction, happened_at DESC)',
+
+            'CREATE INDEX IF NOT EXISTS station_events_station_idx
+                 ON station_events (faction, station, kind, happened_at)',
+
+            /*
+             * How far a key's collector has read the mod's station feed.
+             *
+             * Per key rather than per faction: the feed a key reads is scoped to its player
+             * and alliance together, under one cursor. Not derivable from station_events
+             * either - a console opening one station's newest events stores rows far ahead
+             * of anything collected in order, and a cursor taken from the highest stored seq
+             * would skip everything in between. Only a complete, in-order page of
+             * GET /economy/events?owner=all moves this - see History::recordStationEvents.
+             */
+            'CREATE TABLE IF NOT EXISTS station_feed_state (
+                 key_id     BIGINT      PRIMARY KEY REFERENCES api_keys(id) ON DELETE CASCADE,
+                 boot       TEXT        NOT NULL,
+                 cursor     BIGINT      NOT NULL DEFAULT 0,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
              )',
         ];
     }
