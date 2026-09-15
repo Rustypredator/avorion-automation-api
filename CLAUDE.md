@@ -53,6 +53,7 @@ data/scripts/                   everything the game loads
     enums.lua         engine userdata enums -> names
     missiontypes.lua  API mission keys <-> vanilla command UUIDs, config/area building
     missionrules.lua  pure arithmetic for mission automation limits/candidates
+    programrules.lua  order program vocabulary: actions, conditions, validation, evaluation
     analysis.lua      background area analysis runner (async, deferred responses)
     factionscope.lua  fakes getParentFaction() while vanilla command code runs
     routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates
@@ -66,6 +67,8 @@ data/scripts/                   everything the game loads
       missions.lua          catalog, preview, start, status, recall, collect; owns
                             Missions.enqueue (job queue) + Missions.tick
       missionautomation.lua per-craft automation rules (Server values) + loop (.tick)
+      programs.lua          order programs (Server values) + runner (.tick); steps run as
+                            internal router:dispatch requests to the real endpoints
       movement.lua          /travel (mission alias), /orders (in-sector order chain)
       navigation.lua        /route, /farm, /automation (talks to entity/orderchain.lua)
       map.lua               /galaxy/*, /map/* (sliced scans across ticks)
@@ -86,7 +89,8 @@ web/                            browser console, no build step, no deps, NOT shi
   index.html, app.css
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (~7.4k lines: fleet, missions, orders + standing orders,
-              Automation tab (mission rules + standing orders per craft), economy, industry)
+              Automation tab (programs + mission rules + standing orders per craft), economy,
+              industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/
   mock_avorion.lua   hostile mock of the sandbox (Mock.install/reset/addPlayer/addAlliance/

@@ -343,6 +343,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/mission/recall`, `.../collect` | recall, and collect yields |
 | `GET /automation/missions`, `GET`/`POST /ships/{name}/mission/automation` | mission automation rules and what they are doing |
 | `POST /ships/{name}/mission/automation/evaluate`, `.../delete` | dry-run a rule's limits, or remove it |
+| `GET /automation/programs`, `GET`/`POST /ships/{name}/program`, `.../control`, `.../delete` | order programs: steps a craft works through until conditions are met, looping |
 | `POST /ships/{name}/travel` | alias of the Travel captain mission's start |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |

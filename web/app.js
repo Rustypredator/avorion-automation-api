@@ -63,6 +63,10 @@
     expectEnd: {},      // ship name -> true while a stop sent from here is on its way
     standingSaving: null, // ship name whose standing orders are being saved
     autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
+    /* Order programs, off /automation/programs, shaped like `automations`. `progForm` is the
+       program editor open for the selected craft. */
+    programs: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
+    progForm: null,
     recording: {},      // ship name -> boolean
     traffic: [],
 
@@ -544,6 +548,22 @@
       + 'is worth trying against it, and sends the best one that passes. An alliance '
       + 'craft&rsquo;s rule is shared: every member sees and edits the same one.</p>',
 
+    'program-overview':
+      '<p>A program works the craft through its steps by itself, each until its conditions '
+      + 'are met, then moves to the next step, to a step by number &mdash; which is how a '
+      + 'program loops &mdash; or stops. It runs on the server: closing the console stops '
+      + 'nothing, but every step that gives the ship an order needs the owner (or, for '
+      + 'alliance craft, a member) logged in, and in-sector steps need the sector loaded.</p>'
+      + '<p>A step without conditions ends with its action: a route when it arrives, orders '
+      + 'when the chain runs out, a mission when the craft is back, standing orders at once. '
+      + '<b>Repeat</b> starts the action again each time it ends until the conditions are '
+      + 'met &mdash; mission after mission until the hold is full. A route or farm still '
+      + 'flying when its step ends is stopped.</p>'
+      + '<p>Mission steps fly the craft&rsquo;s mission rule under its limits; while a program '
+      + 'runs, the rule does not send the craft out on its own. Conditions read the ship '
+      + 'database and what the ship last reported, so cargo is as fresh as the game keeps '
+      + 'that row. A failed step is retried every minute.</p>',
+
     'auto-evaluation':
       'Every option the check weighed, best first: everything inside the limits ahead of '
       + 'everything outside them, then by what the rule optimises for. Mining and salvage '
@@ -979,6 +999,7 @@
     loop('fleet', EVERY.fleet, refreshFleet);
     loop('events', EVERY.events, sweepEvents);
     loop('automations', EVERY.automations, loadAutomations);
+    loop('programs', EVERY.automations, loadPrograms);
     loop('mission', EVERY.mission, function () {
       if (!S.selected) { return; }
       var ship = S.byName[S.selected];
@@ -1049,6 +1070,7 @@
       renderAutomationView();
       if (S.connected) {
         loadAutomations(true);
+        loadPrograms(true);
         if (S.selected) { loadAutomation(); }
       }
     }
@@ -1370,6 +1392,7 @@
     S.missionForm = null;
     S.autoForm = null;
     S.autoDry = null;
+    S.progForm = null;
     if (changed) { GalaxyMap.setArea(null); }
     S.nav.result = null;
     S.nav.farm = null;
@@ -2950,6 +2973,7 @@
     blocked:    { tone: 'warn', label: 'blocked' },
     missing:    { tone: 'bad',  label: 'craft missing' },
     error:      { tone: 'bad',  label: 'error' },
+    program:    { tone: 'info', label: 'program drives it' },
     disabled:   { tone: '',     label: 'off' }
   };
 
@@ -3110,13 +3134,14 @@
   function isAutomated(ship) {
     var entry = automationFor(ship.name);
     if (entry && entry.rule) { return true; }
+    if (programFor(ship.name)) { return true; }
     var automation = shipAutomation(ship.name);
     return !!(automation && (automation.plan || automation.reaction || standingOn(automation).length));
   }
 
   function shipAutomationBadges(ship) {
     var automation = shipAutomation(ship.name);
-    var out = [automationBadge(ship)];
+    var out = [programBadge(ship.name), automationBadge(ship)];
     if (!automation) { return out.join(''); }
 
     if (automation.plan) {
@@ -3190,6 +3215,7 @@
       + '<span class="spacer"></span>'
       + '<button class="ghost small" data-act="open-fleet">open in Fleet</button>'
       + '</div>'
+      + renderProgram()
       + renderAutomation()
       + '<div data-standing-orders></div>';
 
@@ -3199,6 +3225,640 @@
   function renderAutomationView() {
     renderAutomationList();
     renderAutomationPane();
+  }
+
+  /* ============================== ORDER PROGRAMS ==============================
+   *
+   * A program is a list of steps the mod works a craft through by itself, each until its
+   * conditions are met: farm until the hold is full, fly to the station, loop. Like mission
+   * automation it is stored and run on the server; this is the view onto it and its editor.
+   * The editor keeps the program in the API's own shape, so saving sends the form as it is.
+   */
+
+  var PROGRAM_STATUS = {
+    running:  { tone: 'good', label: 'running' },
+    starting: { tone: 'busy', label: 'starting a step' },
+    waiting:  { tone: 'info', label: 'waiting' },
+    retrying: { tone: 'warn', label: 'retrying' },
+    finished: { tone: '',     label: 'finished' },
+    disabled: { tone: '',     label: 'off' },
+    error:    { tone: 'bad',  label: 'error' }
+  };
+
+  var PROGRAM_ACTIONS = [
+    ['route', 'fly a route'],
+    ['farm', 'farm bosses'],
+    ['orders', 'run orders'],
+    ['mission', 'go on a mission'],
+    ['standing', 'set standing orders'],
+    ['wait', 'wait']
+  ];
+
+  var PROGRAM_CONDITIONS = [
+    ['cargo', 'cargo'],
+    ['good', 'good in hold'],
+    ['bossKills', 'boss kills'],
+    ['arrived', 'arrived'],
+    ['planEnded', 'plan ended'],
+    ['missionReturned', 'back from mission'],
+    ['elapsed', 'time in step'],
+    ['enemies', 'enemies'],
+    ['idle', 'ship idle'],
+    ['at', 'in sector']
+  ];
+
+  /* Actions that end by themselves; the rest need a condition. */
+  var PROGRAM_NATURAL_END = { route: 'when it arrives', orders: 'when the chain runs out',
+                              mission: 'when it is back', standing: 'at once' };
+
+  var PROGRAM_ORDER_TYPES = ['patrol', 'repair', 'aggressive', 'mine', 'salvage', 'refine', 'jump'];
+
+  function programKey(name) {
+    var ship = S.byName[name];
+    return autoKey(ship && ship.owner && ship.owner.kind, name);
+  }
+
+  function programFor(name) {
+    return S.programs.byKey[programKey(name)] || null;
+  }
+
+  function loadPrograms(userInitiated) {
+    return Api.get('/automation/programs', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'programs' })
+      .then(function (body) {
+        var byKey = {};
+        (body.programs || []).forEach(function (entry) {
+          byKey[autoKey(entry.owner && entry.owner.kind, entry.ship)] = entry;
+        });
+        S.programs = { byKey: byKey, serverTime: body.serverTime, receivedAt: Date.now(),
+                       error: null, loaded: true };
+        refreshProgramStatus();
+        renderAutomationList();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.programs.error = error;
+        S.programs.loaded = true;
+        refreshProgramStatus();
+      });
+  }
+
+  function storeProgram(body) {
+    var key = autoKey(body.owner && body.owner.kind, body.ship);
+    if (body.program) { S.programs.byKey[key] = body; } else { delete S.programs.byKey[key]; }
+    if (typeof body.serverTime === 'number') {
+      S.programs.serverTime = body.serverTime;
+      S.programs.receivedAt = Date.now();
+    }
+    renderAutomationList();
+  }
+
+  function programAgo(at) {
+    if (typeof at !== 'number' || typeof S.programs.serverTime !== 'number') { return ''; }
+    var age = Math.max(0, S.programs.serverTime - at + (Date.now() - S.programs.receivedAt) / 1000);
+    return duration(age) + ' ago';
+  }
+
+  function programBadge(name) {
+    var entry = programFor(name);
+    if (!entry || !entry.program) { return ''; }
+    var st = entry.state || {};
+    var status = entry.program.enabled ? PROGRAM_STATUS[st.status] || { tone: 'info', label: st.status } : PROGRAM_STATUS.disabled;
+    return '<span class="badge ' + status.tone + '" title="' + esc(st.message || '') + '">program · '
+      + (entry.program.enabled && st.status !== 'finished' ? 'step ' + num(st.step) : esc(status.label)) + '</span>';
+  }
+
+  /* --- words for a step --- */
+
+  function actionText(action) {
+    if (!action) { return '—'; }
+    if (action.type === 'route') {
+      return 'fly to ' + coords(action.to) + (action.onEnemies ? ', on enemies ' + esc(action.onEnemies) : '');
+    }
+    if (action.type === 'farm') {
+      return 'farm ' + esc(BOSS_NAMES[action.boss] || 'the nearest boss ring')
+        + (action.collectLoot === false ? ', leaving the loot' : '');
+    }
+    if (action.type === 'orders') {
+      return 'orders: ' + esc((action.orders || []).map(function (o) {
+        return typeof o === 'string' ? o : o.type + (o.to ? ' ' + o.to.x + ':' + o.to.y : '');
+      }).join(' → '));
+    }
+    if (action.type === 'mission') {
+      return action.rule ? 'mission: ' + esc(action.rule.mission) + ' (own limits)' : 'mission under the craft\'s rule';
+    }
+    if (action.type === 'standing') {
+      var parts = [];
+      STANDING.forEach(function (spec) {
+        var order = action.standing && action.standing[spec.key];
+        if (!order) { return; }
+        parts.push(spec.label.toLowerCase() + ' ' + (order.enabled === false ? 'off' : order.mode === 'interrupt' ? 'always' : order.enabled ? 'when idle' : order.mode || ''));
+      });
+      if (action.attackCivilians != null) { parts.push('civilians ' + (action.attackCivilians ? 'count' : 'spared')); }
+      return 'standing orders: ' + esc(parts.join(', ') || 'unchanged');
+    }
+    return 'wait';
+  }
+
+  function conditionText(c) {
+    if (c.type === 'cargo') { return 'cargo ' + esc(c.op || '>=') + ' ' + num(c.percent) + '%'; }
+    if (c.type === 'good') { return esc(c.name) + ' ' + esc(c.op || '>=') + ' ' + num(c.amount); }
+    if (c.type === 'bossKills') { return num(c.count) + ' boss kills'; }
+    if (c.type === 'elapsed') { return duration(c.seconds) + ' in the step'; }
+    if (c.type === 'enemies') { return c.present === false ? 'no enemies' : 'enemies in sector'; }
+    if (c.type === 'at') { return 'in ' + coords(c); }
+    var named = PROGRAM_CONDITIONS.filter(function (p) { return p[0] === c.type; })[0];
+    return esc(named ? named[1] : c.type);
+  }
+
+  function untilText(step) {
+    var until = step['until'] || {};
+    var conditions = until.conditions || [];
+    if (!conditions.length) { return PROGRAM_NATURAL_END[step.action.type] || 'never'; }
+    return 'until ' + conditions.map(conditionText).join(until.match === 'all' ? ' and ' : ' or ')
+      + (step['repeat'] ? ', repeating' : '');
+  }
+
+  function thenText(step, index, count) {
+    if (step['then'] === 'stop') { return 'then stop'; }
+    if (step['then'] === 'goto') { return 'then step ' + num(step['goto']); }
+    return index + 1 < count ? 'then next' : 'then the program ends';
+  }
+
+  /* --- status --- */
+
+  function refreshProgramStatus() {
+    var node = $('#automation-pane [data-program-status]');
+    if (node && S.selected) { node.innerHTML = renderProgramStatus(); }
+  }
+
+  function renderProgram() {
+    return '<div class="section auto-section"><h2>Program ' + explain('program-overview') + '</h2>'
+      + '<div data-program-status>' + renderProgramStatus() + '</div>'
+      + '<div data-program-editor>' + renderProgramEditor() + '</div>'
+      + '</div>';
+  }
+
+  function renderProgramStatus() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.programs.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without order programs.</div>';
+    }
+    if (failed && !Object.keys(S.programs.byKey).length) { return errorBox('Programs unavailable', failed); }
+    if (!S.programs.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var entry = programFor(name);
+    var editing = S.progForm && S.progForm.ship === name;
+
+    if (!entry || !entry.program) {
+      if (editing) { return ''; }
+      return '<div class="row"><span class="note">No program. A program works the craft through steps '
+        + 'by itself &mdash; farm until the hold is full, fly to a station, go again.</span>'
+        + '<button data-prog-act="new">New program…</button></div>';
+    }
+
+    var program = entry.program;
+    var st = entry.state || {};
+    var status = program.enabled ? PROGRAM_STATUS[st.status] || { tone: 'info', label: st.status || 'unknown' } : PROGRAM_STATUS.disabled;
+    var out = [];
+
+    out.push('<div class="row auto-head">'
+      + '<label class="check switch"><input type="checkbox" data-prog-toggle' + (program.enabled ? ' checked' : '')
+      + '><span><b>' + esc(program.name || 'Program') + '</b></span></label>'
+      + '<span class="badge ' + status.tone + '">' + esc(status.label) + '</span>'
+      + '<span class="auto-message">' + esc(st.message || '') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-prog-act="restart" title="Back to step 1">restart</button>'
+      + (editing ? '' : '<button class="ghost small" data-prog-act="edit">edit</button>')
+      + '<button class="ghost small danger" data-prog-act="remove">remove</button>'
+      + '</div>');
+
+    out.push('<div class="program-steps">' + (program.steps || []).map(function (step, i) {
+      var current = st.step === i + 1 && st.status !== 'finished';
+      var conditions = current && st.conditions && st.conditions.length
+        ? '<div class="row tight" style="margin-top:4px">' + st.conditions.map(function (c) {
+            return '<span class="badge ' + (c.met ? 'good' : '') + '">' + esc(c.text) + '</span>';
+          }).join('') + (st.bossKills ? '<span class="mute2">' + num(st.bossKills) + ' kills so far</span>' : '')
+          + '<span class="mute2">' + esc(programAgo(st.stepSince)) + '</span></div>'
+        : '';
+      return '<div class="order-row program-step' + (current ? ' current' : '') + '">'
+        + '<span class="idx">' + (i + 1) + '</span>'
+        + '<div class="program-step-body"><div>' + (step.name ? '<b>' + esc(step.name) + '</b> · ' : '')
+        + actionText(step.action) + '</div>'
+        + '<div class="mute2">' + untilText(step) + ' · ' + thenText(step, i, program.steps.length) + '</div>'
+        + conditions + '</div>'
+        + '<span class="spacer"></span>'
+        + (current ? '<span class="badge good">now</span>'
+          : '<button class="ghost small" data-prog-goto="' + (i + 1) + '" title="Move the program to this step">go here</button>')
+        + '</div>';
+    }).join('') + '</div>');
+
+    if (st.log && st.log.length) {
+      out.push('<details class="card auto-log" style="margin-top:10px"><summary>Program log '
+        + '<span class="mute2">' + st.log.length + '</span></summary>'
+        + st.log.slice().reverse().map(function (line) {
+            var tone = (PROGRAM_STATUS[line.status] || {}).tone || '';
+            return '<div class="log-line ' + (tone === 'bad' ? 'err' : tone === 'warn' ? 'warn' : '') + '">'
+              + '<span class="t">' + esc(programAgo(line.at)) + '</span>'
+              + '<span class="k">step ' + esc(String(line.step)) + '</span>'
+              + '<span class="m">' + esc(line.message) + (line.detail ? ' <span class="dim">· ' + esc(line.detail) + '</span>' : '') + '</span>'
+              + '</div>';
+          }).join('')
+        + '</details>');
+    }
+
+    out.push('<div class="mute2" style="margin-top:6px">saved by ' + esc((program.updatedBy && program.updatedBy.name) || '—')
+      + ' · rev ' + num(program.revision) + '</div>');
+
+    return out.join('');
+  }
+
+  /* --- editor --- */
+
+  function blankStep(type) {
+    var action = { type: type };
+    if (type === 'route') {
+      var ship = S.byName[S.selected] || {};
+      action.to = { x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 };
+    }
+    if (type === 'farm') { action.boss = 'auto'; }
+    if (type === 'orders') { action.orders = [{ type: 'patrol' }]; }
+    if (type === 'standing') { action.standing = { enemies: { enabled: true, mode: 'interrupt' } }; }
+
+    var needs = !PROGRAM_NATURAL_END[type];
+    return {
+      action: action,
+      'until': { match: 'any', conditions: needs ? [blankCondition(type === 'farm' ? 'cargo' : 'elapsed')] : [] },
+      'repeat': false,
+      'then': 'next'
+    };
+  }
+
+  function blankCondition(type) {
+    if (type === 'cargo') { return { type: 'cargo', op: '>=', percent: 80 }; }
+    if (type === 'good') { return { type: 'good', name: '', op: '>=', amount: 100 }; }
+    if (type === 'bossKills') { return { type: 'bossKills', count: 1 }; }
+    if (type === 'elapsed') { return { type: 'elapsed', seconds: 600 }; }
+    if (type === 'enemies') { return { type: 'enemies', present: false }; }
+    if (type === 'at') {
+      var ship = S.byName[S.selected] || {};
+      return { type: 'at', x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 };
+    }
+    return { type: type };
+  }
+
+  function openProgramEditor(entry) {
+    var program = entry && entry.program;
+    S.progForm = {
+      ship: S.selected,
+      name: program ? program.name : 'Program',
+      steps: program ? JSON.parse(JSON.stringify(program.steps)) : [blankStep('route')],
+      revision: program ? program.revision : 0,
+      existing: !!program,
+      error: null
+    };
+    redrawProgram();
+  }
+
+  function pfInput(path, value, attrs) {
+    return '<input data-pf="' + path + '" value="' + esc(value == null ? '' : String(value)) + '" ' + (attrs || '') + '>';
+  }
+
+  function pfSelect(path, value, options, attrs) {
+    return '<select data-pf="' + path + '" ' + (attrs || '') + '>' + options.map(function (o) {
+      return '<option value="' + esc(o[0]) + '"' + (String(value) === String(o[0]) ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function actionFields(step, i) {
+    var a = step.action;
+    var p = 'steps.' + i + '.action.';
+
+    if (a.type === 'route') {
+      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">on enemies</span>'
+        + pfSelect(p + 'onEnemies', a.onEnemies || 'fight', ON_ENEMIES);
+    }
+    if (a.type === 'farm') {
+      return pfSelect(p + 'boss', a.boss || 'auto', BOSSES)
+        + '<label class="check"><input type="checkbox" data-pf="' + p + 'collectLoot" data-pf-bool'
+        + (a.collectLoot === false ? '' : ' checked') + '><span>collect loot</span></label>';
+    }
+    if (a.type === 'orders') {
+      var order = (a.orders && a.orders[0]) || { type: 'patrol' };
+      return pfSelect(p + 'orders.0.type', order.type, PROGRAM_ORDER_TYPES.map(function (t) { return [t, t]; }), 'data-pf-rerender')
+        + (order.type === 'jump'
+          ? '<span class="mute2">to</span>' + pfInput(p + 'orders.0.to.x', (order.to || {}).x || 0, 'type="number" data-pf-num style="width:78px"')
+            + '<span class="mute2">:</span>' + pfInput(p + 'orders.0.to.y', (order.to || {}).y || 0, 'type="number" data-pf-num style="width:78px"')
+          : '');
+    }
+    if (a.type === 'mission') {
+      return '<span class="mute2">flies the craft\'s mission rule below, under its limits</span>';
+    }
+    if (a.type === 'standing') {
+      return STANDING.map(function (spec) {
+        var order = a.standing && a.standing[spec.key];
+        var value = !order ? '' : order.enabled === false ? 'off' : order.mode || 'idle';
+        return '<span class="mute2">' + esc(spec.label.toLowerCase()) + '</span>'
+          + '<select data-pf-standing="' + i + '" data-pf-standing-key="' + spec.key + '">'
+          + [['', 'unchanged'], ['off', 'off'], ['idle', 'when idle'], ['interrupt', 'interrupt']].map(function (o) {
+              return '<option value="' + o[0] + '"' + (value === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+            }).join('') + '</select>';
+      }).join('');
+    }
+    return '';
+  }
+
+  function conditionFields(c, i, j) {
+    var p = 'steps.' + i + '.until.conditions.' + j + '.';
+    var ops = [['>=', 'at least'], ['<=', 'at most']];
+    if (c.type === 'cargo') {
+      return pfSelect(p + 'op', c.op || '>=', ops) + pfInput(p + 'percent', c.percent, 'type="number" min="0" max="100" data-pf-num style="width:64px"') + '<span class="mute2">%</span>';
+    }
+    if (c.type === 'good') {
+      return pfInput(p + 'name', c.name, 'type="text" placeholder="good, e.g. Iron" style="width:130px"')
+        + pfSelect(p + 'op', c.op || '>=', ops) + pfInput(p + 'amount', c.amount, 'type="number" min="0" data-pf-num style="width:78px"');
+    }
+    if (c.type === 'bossKills') { return pfInput(p + 'count', c.count, 'type="number" min="1" data-pf-num style="width:64px"'); }
+    if (c.type === 'elapsed') {
+      return pfInput(p + 'seconds', Math.round(c.seconds / 60), 'type="number" min="1" data-pf-num data-pf-scale="60" style="width:64px"') + '<span class="mute2">min</span>';
+    }
+    if (c.type === 'enemies') { return pfSelect(p + 'present', c.present === false ? 'false' : 'true', [['true', 'present'], ['false', 'gone']], 'data-pf-boolsel'); }
+    if (c.type === 'at') {
+      return pfInput(p + 'x', c.x, 'type="number" data-pf-num style="width:78px"') + '<span class="mute2">:</span>'
+        + pfInput(p + 'y', c.y, 'type="number" data-pf-num style="width:78px"');
+    }
+    return '';
+  }
+
+  function renderProgramEditor() {
+    var form = S.progForm;
+    if (!form || form.ship !== S.selected) { return ''; }
+
+    var count = form.steps.length;
+    var steps = form.steps.map(function (step, i) {
+      var until = step['until'];
+      var conditions = until.conditions.map(function (c, j) {
+        return '<div class="row tight program-condition">'
+          + pfSelect('steps.' + i + '.until.conditions.' + j + '.type', c.type, PROGRAM_CONDITIONS, 'data-pf-condition-type')
+          + conditionFields(c, i, j)
+          + '<button class="ghost small" data-prog-cond-del="' + i + ':' + j + '">×</button></div>';
+      }).join('');
+
+      return '<div class="card program-edit-step" style="margin-top:8px">'
+        + '<div class="row tight"><span class="idx"><b>' + (i + 1) + '</b></span>'
+        + pfInput('steps.' + i + '.name', step.name, 'type="text" placeholder="name (optional)" style="width:140px"')
+        + pfSelect('steps.' + i + '.action.type', step.action.type, PROGRAM_ACTIONS, 'data-pf-action-type')
+        + actionFields(step, i)
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-prog-step-up="' + i + '"' + (i ? '' : ' disabled') + '>↑</button>'
+        + '<button class="ghost small" data-prog-step-del="' + i + '"' + (count > 1 ? '' : ' disabled') + '>×</button></div>'
+        + '<div class="row tight" style="margin-top:6px"><span class="mute2">until</span>'
+        + (until.conditions.length > 1 ? pfSelect('steps.' + i + '.until.match', until.match, [['any', 'any of'], ['all', 'all of']]) : '')
+        + (until.conditions.length ? '' : '<span class="mute2">' + esc(PROGRAM_NATURAL_END[step.action.type] || 'a condition is needed') + '</span>')
+        + '<button class="ghost small" data-prog-cond-add="' + i + '">+ condition</button>'
+        + (until.conditions.length
+          ? '<label class="check"><input type="checkbox" data-pf="steps.' + i + '.repeat" data-pf-bool' + (step['repeat'] ? ' checked' : '')
+            + (PROGRAM_NATURAL_END[step.action.type] && step.action.type !== 'standing' ? '' : ' disabled')
+            + '><span>repeat the action until then</span></label>'
+          : '')
+        + '</div>'
+        + conditions
+        + '<div class="row tight" style="margin-top:6px"><span class="mute2">then</span>'
+        + pfSelect('steps.' + i + '.then', step['then'] || 'next', [['next', i + 1 < count ? 'next step' : 'end'], ['goto', 'go to step'], ['stop', 'stop']], 'data-pf-rerender')
+        + (step['then'] === 'goto'
+          ? pfInput('steps.' + i + '.goto', step['goto'] || 1, 'type="number" min="1" max="' + count + '" data-pf-num style="width:56px"')
+          : '')
+        + '</div></div>';
+    }).join('');
+
+    return '<div class="card auto-editor program-editor" style="margin-top:10px">'
+      + '<div class="row"><h3 style="margin-bottom:0">' + (form.existing ? 'Edit program' : 'New program') + '</h3>'
+      + pfInput('name', form.name, 'type="text" style="width:200px"') + '</div>'
+      + steps
+      + '<div class="row" style="margin-top:10px">'
+      + '<button class="ghost small" data-prog-act="add-step">+ step</button>'
+      + '<span class="spacer"></span>'
+      + '<button class="primary" data-prog-act="save">' + (form.existing ? 'Save program' : 'Save and start') + '</button>'
+      + '<button class="ghost" data-prog-act="cancel">Cancel</button></div>'
+      + (form.error ? '<div style="margin-top:8px">' + errorBox('Not saved', form.error) + '</div>' : '')
+      + (form.existing ? '<div class="mute2" style="margin-top:6px">Saving changed steps starts the program over at step 1.</div>' : '')
+      + '</div>';
+  }
+
+  function redrawProgram() {
+    var editor = $('#automation-pane [data-program-editor]');
+    if (editor) { editor.innerHTML = renderProgramEditor(); }
+    refreshProgramStatus();
+  }
+
+  function setPath(target, path, value) {
+    var keys = path.split('.');
+    var node = target;
+    for (var i = 0; i < keys.length - 1; i++) {
+      if (node[keys[i]] == null) { node[keys[i]] = /^\d+$/.test(keys[i + 1]) ? [] : {}; }
+      node = node[keys[i]];
+    }
+    node[keys[keys.length - 1]] = value;
+  }
+
+  /* Reads one field back into the form. Returns whether the editor has to redraw. */
+  function programField(node) {
+    var form = S.progForm;
+    if (!form) { return false; }
+
+    if (node.dataset.pfStanding !== undefined) {
+      var step = form.steps[Number(node.dataset.pfStanding)];
+      step.action.standing = step.action.standing || {};
+      var key = node.dataset.pfStandingKey;
+      if (!node.value) { delete step.action.standing[key]; }
+      else if (node.value === 'off') { step.action.standing[key] = { enabled: false }; }
+      else { step.action.standing[key] = { enabled: true, mode: node.value }; }
+      return false;
+    }
+
+    var path = node.dataset.pf;
+    if (!path) { return false; }
+
+    var value = node.value;
+    if (node.dataset.pfBool !== undefined) { value = node.checked; }
+    else if (node.dataset.pfBoolsel !== undefined) { value = value === 'true'; }
+    else if (node.dataset.pfNum !== undefined) {
+      value = Number(value) * (Number(node.dataset.pfScale) || 1);
+      if (!isFinite(value)) { return false; }
+    }
+
+    if (node.dataset.pfActionType !== undefined) {
+      var index = Number(path.split('.')[1]);
+      var keep = form.steps[index];
+      var fresh = blankStep(value);
+      fresh.name = keep.name;
+      fresh['then'] = keep['then'];
+      fresh['goto'] = keep['goto'];
+      if (keep['until'].conditions.length) { fresh['until'] = keep['until']; }
+      form.steps[index] = fresh;
+      return true;
+    }
+
+    if (node.dataset.pfConditionType !== undefined) {
+      var parts = path.split('.');
+      form.steps[Number(parts[1])]['until'].conditions[Number(parts[4])] = blankCondition(value);
+      return true;
+    }
+
+    if (path === 'name') { form.name = value; return false; }
+    setPath(form, path, value);
+    return node.dataset.pfRerender !== undefined;
+  }
+
+  function programBody(form) {
+    var steps = form.steps.map(function (step) {
+      var copy = JSON.parse(JSON.stringify(step));
+      if (copy['then'] !== 'goto') { delete copy['goto']; }
+      if (!copy.name) { delete copy.name; }
+      if (copy.action.type === 'orders') {
+        copy.action.orders = copy.action.orders.map(function (o) {
+          return o.type === 'jump' ? { type: 'jump', to: o.to || { x: 0, y: 0 } } : { type: o.type };
+        });
+      }
+      if (!copy['until'].conditions.length) { copy['repeat'] = false; }
+      return copy;
+    });
+    return { name: form.name, steps: steps };
+  }
+
+  function programPath(name, suffix) {
+    return '/ships/' + Api.seg(name) + '/program' + (suffix || '');
+  }
+
+  function programConflict(error) {
+    if (error.code !== 'program_changed') { return false; }
+    toast('warn', 'Program changed elsewhere',
+          'Someone else saved this program since it was loaded. It has been reloaded; apply your change again.');
+    S.progForm = null;
+    loadPrograms(true).then(redrawProgram);
+    return true;
+  }
+
+  function saveProgram(button) {
+    var form = S.progForm;
+    var name = S.selected;
+    if (!form || !name) { return; }
+
+    var body = programBody(form);
+    body.ifRevision = form.revision;
+    if (!form.existing) { body.enabled = true; }
+
+    return guard(button, Api.post(programPath(name), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'save program' }))
+      .then(function (result) {
+        storeProgram(result);
+        S.progForm = null;
+        toast('good', 'Program saved', name + ': ' + (result.program.enabled ? 'it starts on the next pass.' : 'switched off.'));
+        redrawProgram();
+      })
+      .catch(function (error) {
+        if (programConflict(error)) { return; }
+        form.error = error;
+        redrawProgram();
+      });
+  }
+
+  function toggleProgram(input) {
+    var name = S.selected;
+    var entry = programFor(name);
+    if (!entry || !entry.program) { return; }
+
+    var enabled = input.checked;
+    input.disabled = true;
+
+    Api.post(programPath(name), { enabled: enabled, ifRevision: entry.program.revision },
+             { owner: ownerParamFor(name) }, { priority: Api.P.USER, label: 'toggle program' })
+      .then(function (result) {
+        storeProgram(result);
+        toast('good', enabled ? 'Program on' : 'Program off', name);
+        refreshProgramStatus();
+      })
+      .catch(function (error) {
+        input.checked = !enabled;
+        input.disabled = false;
+        if (programConflict(error)) { return; }
+        apiFailed(error, 'Could not switch the program');
+      });
+  }
+
+  function controlProgram(button, body) {
+    var name = S.selected;
+    return guard(button, Api.post(programPath(name, '/control'), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'move program' }))
+      .then(function (result) {
+        storeProgram(result);
+        refreshProgramStatus();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not move the program'); });
+  }
+
+  function removeProgram(button) {
+    var name = S.selected;
+    if (!name || !window.confirm('Remove the program for ' + name + '?')) { return; }
+
+    return guard(button, Api.post(programPath(name, '/delete'), {}, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'remove program' }))
+      .then(function (result) {
+        storeProgram(result);
+        S.progForm = null;
+        toast('good', 'Program removed', name);
+        redrawProgram();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove the program'); });
+  }
+
+  /* Clicks inside the program section. Returns whether it was one of its controls. */
+  function programClick(button) {
+    var form = S.progForm;
+    var act = button.dataset.progAct;
+
+    if (act === 'new') { openProgramEditor(null); return true; }
+    if (act === 'edit') { openProgramEditor(programFor(S.selected)); return true; }
+    if (act === 'cancel') { S.progForm = null; redrawProgram(); return true; }
+    if (act === 'save') { saveProgram(button); return true; }
+    if (act === 'remove') { removeProgram(button); return true; }
+    if (act === 'restart') { controlProgram(button, { action: 'restart' }); return true; }
+    if (button.dataset.progGoto) {
+      controlProgram(button, { action: 'goto', step: Number(button.dataset.progGoto) });
+      return true;
+    }
+
+    if (!form) { return false; }
+
+    if (act === 'add-step') { form.steps.push(blankStep('wait')); redrawProgram(); return true; }
+    if (button.dataset.progStepDel !== undefined) {
+      form.steps.splice(Number(button.dataset.progStepDel), 1);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progStepUp !== undefined) {
+      var i = Number(button.dataset.progStepUp);
+      form.steps.splice(i - 1, 0, form.steps.splice(i, 1)[0]);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progCondAdd !== undefined) {
+      form.steps[Number(button.dataset.progCondAdd)]['until'].conditions.push(blankCondition('cargo'));
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progCondDel !== undefined) {
+      var at = button.dataset.progCondDel.split(':');
+      form.steps[Number(at[0])]['until'].conditions.splice(Number(at[1]), 1);
+      redrawProgram();
+      return true;
+    }
+    return false;
   }
 
   function limitsText(rule) {
@@ -7035,6 +7695,7 @@
 
     $('#automation-refresh').addEventListener('click', function () {
       loadAutomations(true);
+      loadPrograms(true);
       refreshFleet(true);
       if (S.selected) { loadAutomation(); }
     });
@@ -7049,6 +7710,7 @@
       if (!button) { return; }
 
       if (standingClick(button)) { return; }
+      if (programClick(button)) { return; }
       if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
       if (button.dataset.autoArea && S.autoForm) {
         S.autoForm.areaMode = button.dataset.autoArea;
@@ -7068,6 +7730,11 @@
     $('#automation-pane').addEventListener('change', function (e) {
       var node = e.target;
       if (standingChange(node)) { return; }
+      if (node.dataset.progToggle !== undefined) { toggleProgram(node); return; }
+      if (node.closest('.program-editor')) {
+        if (programField(node)) { redrawProgram(); }
+        return;
+      }
       if (node.dataset.autoToggle !== undefined) { toggleAutomation(node); }
       else if (node.dataset.autoCollect !== undefined && S.autoForm) {
         S.autoForm.collectYields = node.checked;
@@ -7080,6 +7747,9 @@
       // Kept on the form as typed and never redrawn from here, so the field keeps focus.
       if (node.dataset.autoLimit && S.autoForm) {
         S.autoForm.limits[node.dataset.autoLimit] = node.value === '' ? null : Number(node.value);
+      }
+      if (node.tagName === 'INPUT' && node.type !== 'checkbox' && node.closest('.program-editor')) {
+        programField(node);
       }
     });
 

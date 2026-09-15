@@ -126,6 +126,34 @@ Config.missionAutomationReportedCandidates = 8
 Config.missionAutomationValuePrefix = "automationapi_missionauto_"
 Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
 
+-- #### ORDER PROGRAMS #### --
+
+-- How often the program runner looks at each running program, in seconds. A look reads the
+-- ship database row and the ship's last reported state, both in memory or cheap.
+Config.programInterval = 2
+
+-- How long a step whose action was refused (owner offline, sector not loaded, nothing inside
+-- a mission rule's limits) waits before it is tried again.
+Config.programRetry = 60
+
+-- A dispatched action that has not answered in this long is given up on and retried. Longer
+-- than requestTimeout, since a route plan is searched before it is sent.
+Config.programDispatchTimeout = 60
+
+-- An orders step's chain counts as run out only after this long, so the chain it replaced -
+-- empty for a moment while the new one goes on - is not mistaken for the end of the new one.
+Config.programOrdersGrace = 5
+
+-- Recent decisions kept per program.
+Config.programLogSize = 30
+
+-- Server value keys: programs, one document per owning faction, the index of factions with
+-- any, and where each running program has got to, kept apart so a step moving on does not
+-- rewrite (and re-revision) the program itself.
+Config.programValuePrefix = "automationapi_program_"
+Config.programIndexValue = "automationapi_program_factions"
+Config.programCursorPrefix = "automationapi_programcursor_"
+
 -- Default and maximum page sizes for list endpoints.
 Config.defaultPageSize = 100
 Config.maxPageSize = 1000

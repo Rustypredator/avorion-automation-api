@@ -394,6 +394,7 @@ starts empty after a server restart.
 | `offline` | nobody who could start it is in game |
 | `missing` | the owner no longer has a craft by that name |
 | `error` | the check or start failed; `message` says how |
+| `program` | an enabled program drives the craft and flies this rule in its mission steps |
 | `disabled` | switched off |
 
 ### GET /ships/{name}/mission/automation
@@ -448,6 +449,135 @@ Works with the owner offline.
 
 `patience` follows the captain's wording thresholds: `safe` up to 3 flights, `small risk` to
 5, `real risk` to 10, `likely lost` beyond.
+
+## Order programs
+
+A program per craft: a list of steps the mod works it through by itself, each until its
+conditions are met, then on to the next step, to a step by number - which is how a program
+loops - or to its end. For example, farm bosses until the hold is 80% full, fly to a trade
+station, go back to step 1.
+
+- **Stored and run like mission automation.** Programs are Server values per owning faction
+  with a revision; the runner is in the galaxy bridge. Alliance programs are shared, and run
+  under the rank of the member who last saved them.
+- **Every step is an ordinary request.** A route step is `POST /ships/{name}/route`, a farm
+  step `POST /ships/{name}/farm`, an orders step `POST /ships/{name}/orders`, a standing step
+  `POST /ships/{name}/automation`, issued internally with the program's authority - so each is
+  validated, refused and confirmed exactly as a client's call would be, and needs what that
+  call needs (the owner online, the sector loaded, a captain). A mission step runs the craft's
+  mission automation rule once: one analysis, the best option inside its limits, the ordinary
+  start.
+- **While a program runs, the craft's mission rule does not dispatch by itself** (its state
+  shows phase `program`). When the program finishes or is switched off, the rule takes over
+  again.
+- **A refused step is retried** every minute (`status: retrying`, `message` says why).
+- **After a restart the current step starts over.** Where a program has got to is kept apart
+  from the program, so moving on does not change its revision.
+
+### Steps
+
+```jsonc
+{
+  "name": "fill up",                       // optional
+  "action": {"type": "farm", "boss": "auto"},
+  "until": {"match": "any", "conditions": [{"type": "cargo", "op": ">=", "percent": 80}]},
+  "repeat": false,
+  "then": "next"                           // "next", "stop", or {"goto": 1}
+}
+```
+
+| action | fields | ends by itself |
+|---|---|---|
+| `route` | `to {x, y}`, and optionally `onEnemies`, `attackCivilians`, `preferGates`, `avoidRifts`, `preferUncontrolled` as for `/route` | when the plan ends (arrived, or stopped) |
+| `farm` | `boss`, `onEnemies`, `attackCivilians`, `collectLoot`, `bossCooldown` as for `/farm` | never - needs a condition |
+| `orders` | `orders`, `clear` as for `/orders` | when the chain runs out |
+| `mission` | optionally `rule`, a mission automation rule of its own; without one, the craft's stored rule | when the craft is back |
+| `standing` | `standing`, `attackCivilians` as for `POST /ships/{name}/automation` | at once |
+| `wait` | - | never - needs a condition |
+
+A step with no conditions ends with its action. One with conditions ends when `any` (the
+default) or `all` of them hold, checked every two seconds; with `repeat` the action starts
+again each time it ends while they do not. A route or farm still flying when its step ends is
+stopped first.
+
+| condition | fields | met when |
+|---|---|---|
+| `cargo` | `op` (`>=`, `<=`), `percent` | the hold's used share compares so |
+| `good` | `name`, `op`, `amount` | the hold's amount of that good compares so |
+| `bossKills` | `count` | this step's farm has killed that many bosses |
+| `arrived` | - | this step's route arrived |
+| `planEnded` | - | this step's route or farm ended, however |
+| `missionReturned` | - | this step's mission is back |
+| `elapsed` | `seconds` | the step has run that long |
+| `enemies` | `present` (default true) | the ship last reported enemies in its sector, or none |
+| `idle` | - | the ship has no chain, plan or standing order at work |
+| `at` | `x`, `y` | the craft is in that sector |
+
+Cargo and position come from the ship database; enemies, plans and boss kills from what the
+ship last reported. A condition whose facts are not known yet counts as not met.
+
+### GET /automation/programs
+
+Every program the caller can see (`?owner=player|alliance|all`, default all), with what each
+is doing, and the vocabulary.
+
+```json
+{
+  "serverTime": 7310,
+  "programs": [{
+    "ship": "Ore Hound", "owner": {"kind": "player"},
+    "program": {"name": "Farm and sell", "enabled": true, "revision": 3,
+                "updatedBy": {"index": 1, "name": "Rusty"}, "steps": []},
+    "state": {
+      "status": "running", "message": "Farming bosses.", "since": 7290,
+      "step": 1, "stepSince": 7010, "phase": "active", "attempts": 0,
+      "planId": "p4-7011", "bossKills": 1,
+      "conditions": [{"text": "cargo >= 80%", "met": false}],
+      "log": [{"at": 7010, "status": "running", "step": 1, "message": "Farming bosses."}]
+    }
+  }],
+  "actions": ["farm", "mission", "orders", "route", "standing", "wait"],
+  "conditions": ["arrived", "at", "bossKills", "cargo", "elapsed", "enemies", "good", "idle", "missionReturned", "planEnded"],
+  "maxSteps": 20
+}
+```
+
+| `state.status` | meaning |
+|---|---|
+| `starting` | the step's action has been sent and not answered yet |
+| `running` | the step's action is under way, or over and waiting for the conditions |
+| `waiting` | nothing can be done yet: owner offline, or just saved |
+| `retrying` | the step's action was refused; tried again after a minute |
+| `finished` | the program ran to its end (`then: "stop"`, or past the last step) |
+| `disabled` | switched off |
+| `error` | the craft or the authority to run it is gone |
+
+### GET /ships/{name}/program
+
+One craft's program and state, in the shape of a `programs` entry; `program` is absent when
+it has none.
+
+### POST /ships/{name}/program
+
+Creates or updates the program: `name`, `enabled`, `steps`. Fields left out keep their stored
+values; `steps`, when given, replaces them all and starts the program over at step 1.
+Switching it off and on keeps its place (the step it was on starts its action again). At most
+20 steps and 8 conditions per step.
+
+Pass `ifRevision` as for mission rules: `409 program_changed` if someone saved since. A
+malformed program is `400 bad_program` (`details.known` lists actions or conditions where one
+is unknown); a mission step's own rule is checked as a mission rule is. Alliance craft need
+`ManageShips`.
+
+### POST /ships/{name}/program/control
+
+`{"action": "restart"}` moves the program to step 1, `{"action": "goto", "step": n}` to step
+n. The step moved to starts its action on the next pass; whatever the previous step started is
+left as it is. Errors: `400 bad_control`, `400 bad_step`, `404 no_program`.
+
+### POST /ships/{name}/program/delete
+
+Removes the program. `{"deleted": true}` if there was one.
 
 ## POST /ships/{name}/travel
 

@@ -335,7 +335,36 @@ const tradeEvaluation = () => ({
     }
 });
 
+/* Order programs as the mod stores them: saving bumps the revision and starts at step 1. */
+const programStore = {};
+
+function saveProgram(sent) {
+    const key = 'player/Ore Hound';
+    const previous = programStore[key];
+    if (previous && sent.ifRevision !== undefined && sent.ifRevision !== previous.program.revision) {
+        return { status: 409, body: { error: { code: 'program_changed', message: 'changed' } } };
+    }
+    const program = Object.assign({}, previous ? previous.program : {}, sent);
+    delete program.ifRevision;
+    program.revision = (previous ? previous.program.revision : 0) + 1;
+    program.updatedBy = { index: 1, name: 'Rusty' };
+    programStore[key] = {
+        ship: 'Ore Hound', owner: { kind: 'player', index: 1, name: 'Rusty' }, program: program,
+        state: { status: 'running', message: 'Farming bosses.', step: 1, stepSince: 3590,
+                 conditions: [{ text: 'cargo >= 90%', met: false }], log: [] }
+    };
+    return Object.assign({ serverTime: 3600 }, programStore[key]);
+}
+
+function controlProgram(sent) {
+    const entry = programStore['player/Ore Hound'];
+    entry.state.step = sent.action === 'restart' ? 1 : sent.step;
+    return Object.assign({ serverTime: 3600 }, entry);
+}
+
 const dynamic = {
+    '/ships/Ore%20Hound/program': saveProgram,
+    '/ships/Ore%20Hound/program/control': controlProgram,
     '/ships/Ore%20Hound/mission/automation': saveAutomation,
     '/ships/Ore%20Hound/mission/automation/evaluate': tradeEvaluation,
     '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
@@ -358,6 +387,10 @@ const routes = {
     '/ships/Ore%20Hound/mission': { active: null },
     '/ships/Ore%20Hound/automation': houndAutomation,
     get '/automation/missions'() { return automationList(); },
+    get '/automation/programs'() {
+        return { serverTime: 3600, programs: Object.values(programStore),
+                 actions: ['farm', 'mission', 'orders', 'route', 'standing', 'wait'], conditions: [] };
+    },
     '/history/events': storedEvents,
     // What the bridge kept of holds read earlier, by this console or anyone else's. Far
     // Scout's is fresh; Wingman's is an hour old, and neither has a live detail route here,
@@ -967,6 +1000,84 @@ const ready = window.document.readyState === 'loading'
           && /blocked/.test(autoStatus().textContent),
           'picking another craft in the list shows its rule');
     check($('#ship-name').textContent === 'Wingman', 'and selects it on the Fleet tab too');
+
+    console.log('\norder programs');
+
+    click($('#automation-rows [data-auto-ship="Ore Hound"]'));
+    await settle(400);
+
+    const progStatus = () => $('#automation-pane [data-program-status]');
+    check(/No program/.test(progStatus().textContent), 'a craft without a program offers to make one');
+
+    click(progStatus().querySelector('[data-prog-act="new"]'));
+    await settle(50);
+
+    const editor = () => $('#automation-pane .program-editor');
+    check(editor() && editor().querySelectorAll('.program-edit-step').length === 1,
+          'the editor opens with one step');
+
+    const change = (node, value) => {
+        if (value !== undefined) { node.value = value; }
+        node.dispatchEvent(new window.Event('change', { bubbles: true }));
+    };
+    const typed = (node, value) => {
+        node.value = value;
+        node.dispatchEvent(new window.Event('input', { bubbles: true }));
+    };
+
+    change(editor().querySelector('[data-pf="steps.0.action.type"]'), 'farm');
+    await settle(50);
+    const percent = editor().querySelector('[data-pf="steps.0.until.conditions.0.percent"]');
+    check(percent && percent.value === '80', 'a farm step comes with a cargo condition, since it never ends by itself');
+    typed(percent, '90');
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.1.action.type"]'), 'route');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.1.action.to.x"]'), '14');
+    change(editor().querySelector('[data-pf="steps.1.then"]'), 'goto');
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.1.goto"]'), '1');
+
+    click(editor().querySelector('[data-prog-cond-add="1"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.1.until.conditions.0.type"]'), 'elapsed');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.1.until.conditions.0.seconds"]'), '15');
+
+    posts.length = 0;
+    click(editor().querySelector('[data-prog-act="save"]'));
+    await settle(400);
+
+    const savedProgram = posts.filter((p) => p.path === '/ships/Ore%20Hound/program').pop();
+    const steps = savedProgram && savedProgram.body.steps;
+    check(steps && steps.length === 2 && steps[0].action.type === 'farm'
+          && steps[0].until.conditions[0].type === 'cargo' && steps[0].until.conditions[0].percent === 90,
+          'saving sends the farm step with its condition as typed');
+    check(steps && steps[1].action.type === 'route' && steps[1].action.to.x === 14
+          && steps[1].then === 'goto' && steps[1].goto === 1,
+          'and the route that loops back to step 1');
+    check(steps && steps[1].until.conditions[0].seconds === 900,
+          'minutes typed are sent as seconds');
+    check(savedProgram && savedProgram.body.enabled === true && savedProgram.body.ifRevision === 0,
+          'a new program is switched on, guarded by revision');
+
+    check(!editor(), 'the editor closes');
+    const stepRows = $$('#automation-pane .program-step');
+    check(stepRows.length === 2 && stepRows[0].classList.contains('current')
+          && /cargo >= 90%/.test(stepRows[0].textContent),
+          'the steps are listed, the current one with its conditions');
+    check(/then step 1/.test(stepRows[1].textContent), 'and where each leads');
+    check(/program · step 1/.test($('#automation-rows [data-auto-ship="Ore Hound"]').textContent),
+          'the list shows the program at work');
+
+    posts.length = 0;
+    click(stepRows[1].querySelector('[data-prog-goto="2"]'));
+    await settle(400);
+    const moved = posts.filter((p) => p.path === '/ships/Ore%20Hound/program/control').pop();
+    check(moved && moved.body.action === 'goto' && moved.body.step === 2, 'go here moves the program');
+    check($$('#automation-pane .program-step')[1].classList.contains('current'), 'and the list follows');
 
     $('[data-view="fleet"]').click();
     await settle(50);

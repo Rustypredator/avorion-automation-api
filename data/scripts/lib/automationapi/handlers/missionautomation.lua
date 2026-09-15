@@ -784,6 +784,11 @@ local function considerRule(owner, index, shipName, rule, state, mayEvaluate)
     return true
 end
 
+-- Set by handlers/programs.lua: returns the program's name when an enabled program drives
+-- the craft. A program sends the craft out on missions itself, and two loops dispatching
+-- one ship would each find it busy with the other's mission.
+MissionAutomation.controlledBy = function() return nil end
+
 local function pass()
     local t = now()
     local evaluated = false
@@ -795,11 +800,16 @@ local function pass()
         for _, shipName in ipairs(sortedKeys(data.ships)) do
             local rule = data.ships[shipName]
             local state = stateOf(index, shipName)
+            local program = rule.enabled and not state.busy
+                            and MissionAutomation.controlledBy(index, shipName)
 
             if not rule.enabled then
                 if state.phase ~= "disabled" and not state.busy then
                     note(state, "disabled", "Automation is switched off for this craft.")
                 end
+            elseif program then
+                note(state, "program", "The program '" .. tostring(program) .. "' drives this "
+                     .. "craft; its mission steps use this rule.")
             elseif not state.busy and t >= (state.nextCheckAt or 0) then
                 owner = owner or ownerOf(index)
 
@@ -988,6 +998,71 @@ function MissionAutomation.register(router)
         return Router.DEFERRED
     end)
 
+end
+
+-- #### FOR PROGRAMS #### --
+
+-- A program's owner and authority are found exactly as a rule's are.
+MissionAutomation.ownerOf = ownerOf
+MissionAutomation.hasPrivilege = hasPrivilege
+
+-- The craft's stored rule, or nil.
+function MissionAutomation.ruleFor(index, shipName)
+    return loadFaction(index).ships[shipName]
+end
+
+-- One dispatch under `rule`, for a program's mission step: the same analysis, limits and
+-- start the loop runs, but once, and answering through callbacks rather than into a rule's
+-- state. onStarted(summary) once the ship is out; onFailed(code, message) otherwise,
+-- including when nothing passes the limits.
+function MissionAutomation.startOnce(owner, shipName, rule, authIndex, onStarted, onFailed)
+    local availability = owner.faction:getShipAvailability(shipName)
+    if availability ~= ShipAvailability.Available then
+        onFailed("ship_unavailable", "The craft is not available to send out.")
+        return
+    end
+
+    local okEvaluate, err = pcall(evaluate, owner, shipName, rule, authIndex,
+        function(report)
+            if not report.chosen then
+                local nearest = report.candidates[1]
+                onFailed("nothing_within_limits", "Nothing within the limits: "
+                         .. (nearest and violationText(nearest)
+                             or "no way to fly this mission was found in the area"))
+                return
+            end
+
+            local chosen = report.chosen
+
+            Missions.enqueue
+            {
+                kind = "start",
+                owner = owner,
+                playerIndex = authIndex,
+                shipName = shipName,
+                missionType = MissionTypes.typeOf(rule.mission),
+                area = Missions.plainArea(report.area),
+                config = Missions.plainConfig(chosen.config),
+                complete = function(status, body)
+                    local e = type(body) == "table" and body.error or {}
+                    onFailed(e.code or ("http_" .. tostring(status)), e.message)
+                end,
+                onResult = function(result)
+                    if not result.started then
+                        onFailed(result.code or "start_rejected", result.message
+                                 or "the game refused the start; its reason went to the owner as chat")
+                        return
+                    end
+                    onStarted(dispatchSummary(rule, chosen))
+                end,
+            }
+        end,
+        function(code, message) onFailed(code, message) end)
+
+    if not okEvaluate then
+        if Router.isApiError(err) then onFailed(err.code, err.message)
+        else onFailed("evaluation_failed", tostring(err)) end
+    end
 end
 
 -- For tests: forget in-memory state, as a server restart would.
