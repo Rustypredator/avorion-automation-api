@@ -32,6 +32,19 @@ dest="${1:-${AVORION_MOD_DIR:-$HOME/.avorion/mods/$name}}"
 mapfile -t files < <(git ls-files -- data docs tests; git ls-files | grep -vE '/|^\.')
 [ "${#files[@]}" -gt 0 ] || { echo "nothing to copy - is this the repo root?" >&2; exit 1; }
 
+# The flip side of listing through git: a new script not yet `git add`ed is silently left
+# out, while the tracked files that include() it are copied. The local server loads the
+# repo directly and never notices; the Workshop copy fails with "module not found" (this
+# shipped once with missionlists.lua). Anything untracked and not ignored under data/ is
+# almost certainly meant to ship, so stop instead of guessing.
+mapfile -t untracked < <(git ls-files --others --exclude-standard -- data)
+if [ "${#untracked[@]}" -gt 0 ]; then
+    echo "untracked files under data/ would not be copied:" >&2
+    printf '  %s\n' "${untracked[@]}" >&2
+    echo "git add them (or delete them) and run again" >&2
+    exit 1
+fi
+
 # An rm -rf driven by an argument or the environment deserves a look first. A previous copy
 # identifies itself by its modinfo.lua; anything else - a typo, a half-right path, a
 # directory that is someone's actual work - is refused instead of emptied.
