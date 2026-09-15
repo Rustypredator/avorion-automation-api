@@ -1169,8 +1169,17 @@ local function automationApiSameOwner(ship, target)
     return allianceOf(a) == b or allianceOf(b) == a
 end
 
--- How far apart the two craft are, and how far the transfer reaches.
+-- How far apart the two craft are, and how far the transfer reaches. A ship in a station's
+-- docking area counts as touching it: that is where vanilla's dock order stops
+-- (entity/ai/dock.lua, isInDockingArea) and what vanilla trading calls docked
+-- (lib/player.lua CheckShipDocked), but the area reaches well past the 20 of hull distance,
+-- so a docked ship measured by distance alone would never be in reach.
 local function automationApiReach(ship, target)
+    local okDocked, docked = pcall(function()
+        return target:hasComponent(ComponentType.DockingPositions) and target:isInDockingArea(ship)
+    end)
+    if okDocked and docked then return 0, AUTOMATION_API_TRANSFER_REACH end
+
     local ok, distance = pcall(function() return ship:getNearestDistance(target) end)
     local reach = AUTOMATION_API_TRANSFER_REACH
 
@@ -1371,7 +1380,10 @@ local function automationApiTickTransfer(transfer, timeStep)
     end
 
     if transfer.phase == "docking" then
-        if #OrderChain.chain == 0 or OrderChain.finished then
+        -- The dock script ends with orderCompleted, which only stops the chain: the order
+        -- stays on it and `finished` is never set. A stopped chain here means the ship
+        -- arrived and is still not in reach, so waiting for the timeout would change nothing.
+        if #OrderChain.chain == 0 or OrderChain.finished or not OrderChain.running then
             automationApiEndTransfer("refused", "out_of_range")
             return
         end

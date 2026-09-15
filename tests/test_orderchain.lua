@@ -91,6 +91,17 @@ local function craft(spec)
         return 0
     end
 
+    -- Only stations have docks, and which ship sits in the docking area is up to the test.
+    -- The area reaches past the transfer's 20 of hull distance, which is the point.
+    function c:hasComponent(component)
+        return component == ComponentType.DockingPositions and self.isStation
+    end
+
+    function c:isInDockingArea(ship)
+        assert(self.isStation, "isInDockingArea on a craft without docks")
+        return world.docked[self.name] == true
+    end
+
     function c:getNearestDistance(other)
         local d = world.distance[other.name] or world.distance[self.name]
         return d or 0
@@ -133,13 +144,14 @@ local function newWorld()
         flyTo = nil,     -- the last setFly: {target, distance}
         flyCalls = 0,
         dockDone = false,
+        docked = {},     -- station name -> the ship is in its docking area
     }
     world.ship = craft({name = "Self", faction = 1, capacity = 100})
     _G.callingPlayer = nil
 end
 
 _G.EntityType = {Loot = 8}
-_G.ComponentType = {CargoLoot = 71}
+_G.ComponentType = {CargoLoot = 71, DockingPositions = 30}
 _G.FighterOrders = {Return = 3, CollectLoot = 9}
 _G.StatsBonuses = {FighterCargoPickup = 48}
 _G.BlockType = {Transporter = 55}
@@ -340,6 +352,15 @@ local function loadOrderChain()
             finished = true
         elseif current.action == OrderType.DockToStation then
             finished = world.dockDone
+        end
+
+        -- The dock script ends itself with orderCompleted, which only stops the chain:
+        -- the order stays on it and `finished` is never set.
+        if finished and current.action == OrderType.DockToStation
+           and OrderChain.executableOrders <= OrderChain.activeOrder then
+            OrderChain.running = false
+            OrderChain.updateShipOrderInfo()
+            return
         end
 
         if finished then
@@ -1303,6 +1324,30 @@ tick()
 check(state().transfer == nil and state().lastTransfer.reason == "out_of_range",
       "docking that ends out of reach is reported rather than waited on")
 world.dockDone = false
+
+-- what the local server showed: the dock order stops in the docking area, 60 from the hull
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+hub.hold = {}
+world.distance.Hub = 500
+transfer({id = "t7", all = true})
+world.distance.Hub = 60
+world.docked.Hub = true
+world.dockDone = true
+tick()
+check(state().transfer == nil and state().lastTransfer.id == "t7" and state().lastTransfer.outcome == "done"
+      and hub:held("Iron") == 10,
+      "a ship in the station's docking area is in reach, however far the hull is")
+check(#OrderChain.chain == 1 and not OrderChain.running, "and the finished dock order is left as vanilla leaves it")
+world.dockDone = false
+world.docked.Hub = nil
+
+world.ship = craft({name = "Self", goods = {{IRON, 10}}})
+hub.hold = {}
+world.distance.Hub = 60
+world.docked.Hub = true
+transfer({id = "t8", all = true, approach = false})
+check(state().lastTransfer.outcome == "done", "already docked counts as in reach without approaching too")
+world.docked.Hub = nil
 
 print("\ncargo transfer flying alongside a ship")
 

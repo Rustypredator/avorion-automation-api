@@ -5311,7 +5311,7 @@
               + (g.illegal ? ' <span class="badge warn">illegal</span>' : '') + '</td>'
               + '<td class="num">' + num(g.amount) + '</td>'
               + '<td class="num"><input type="number" min="1" step="1" style="width:96px" data-transfer-amount="' + esc(key) + '"'
-              + ' value="' + (picked && amount != null ? amount : '') + '" placeholder="' + num(g.amount) + '"'
+              + ' value="' + (picked && amount != null ? amount : '') + '" placeholder="' + esc(numText(g.amount)) + '"'
               + (form.all ? ' disabled' : off) + '>'
               + ' <button class="ghost small" data-transfer-max="' + esc(key) + '"' + (form.all ? ' disabled' : off) + '>all</button></td>'
               + '<td class="num mute2">' + (g.size != null ? num(g.size * (picked && amount != null ? amount : 0), 1) : '—') + '</td>'
