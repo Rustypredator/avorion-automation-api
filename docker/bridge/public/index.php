@@ -383,6 +383,8 @@ if (str_starts_with($path, '/history')) {
         'y' => isset($query['y']) && $query['y'] !== '' ? (int) $query['y'] : null,
         'limit' => max(0, min(20000, (int) ($query['limit'] ?? 2000))),
         'kind' => (string) ($query['kind'] ?? ''),
+        // Paging back through the station event log, see History::stationEvents.
+        'before' => max(0, (int) ($query['before'] ?? 0)),
     ];
 
     if ($method === 'GET' && ($what === '' || $what === '/' || $what === '/summary')) {

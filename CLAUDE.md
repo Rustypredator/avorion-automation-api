@@ -102,7 +102,7 @@ web/                            browser console, no build step, no deps, NOT shi
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (~7.4k lines: fleet, missions, orders + standing orders,
               cargo transfer, Automation tab (programs + mission rules + standing orders per
-              craft), economy,
+              craft), economy + station activity log (live feed merged with history),
               industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/

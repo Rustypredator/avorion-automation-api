@@ -510,6 +510,8 @@ const routes = {
             traded: { sold: 136000, bought: 70000, consumed: 0, net: 66000, perHour: 33000 }
         }]
     },
+    '/history/economy/events': (query) => activityHistory(query),
+    '/stations/Rusty%20Refinery/events': (query) => activityLive(query),
     '/history/economy/goods': {
         goods: [
             { ship: 'Rusty Refinery', good: 'Oil', in: 400, out: 380, net: 20, stock: 900 },
@@ -517,6 +519,51 @@ const routes = {
         ]
     }
 };
+
+/*
+ * The refinery's activity log. The bridge holds 203 trades: the newest page of 200 and three
+ * older ones behind it. The mod's feed holds the newest of those again - the bridge stored
+ * it out of this very feed - plus one trade and one production window it has not collected.
+ */
+const activityQueries = [];
+
+function storedTrade(seq) {
+    return { id: seq, t: now - (210 - seq) * 10, station: 'Rusty Refinery', owner: 'player',
+             x: 12, y: -4, boot: 'run-1', q: seq, at: seq * 10, kind: 'trade',
+             direction: seq % 2 ? 'sold' : 'bought', good: seq % 2 ? 'Oil' : 'Raw Oil',
+             units: 10, price: 3400, unitPrice: 340, ownerAmount: 3400, internal: false,
+             channel: 'docked', counterparty: { kind: 'ai', name: 'The Xsotan Traders' } };
+}
+
+function activityHistory(query) {
+    activityQueries.push(Object.fromEntries(query));
+    const before = Number(query.get('before') || 0);
+    const events = [];
+    if (before) {
+        for (let seq = 1; seq < 4; seq++) { events.push(storedTrade(seq)); }
+    } else {
+        for (let seq = 4; seq <= 203; seq++) { events.push(storedTrade(seq)); }
+    }
+    return { events: events };
+}
+
+function activityLive(query) {
+    activityQueries.push(Object.fromEntries(query));
+    const seqOf = (event) => Object.assign({}, event, { seq: event.q });
+    return {
+        station: 'Rusty Refinery', boot: 'run-1', now: 2100, cursor: 205, more: false, gap: false,
+        events: [
+            seqOf(storedTrade(203)),
+            { seq: 204, at: 2090, kind: 'trade', station: 'Rusty Refinery', sector: { x: 12, y: -4 },
+              direction: 'sold', good: 'Fuel', units: 50, price: 17000, unitPrice: 340,
+              ownerAmount: 17000, internal: false, channel: 'direct', ship: 'Fuel Barge',
+              counterparty: { kind: 'ai', name: 'The Newest Buyer' } },
+            { seq: 205, at: 2095, kind: 'production', station: 'Rusty Refinery',
+              sector: { x: 12, y: -4 }, seconds: 60, cycles: 2, utilization: 0.5,
+              starvedSeconds: 30, results: [{ name: 'Oil', amount: 5 }] }
+        ]
+    };
+}
 
 /* ------------------------------- the harness ------------------------------ */
 
@@ -545,6 +592,7 @@ window.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 window.fetch = function (url, init) {
     const parsed = new window.URL(url, 'http://api.test');
     let body = routes[parsed.pathname];
+    if (typeof body === 'function') { body = body(parsed.searchParams); }
 
     if (init && init.method === 'POST') {
         const sent = JSON.parse(init.body || '{}');
@@ -853,6 +901,55 @@ const ready = window.document.readyState === 'loading'
     check(/\+16\.2K ¢/.test(text), 'and the per-hour rate the bridge worked out');
     check(/title="16,200"/.test(economy.innerHTML), 'exact in its tooltip');
     check($('#economy-window') !== null, 'the window picker is there');
+
+    console.log('\nthe activity log');
+
+    let log = economy.querySelector('details.activity-log');
+    check(log !== null && !log.open, 'the station has an activity log, collapsed by default');
+    check(activityQueries.length === 0, 'and nothing is read for it while it is shut');
+
+    log.open = true;
+    await settle(800);
+
+    log = $('#sv-economy details.activity-log');
+    let logRows = () => Array.from($('#sv-economy details.activity-log').querySelectorAll('tbody tr'));
+
+    check(log.open, 'opening it keeps it open across the redraw its data causes');
+    check(activityQueries.some((q) => q.kind === 'trade' && q.station === 'Rusty Refinery'),
+          'it reads the bridge\'s store for that station\'s trades');
+    check(logRows().length === 201,
+          'stored and live trades are merged, the one both hold drawn once');
+    check(/The Newest Buyer/.test(logRows()[0].textContent),
+          'the newest trade, which only the live feed has, is at the top');
+    check(!/production/.test(log.textContent.replace(/production windows/, '')),
+          'production windows stay out of the trades view');
+
+    const older = log.querySelector('[data-activity-older]');
+    check(older !== null, 'a full page offers older trades');
+    older.click();
+    await settle(600);
+
+    check(activityQueries.some((q) => q.before === '4'), 'which pages back from the oldest held, by id');
+    check(logRows().length === 204, 'and adds them below');
+    check(/start of the record/.test($('#sv-economy details.activity-log').textContent),
+          'until the store has nothing older');
+
+    $('#sv-economy [data-activity-kind="all"]').click();
+    await settle(600);
+
+    check(logRows().some((row) => /production/.test(row.textContent) && /2 cycles/.test(row.textContent)),
+          'all adds the production windows');
+
+    await settle(5600);
+    const livePolls = activityQueries.filter((q) => q.since === '205').length;
+    check(livePolls >= 1, 'and the live feed is polled on from its cursor while open');
+    check(logRows().filter((row) => /The Newest Buyer/.test(row.textContent)).length === 1,
+          'without a repeated poll adding the same trade again');
+
+    $('#sv-economy [data-activity-kind="trade"]').click();
+    $('#sv-economy details.activity-log').open = false;
+    await settle(300);
+    check(!$('#sv-economy details.activity-log').open, 'closing it stays closed');
 
     console.log('\nthe production tab');
 

@@ -954,6 +954,24 @@ check($activity->economyObserved(['ship' => 'Rusty Refinery', 'from' => time() +
 
 check(count($activity->stationEvents(['kind' => 'production'])) === 1, 'the log can be narrowed to one kind');
 
+// Paging back two at a time has to walk the whole log once, in order, nothing repeated.
+$whole = $activity->stationEvents(['ship' => 'Rusty Refinery']);
+$walked = [];
+$before = 0;
+for ($pages = 0; $pages < 10; $pages++) {
+    $page = $activity->stationEvents(['ship' => 'Rusty Refinery', 'limit' => 2, 'before' => $before]);
+    if ($page === []) {
+        break;
+    }
+    $walked = array_merge($page, $walked);
+    $before = $page[0]['id'];
+}
+check(array_column($walked, 'id') === array_column($whole, 'id') && count($whole) === 6,
+      'paging back with before walks the log once, oldest to newest');
+check(isset($whole[0]['boot'], $whole[0]['q']) && $whole[0]['boot'] === $bootA,
+      'each stored event carries the run and seq that identify it in the live feed');
+check($activity->stationEvents(['before' => 999999999]) === [], 'an unknown before reads as nothing');
+
 // A player and their alliance can each own a station of the same name.
 $activity->recordStationEvents(feedPage($bootB, 100.0, 5, false, [
     tradeEvent(4, 90.0, $mine, 'Twin Yard', 'sold', 'Steel', 10, 1000),

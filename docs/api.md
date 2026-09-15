@@ -2066,14 +2066,22 @@ over the window rather than since the server started.
 ## GET /history/economy/events
 
 The stored station events themselves, newest `limit` in time order: the trade log. Takes
-the same filters as above, plus `kind` - `trade`, `production` or `catchup`.
+the same filters as above, plus `kind` - `trade`, `production` or `catchup` - and `before`.
 
 ```json
 {"events": [
-  {"t": 1757716200, "station": "Rusty Refinery", "owner": "player", "x": 12, "y": -4, "q": 480,
+  {"id": 9120, "t": 1757716200, "station": "Rusty Refinery", "owner": "player", "x": 12, "y": -4,
+   "boot": "1757716400", "q": 480,
    "kind": "trade", "direction": "sold", "good": "Oil", "units": 50, "price": 17000, "...": "..."}
 ]}
 ```
+
+To read the whole log, page back: pass the `id` of the first (oldest) event of a page as
+`before` for the page ahead of it, until a page comes back shorter than `limit`. `before` is
+a position in the log's own order, not a time, so events that share a second are neither
+repeated nor skipped. `boot` and `q` are the mod's run and `seq` for the event, which is how
+to merge this with the live [`/economy/events`](#get-economyevents) feed without doubling
+what both hold.
 
 ## GET /history/manifests
 

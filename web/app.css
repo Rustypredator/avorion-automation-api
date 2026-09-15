@@ -570,6 +570,15 @@ marker#ia-bad path { fill: #8a3a3a; }
 .auto-log[open] summary { margin-bottom: 6px; }
 .auto-log .log-line { grid-template-columns: 90px 80px 1fr; padding: 2px 0; }
 .auto-log .log-line .dim { color: var(--text-mute); }
+
+/* Station activity log: collapsed to its heading, and scrolling on its own when open so a
+   few thousand trades do not push the rest of the page away. */
+.activity-log summary { cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); }
+.activity-log[open] summary { margin-bottom: 8px; }
+.activity-scroll { max-height: 460px; overflow-y: auto; margin-top: 8px; }
+.activity-scroll thead th { position: sticky; top: 0; background: var(--bg-2); }
+.activity-production td { color: var(--text-mute); }
+.nowrap { white-space: nowrap; }
 .auto-limits { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 12px; }
 .auto-limit { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
 .auto-limit input { width: 100%; min-width: 0; }

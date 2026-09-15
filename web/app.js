@@ -20,12 +20,14 @@
     dock: 'avoconsole.dock',
     history: 'avoconsole.history',
     notify: 'avoconsole.notify',
-    basis: 'avoconsole.basis'
+    basis: 'avoconsole.basis',
+    activity: 'avoconsole.activity'
   };
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
      pushes events as they happen, so polling faster buys nothing but queue depth. */
-  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60, automations: 10 };
+  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60, automations: 10,
+                activity: 5 };
 
   var S = {
     connected: false,
@@ -107,6 +109,11 @@
     view: 'fleet',
     industry: { stations: null, error: null, sector: null, history: {}, observed: {},
                 basis: 'observed' },
+
+    /* The station activity log, on a station's Economy tab and under an Industry sector.
+       `open` and `kind` are the viewer's and shared by every log; `scopes` holds what has
+       been read for each station or sector, keyed by activityScope().key. */
+    activityLog: { open: false, kind: 'trade', scopes: {} },
 
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
 
@@ -549,6 +556,20 @@
       + 'moments something was calling the API &mdash; a quiet stretch can mean nobody '
       + 'was looking rather than that nothing moved.',
 
+    'activity-log':
+      '<p>Every trade the station made, recorded from inside it: the good, the units, what '
+      + 'was actually paid after supply, demand and relations, and who with. '
+      + '<b>All</b> adds its production windows &mdash; one a minute while its sector is '
+      + 'loaded &mdash; and the catch-up the game runs when an unloaded sector loads again.</p>'
+      + '<p>New events come from the mod every few seconds while this is open. Older ones '
+      + 'come from the bridge\'s store, back to the first event it recorded. Nothing is '
+      + 'recorded while a station\'s sector is unloaded, and a player station does not '
+      + 'trade then either.</p>',
+
+    'activity-no-history':
+      'This bridge keeps no history, so the log reaches back only as far as the mod\'s own '
+      + 'buffer: this server run, and the most recent few thousand events per faction.',
+
     'sector-predicted':
       'From the galaxy seed. It cannot know what players built or destroyed, and a home '
       + 'sector routinely predicts empty.',
@@ -930,6 +951,12 @@
     setDock(localStorage.getItem(LS.dock) === 'open');
 
     if (localStorage.getItem(LS.basis) === 'ceiling') { S.industry.basis = 'ceiling'; }
+
+    try {
+      var activity = JSON.parse(localStorage.getItem(LS.activity) || '{}');
+      S.activityLog.open = activity.open === true;
+      S.activityLog.kind = activity.kind === 'all' ? 'all' : 'trade';
+    } catch (e) { /* as above */ }
   }
 
   function saveConnection() {
@@ -1082,6 +1109,10 @@
     loop('industry', EVERY.detail, function () {
       // Every station's database row in one call, so only while someone is looking.
       if (S.view === 'industry') { return loadIndustry(false); }
+    });
+    loop('activity', EVERY.activity, function () {
+      // Only the log someone has open and can see; see ACTIVITY LOG.
+      if (S.activityLog.open) { return refreshActivity(visibleActivityScope()); }
     });
     loop('history', EVERY.history, function () {
       // Cheap when nothing draws it: loadHistory returns without a call in that case.
@@ -6523,11 +6554,14 @@
 
     // One grid, so the wide cards below can span it - .card.wide is a grid-column rule
     // and does nothing to a card that is not in a .cards container.
-    node.innerHTML = '<div class="cards">'
-      + economyHeadCard(station, economy)
-      + goodsTable(economy.goods, name)
-      + economyHistory(name)
-      + '</div>';
+    keepActivityScroll(node, function () {
+      node.innerHTML = '<div class="cards">'
+        + economyHeadCard(station, economy)
+        + goodsTable(economy.goods, name)
+        + economyHistory(name)
+        + activityCard(stationActivityScope(name))
+        + '</div>';
+    });
   }
 
   function economyHeadCard(station, economy) {
@@ -6661,6 +6695,413 @@
       ])
       + seriesChart((recorded.series || {}).points || [], (recorded.series || {}).bucket)
       + '</div>';
+  }
+
+  /* ============================== ACTIVITY LOG ============================= */
+  /*
+   * Every trade a station made, and its production windows on request, as one list. The
+   * same card sits on a station's Economy tab and under a sector in the Industry view.
+   *
+   * Two sources, merged, both read all the time rather than one standing in for the other:
+   *
+   *   the mod's feed      what happened since this page last asked, polled with the feed's
+   *                       own cursor every few seconds while the log is open;
+   *   the bridge's store  everything older, a page at a time back to the first event it
+   *                       recorded, paged with `before` rather than by time.
+   *
+   * They overlap - the bridge stores the very pages this polls - and the mod's (boot, seq)
+   * is what both carry, so an event held by both is drawn once. A bridge with no store
+   * answers 404 and the log is the mod's buffer alone.
+   */
+
+  var ACTIVITY_PAGE = 200;
+  // Live events kept per scope. A trading post under heavy traffic outruns anything a page
+  // wants to draw long before this, and everything dropped is in the store anyway.
+  var ACTIVITY_LIVE_KEEP = 5000;
+
+  function stationActivityScope(name) {
+    var owner = ownerParamFor(name);
+    var history = { station: name };
+    if (owner !== 'all') { history.owner = owner; }
+
+    return {
+      key: 'station|' + owner + '|' + name, name: name, history: history,
+      live: '/stations/' + Api.seg(name) + '/events', liveQuery: { owner: owner }
+    };
+  }
+
+  function sectorActivityScope(key) {
+    var at = key.split(':').map(Number);
+    var owner = S.filters.owner;
+    var history = { x: at[0], y: at[1] };
+    if (owner !== 'all') { history.owner = owner; }
+
+    return {
+      key: 'sector|' + owner + '|' + key, sector: key, history: history,
+      // The mod has no sector filter on its feed, so the whole faction's is read and cut
+      // down here. It is one call however many stations there are.
+      live: '/economy/events', liveQuery: { owner: owner },
+      match: function (event) {
+        return !!event.sector && event.sector.x === at[0] && event.sector.y === at[1];
+      }
+    };
+  }
+
+  // The log someone could be looking at right now, or null.
+  function visibleActivityScope() {
+    if (S.view === 'industry') {
+      return S.industry.sector ? sectorActivityScope(S.industry.sector) : null;
+    }
+    if (S.view === 'fleet' && S.selected && S.sub === 'economy'
+        && isStation(S.byName[S.selected] || S.detail)) {
+      return stationActivityScope(S.selected);
+    }
+    return null;
+  }
+
+  function activityEntry(scope) {
+    var entry = S.activityLog.scopes[scope.key];
+    if (!entry) {
+      entry = S.activityLog.scopes[scope.key] = {
+        // Stored events, oldest first. Null until the first page lands, and again whenever
+        // the kind filter changes, since the pages are read with it.
+        history: null, historyToken: null, unavailable: null, exhausted: false, loadingOlder: false,
+        live: [], liveSeen: {}, boot: null, cursor: null, liveError: null, polling: false
+      };
+    }
+    return entry;
+  }
+
+  function resetActivityHistory(entry) {
+    entry.history = null;
+    entry.historyToken = null;
+    entry.unavailable = null;
+    entry.exhausted = false;
+    entry.loadingOlder = false;
+  }
+
+  /* The newest page, or with `older` the page before the oldest event held. A token per
+     read drops an answer that lands after the filter changed under it. */
+  function loadActivityHistory(scope, older) {
+    var entry = activityEntry(scope);
+    if (older && (entry.exhausted || entry.loadingOlder || !entry.history || !entry.history.length)) {
+      return Promise.resolve();
+    }
+    if (!older && entry.historyToken) { return Promise.resolve(); }
+
+    var token = {};
+    var query = { limit: ACTIVITY_PAGE };
+    for (var key in scope.history) {
+      if (Object.prototype.hasOwnProperty.call(scope.history, key)) { query[key] = scope.history[key]; }
+    }
+    if (S.activityLog.kind === 'trade') { query.kind = 'trade'; }
+    if (older) {
+      query.before = entry.history[0].id;
+      entry.loadingOlder = true;
+    }
+    entry.historyToken = token;
+
+    return Api.get('/history/economy/events', query,
+                   { priority: older ? Api.P.USER : Api.P.DETAIL, label: 'activity log' })
+      .then(function (body) {
+        if (entry.historyToken !== token) { return; }
+        entry.loadingOlder = false;
+
+        var page = body.events || [];
+        entry.history = older ? page.concat(entry.history) : page;
+        entry.unavailable = null;
+        // A bridge that predates `before` hands out no ids, and would answer every older
+        // page with the newest one again.
+        entry.exhausted = page.length < ACTIVITY_PAGE
+          || page.some(function (event) { return event.id == null; });
+        redrawActivity(scope);
+      })
+      .catch(function (error) {
+        if (entry.historyToken !== token) { return; }
+        entry.loadingOlder = false;
+        if (error.code === 'cancelled') {
+          if (!older) { entry.historyToken = null; }
+          return;
+        }
+
+        if (older) {
+          apiFailed(error, 'Could not read older activity');
+        } else {
+          entry.history = [];
+          entry.unavailable = error;
+          entry.exhausted = true;
+        }
+        redrawActivity(scope);
+      });
+  }
+
+  /* What the mod recorded since the last poll, following `more` until the feed is caught
+     up. A different `boot` means the server restarted and the cursor belongs to the last
+     run, where it would skip the start of this one - so the read starts over. */
+  function pollActivityLive(scope) {
+    var entry = activityEntry(scope);
+    if (entry.polling) { return Promise.resolve(); }
+    entry.polling = true;
+
+    function read(depth) {
+      var query = { owner: scope.liveQuery.owner };
+      var resuming = entry.cursor != null;
+      if (resuming) {
+        query.since = entry.cursor;
+        query.limit = 1000;
+      } else {
+        query.limit = entry.unavailable ? 1000 : ACTIVITY_PAGE;
+      }
+
+      return Api.get(scope.live, query, { priority: Api.P.POLL, label: 'activity live' })
+        .then(function (body) {
+          if (resuming && body.boot !== entry.boot) {
+            entry.boot = body.boot;
+            entry.cursor = null;
+            return depth < 3 ? read(depth + 1) : null;
+          }
+
+          entry.boot = body.boot;
+          entry.cursor = body.cursor;
+          entry.liveError = null;
+
+          // `at` is the server's uptime clock; `now` is that clock when it answered.
+          var received = Date.now() / 1000;
+          var serverNow = Number(body.now) || 0;
+          var added = 0;
+
+          (body.events || []).forEach(function (event) {
+            if (scope.match && !scope.match(event)) { return; }
+            var id = body.boot + '|' + event.seq;
+            if (entry.liveSeen[id]) { return; }
+            entry.liveSeen[id] = true;
+
+            var row = {};
+            for (var field in event) {
+              if (Object.prototype.hasOwnProperty.call(event, field)) { row[field] = event[field]; }
+            }
+            row.boot = body.boot;
+            row.q = event.seq;
+            row.t = received - Math.max(0, serverNow - (Number(event.at) || 0));
+            row.x = event.sector ? event.sector.x : null;
+            row.y = event.sector ? event.sector.y : null;
+            entry.live.push(row);
+            added++;
+          });
+
+          if (entry.live.length > ACTIVITY_LIVE_KEEP) {
+            entry.live.splice(0, entry.live.length - ACTIVITY_LIVE_KEEP).forEach(function (row) {
+              delete entry.liveSeen[row.boot + '|' + row.q];
+            });
+          }
+
+          if (added) { redrawActivity(scope); }
+          if (body.more && depth < 10) { return read(depth + 1); }
+          return null;
+        });
+    }
+
+    return read(0)
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        entry.liveError = error;
+        redrawActivity(scope);
+      })
+      .then(function () { entry.polling = false; });
+  }
+
+  function refreshActivity(scope) {
+    if (!S.connected || !scope) { return Promise.resolve(); }
+    var entry = activityEntry(scope);
+    return Promise.all([
+      entry.historyToken ? null : loadActivityHistory(scope, false),
+      pollActivityLive(scope)
+    ]);
+  }
+
+  function redrawActivity(scope) {
+    var visible = visibleActivityScope();
+    if (!visible || visible.key !== scope.key) { return; }
+    if (scope.sector) { renderIndustry(); } else { renderEconomy(); }
+  }
+
+  function setActivityKind(kind) {
+    S.activityLog.kind = kind === 'all' ? 'all' : 'trade';
+    saveActivityPrefs();
+    for (var key in S.activityLog.scopes) {
+      if (Object.prototype.hasOwnProperty.call(S.activityLog.scopes, key)) {
+        resetActivityHistory(S.activityLog.scopes[key]);
+      }
+    }
+    var scope = visibleActivityScope();
+    if (scope) {
+      redrawActivity(scope);
+      loadActivityHistory(scope, false);
+    }
+  }
+
+  function setActivityOpen(open) {
+    if (S.activityLog.open === open) { return; }
+    S.activityLog.open = open;
+    saveActivityPrefs();
+    if (open) { refreshActivity(visibleActivityScope()); }
+  }
+
+  function saveActivityPrefs() {
+    try {
+      localStorage.setItem(LS.activity, JSON.stringify({ open: S.activityLog.open, kind: S.activityLog.kind }));
+    } catch (e) { /* a forgotten preference is not worth failing over */ }
+  }
+
+  // Stored and live, each event once, filtered to the kind shown, newest first.
+  function activityRows(entry) {
+    var seen = {};
+    var rows = [];
+
+    (entry.history || []).concat(entry.live).forEach(function (event) {
+      var id = event.boot + '|' + event.q;
+      if (seen[id]) { return; }
+      seen[id] = true;
+      if (S.activityLog.kind === 'trade' && event.kind !== 'trade') { return; }
+      rows.push(event);
+    });
+
+    return rows.sort(function (a, b) { return (b.t - a.t) || (b.q - a.q); });
+  }
+
+  function activityWhen(t) {
+    var at = new Date(t * 1000);
+    var today = new Date().toDateString() === at.toDateString();
+    return '<span title="' + esc(at.toLocaleString()) + '">'
+      + (today ? '' : esc(at.toLocaleDateString()) + ' ') + clock(t * 1000) + '</span>';
+  }
+
+  var ACTIVITY_DIRECTION = { sold: 'good', bought: 'info', consumed: 'busy' };
+
+  function activityRow(event, withStation) {
+    var cells = ['<td class="nowrap">' + activityWhen(event.t) + '</td>'];
+    if (withStation) {
+      cells.push('<td>' + stationLink({ name: event.station, owner: { kind: event.owner } }) + '</td>');
+    }
+
+    if (event.kind !== 'trade') {
+      var catchup = event.kind === 'catchup';
+      var made = (event.results || []).map(function (r) { return r.name; }).join(', ');
+      var said = catchup
+        ? numText(event.cycles) + ' cycles caught up for ' + duration(event.seconds) + ' unloaded'
+        : numText(event.cycles) + ' cycles in ' + duration(event.seconds)
+          + (event.utilization != null ? ' · ' + numText(event.utilization * 100) + '% busy' : '')
+          + (event.starvedSeconds ? ' · starved ' + duration(event.starvedSeconds) : '')
+          + (event.blockedSeconds ? ' · full ' + duration(event.blockedSeconds) : '');
+
+      cells.push('<td><span class="badge">' + (catchup ? 'catch-up' : 'production') + '</span></td>'
+        + '<td colspan="5" class="mute2">' + esc(said) + (made ? ' · ' + esc(made) : '') + '</td>');
+      return '<tr class="activity-production">' + cells.join('') + '</tr>';
+    }
+
+    var units = Number(event.units) || 0;
+    var price = Number(event.price) || 0;
+    var unitPrice = event.unitPrice != null ? event.unitPrice : (units ? price / units : null);
+    // The owner's side of the money: a purchase is money out.
+    var amount = event.ownerAmount != null ? Number(event.ownerAmount) : price;
+    if (event.direction === 'bought') { amount = -amount; }
+
+    var counterparty = event.counterparty && event.counterparty.name;
+    var with_ = [counterparty ? esc(counterparty) : '', event.ship ? esc(event.ship) : '']
+      .filter(Boolean).join(' · ');
+
+    cells.push(
+      '<td><span class="badge ' + (ACTIVITY_DIRECTION[event.direction] || '') + '">'
+        + esc(event.direction || '?') + '</span>'
+        + (event.internal ? ' <span class="badge">internal</span>' : '') + '</td>',
+      '<td>' + esc(event.good || '?') + '</td>',
+      '<td class="num">' + num(units) + '</td>',
+      '<td class="num">' + (event.internal ? '—' : (unitPrice != null ? num(unitPrice, unitPrice < 10 ? 1 : 0) + ' ¢' : '—')) + '</td>',
+      '<td class="num">' + (event.internal ? '<span class="mute2">free</span>' : signedCredits(amount)) + '</td>',
+      '<td>' + (with_ || '—') + (event.channel ? ' <span class="mute2">' + esc(event.channel) + '</span>' : '') + '</td>'
+    );
+    return '<tr>' + cells.join('') + '</tr>';
+  }
+
+  function activityCard(scope) {
+    var log = S.activityLog;
+    var entry = activityEntry(scope);
+    var withStation = !!scope.sector;
+
+    var head = '<details class="card wide activity-log"' + (log.open ? ' open' : '') + '>'
+      + '<summary>Activity log</summary>';
+
+    if (!log.open) { return head + '</details>'; }
+
+    // The first draw of a log nobody has read yet is what starts reading it.
+    if (!entry.historyToken && S.connected) {
+      Promise.resolve().then(function () { refreshActivity(scope); });
+    }
+
+    var rows = activityRows(entry);
+
+    var trades = rows.filter(function (event) { return event.kind === 'trade' && !event.internal; });
+    var sum = function (direction) {
+      return trades.reduce(function (total, event) {
+        return total + (event.direction === direction
+          ? Number(event.ownerAmount != null ? event.ownerAmount : event.price) || 0 : 0);
+      }, 0);
+    };
+
+    var notes = [];
+    if (entry.unavailable) {
+      notes.push('<span class="note warn">no bridge history ' + explain('activity-no-history', 'warn') + '</span>');
+    }
+    if (entry.liveError) {
+      notes.push('<span class="note warn">live feed: ' + esc(entry.liveError.message) + '</span>');
+    } else if (entry.boot) {
+      notes.push('<span class="badge good">live</span>');
+    }
+
+    var controls = '<div class="row tight">'
+      + '<div class="seg" data-activity-kind-seg>'
+      + [['trade', 'trades'], ['all', 'all']].map(function (k) {
+          return '<button data-activity-kind="' + k[0] + '"' + (log.kind === k[0] ? ' class="on"' : '')
+            + '>' + k[1] + '</button>';
+        }).join('')
+      + '</div>' + explain('activity-log')
+      + '<span class="mute2">' + numText(rows.length) + (log.kind === 'trade' ? ' trades' : ' events')
+      + ' · sold ' + credits(sum('sold') + sum('consumed')) + ' · bought ' + credits(sum('bought')) + '</span>'
+      + '<span class="spacer"></span>' + notes.join(' ') + '</div>';
+
+    var body;
+    if (!rows.length) {
+      body = '<div class="mute2" style="margin-top:8px">'
+        + (entry.history === null && !entry.boot ? 'loading…'
+          : (log.kind === 'trade' ? 'No trades recorded.' : 'Nothing recorded.')) + '</div>';
+    } else {
+      body = '<div class="activity-scroll scroll-x"><table><thead><tr><th>When</th>'
+        + (withStation ? '<th>Station</th>' : '')
+        + '<th></th><th>Good</th><th class="num">Units</th><th class="num">Each</th>'
+        + '<th class="num">Total</th><th>With</th></tr></thead><tbody>'
+        + rows.map(function (event) { return activityRow(event, withStation); }).join('')
+        + '</tbody></table></div>';
+    }
+
+    var foot = '';
+    if (entry.history && !entry.unavailable) {
+      foot = entry.exhausted
+        ? '<div class="mute2" style="margin-top:6px">start of the record</div>'
+        : '<div style="margin-top:6px"><button class="ghost small" data-activity-older'
+          + (entry.loadingOlder ? ' disabled' : '') + '>'
+          + (entry.loadingOlder ? 'loading…' : 'load older') + '</button></div>';
+    }
+
+    return head + controls + body + foot + '</details>';
+  }
+
+  // The log scrolls on its own, and the card around it is rewritten on every poll.
+  function keepActivityScroll(node, draw) {
+    var scrolled = $('.activity-scroll', node);
+    var top = scrolled ? scrolled.scrollTop : 0;
+    draw();
+    var again = $('.activity-scroll', node);
+    if (again) { again.scrollTop = top; }
   }
 
   /* Earned, spent and net per bucket as three lines. One station's figures over time are
@@ -8147,7 +8588,7 @@
     var wide = $('.sector-scroll', node);
     var across = wide ? wide.scrollLeft : 0;
 
-    node.innerHTML = html;
+    keepActivityScroll(node, function () { node.innerHTML = html; });
 
     if ($('.industry-body', node)) { $('.industry-body', node).scrollTop = top; }
     if ($('.sector-scroll', node)) { $('.sector-scroll', node).scrollLeft = across; }
@@ -8239,6 +8680,7 @@
 
     paint(pane, 'pane', head + '<div class="industry-body"><div class="cards">'
       + graph + projectionCard(current) + balanceCard(current, all) + sectorChart(current) + idle
+      + activityCard(sectorActivityScope(current.key))
       + '</div></div>');
   }
 
@@ -8704,8 +9146,33 @@
        whenever the station is re-read, which would drop a direct listener. */
     $('#sv-economy').addEventListener('click', function (e) {
       var button = e.target.closest('#economy-window button');
-      if (button) { setEconomyWindow(Number(button.dataset.v)); }
+      if (button) { setEconomyWindow(Number(button.dataset.v)); return; }
+      activityClick(e);
     });
+
+    /* The activity log's own controls, wherever the card is. `toggle` does not bubble, so
+       the open state is caught on the way down; a card redrawn already open fires it too,
+       which setActivityOpen ignores. */
+    var activityClick = function (e) {
+      var kind = e.target.closest('[data-activity-kind]');
+      if (kind) { setActivityKind(kind.dataset.activityKind); return true; }
+
+      if (e.target.closest('[data-activity-older]')) {
+        var scope = visibleActivityScope();
+        if (scope) {
+          loadActivityHistory(scope, true);
+          redrawActivity(scope);
+        }
+        return true;
+      }
+      return false;
+    };
+
+    document.addEventListener('toggle', function (e) {
+      if (e.target.classList && e.target.classList.contains('activity-log')) {
+        setActivityOpen(e.target.open);
+      }
+    }, true);
 
     bindSeg('#filter-type', function (value) {
       S.filters.type = value;
@@ -8735,6 +9202,8 @@
     });
 
     $('#industry-pane').addEventListener('click', function (e) {
+      if (activityClick(e)) { return; }
+
       var station = e.target.closest('[data-station]');
       if (station) { e.preventDefault(); openStation(station.dataset.station); return; }
 

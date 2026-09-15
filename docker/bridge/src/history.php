@@ -1824,6 +1824,14 @@ final class History
     /**
      * Stored station events, newest `limit` of them in time order - the trade log.
      * `kind` narrows to one of trade, production and catchup.
+     *
+     * `before` is the `id` of an event from an earlier answer, and pages back from it. It
+     * is a position in the same order the rows are read in rather than a time: `to` only
+     * has whole seconds, and a busy trading post trades several times in one of those, so
+     * paging by time either repeats a second's events or skips them. Rows are ordered by
+     * when they happened, not by id - a reload catch-up or a late collection is stored
+     * after events that happened later - so the id is resolved to its place in that order.
+     * An id this key cannot see, or that has been cleared, reads as nothing before it.
      */
     public function stationEvents(array $filter): array
     {
@@ -1837,11 +1845,16 @@ final class History
             $args[':kind'] = (string) $filter['kind'];
         }
 
+        if ((int) ($filter['before'] ?? 0) > 0) {
+            $scope .= ' AND (happened_at, id) < (SELECT happened_at, id FROM station_events WHERE id = :before)';
+            $args[':before'] = (int) $filter['before'];
+        }
+
         $limit = max(1, (int) ($filter['limit'] ?? 500));
 
         $rows = $this->all(
             $this->db(),
-            "SELECT station, owner, x, y, seq, kind, data,
+            "SELECT id, station, owner, x, y, boot, seq, kind, data,
                     EXTRACT(EPOCH FROM happened_at)::bigint AS t
              FROM station_events WHERE {$scope}
              ORDER BY happened_at DESC, id DESC LIMIT {$limit}",
@@ -1850,9 +1863,11 @@ final class History
 
         $out = [];
         foreach (array_reverse($rows) as $row) {
-            $event = ['t' => (int) $row['t'], 'station' => (string) $row['station'],
+            // `boot` and `q` together are the mod's own identity for the event, which is what
+            // lets a reader merge these with the live feed without showing one twice.
+            $event = ['id' => (int) $row['id'], 't' => (int) $row['t'], 'station' => (string) $row['station'],
                       'owner' => (string) $row['owner'], 'x' => (int) $row['x'], 'y' => (int) $row['y'],
-                      'q' => (int) $row['seq']];
+                      'boot' => (string) $row['boot'], 'q' => (int) $row['seq']];
 
             $data = json_decode((string) $row['data'], true);
             if (is_array($data)) {
