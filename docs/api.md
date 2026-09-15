@@ -737,8 +737,10 @@ What the ship's automation is doing, as the ship itself last reported it.
   "ship": "Ore Hound", "source": "live", "reported": true,
   "automation": {
     "version": 1,
+    "standing": {"enemies": {"enabled": true, "mode": "interrupt"},
+                 "loot": {"enabled": true, "mode": "idle"}},
     "autoAggressive": true, "attackCivilians": false,
-    "enemies": false, "defenceFights": 3,
+    "enemies": false, "defenceFights": 3, "lootRuns": 5,
     "sector": {"x": 290, "y": 1},
     "plan": {
       "id": "p5-7322", "kind": "farm", "phase": "running", "onEnemies": "fight",
@@ -751,7 +753,10 @@ What the ship's automation is doing, as the ship itself last reported it.
       "cooldown": {"left": 1740, "total": 1800}
     },
     "last": {"id": "p4-7310", "kind": "route", "outcome": "arrived", "jumps": 9, "fights": 0,
-             "sector": {"x": -120, "y": 88}}
+             "sector": {"x": -120, "y": 88}},
+    "reaction": null,
+    "lastReaction": {"kind": "loot", "outcome": "done", "lootResult": "collected",
+                     "resumed": true, "sector": {"x": 290, "y": 1}}
   }
 }
 ```
@@ -767,30 +772,73 @@ What the ship's automation is doing, as the ship itself last reported it.
 | `plan.lootResult` | farms: how the last looting ended - `collected`, `stalled`, `timeout`, `no_launch`, `no_fighters`; `_recalled` appended when stragglers had to be pulled in |
 | `plan.hop` | the hop being flown, 1-based, counting the approach |
 | `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
+| `standing` | the ship's standing orders, `enemies` and `loot`, each `{enabled, mode}`. Absent on ships running a mod version from before standing orders |
+| `autoAggressive` | kept for older clients: `standing.enemies.enabled` |
+| `reaction` | a standing order holding the ship right now: `{kind, mode, phase, resumes, loot, lootResult}`. `phase` is `fighting`, `looting` or `returning`; `resumes` says whether an interrupted chain comes back afterwards. Absent when there is none, and never alongside `plan` |
+| `lastReaction.outcome` | `done`, `replaced` (orders from elsewhere; the old chain is not put back), `switched_off` (the chain is put back), `stopped` |
+| `defenceFights`, `lootRuns` | fights and loot runs started by standing orders, over the life of the ship |
 
 Works offline, from the database copy.
 
 ## POST /ships/{name}/automation
 
-Idle defence: a ship with a captain, no orders and enemies in its sector turns aggressive
-until the sector is clear, then goes back to idle. A ship somebody is flying is left alone.
+The ship's standing orders: what it does by itself, without a plan, while its sector is
+loaded.
+
+| order | what it does |
+|---|---|
+| `enemies` | turns aggressive while enemies are in the sector, until it has been clear for five seconds |
+| `loot` | sends every squad for loot in the sector, then waits for the fighters to land. Needs fighters aboard; cargo drops only count with a transporter block and Transporter Software (rare or better). Never under fire. Loot that could not all be taken (a stall, fighters that would not launch) is left alone in that sector for two minutes |
+
+Each has a `mode`:
+
+| mode | when it may take the ship |
+|---|---|
+| `idle` | only while the ship has no orders (the default) |
+| `interrupt` | whatever it is doing. The chain is put aside whole and put back afterwards, at the order it was on; loops keep their indices |
+
+A fight that leaves loot goes on to the loot when the loot order applies to what the ship was
+doing: always if it was idle, only in `interrupt` mode if a chain is waiting. Enemies arriving
+while the fighters are out are fought.
+
+Both need a captain, as vanilla requires for any order; a ship somebody is flying is left to
+them. While a plan runs, the plan's own `onEnemies` and `collectLoot` govern, and the standing
+orders wait. A planned route, which has no loot setting of its own, collects loot after its
+fights when the loot order is on in `interrupt` mode. Sending orders or a plan while a standing
+order holds the ship ends it, and the chain it put aside is not put back. Switching an order
+off while it holds the ship ends it and puts the chain back.
 
 ```jsonc
-{"autoAggressive": true, "attackCivilians": false}
+{
+  "standing": {
+    "enemies": {"enabled": true, "mode": "interrupt"},
+    "loot": {"enabled": true}
+  },
+  "attackCivilians": false
+}
 ```
 
-Either field may be sent alone. The setting is saved on the ship and survives restarts. The
-answer is held until the ship reports the new settings, as for routes. It gives the ship no
-order, so only the world checks apply, not the captain ones.
+Every part is optional: an order or field left out stays as the ship has it. `attackCivilians`
+decides whether civilian ships count as enemies, for the standing orders and the ship's enemy
+check alike. `autoAggressive` is the older name for `standing.enemies.enabled` and is still
+accepted; sending both with different values is `400 conflicting_settings`.
 
-Errors: `400 no_settings`, `400 bad_setting`.
+The settings are saved on the ship and survive restarts; a ship saved with `autoAggressive`
+on comes back with the `enemies` order in `idle` mode. The answer is held until the ship
+reports the new settings, as for routes. It gives the ship no order, so only the world checks
+apply, not the captain ones.
+
+Errors: `400 no_settings`, `400 bad_setting`, `400 bad_standing` (not an object, an unknown
+order - `details.known` lists them - or an order that sets nothing), `400 bad_standing_mode`,
+`400 conflicting_settings`.
 
 **Requires the owning player to be logged in.**
 
 ## POST /ships/{name}/automation/stop
 
-Ends the ship's plan and clears its order chain. Idle defence is a setting and stays as it
-was. Answered once the ship reports it has no plan.
+Ends the ship's plan, or a standing order holding the ship, and clears its order chain. The
+standing orders are settings and stay as they were. Answered once the ship reports it has
+neither.
 
 **Requires the owning player to be logged in.**
 

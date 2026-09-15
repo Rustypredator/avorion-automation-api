@@ -347,7 +347,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
 | `POST /ships/{name}/farm` | boss farming: loop through empty space in a boss ring |
-| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, idle defence, stop |
+| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, standing orders (fight enemies, collect loot), stop |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
@@ -403,7 +403,7 @@ exact call shape vanilla uses, and every vanilla caller of the background simula
 player script. So the bridge parks a job and the agent, running in the one context where the
 call is legal, executes it and reports back.
 
-Planned routes, boss farming and idle defence need a third place, because only a script in
+Planned routes, boss farming and standing orders need a third place, because only a script in
 the ship's own sector can see enemies in it: `data/scripts/entity/orderchain.lua` extends
 vanilla's order chain. It puts a plan's hops on the ordinary chain, watches the sector while
 the ship flies them, and publishes its state alongside the chain in the order info the agent

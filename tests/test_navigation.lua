@@ -355,6 +355,52 @@ check(status == 200 and body.confirmed == true and body.automation.autoAggressiv
 check(#Mock.entityCalls == 1 and Mock.entityCalls[1].fn == "automationApiConfigure",
       "without touching the chain the ship is running")
 
+print("\nstanding orders")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = true})
+check(status == 400 and body.error.code == "bad_standing", "standing must be an object")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {salvage = {enabled = true}}})
+check(status == 400 and body.error.code == "bad_standing" and body.error.details.known ~= nil,
+      "an unknown standing order is a 400 that lists the known ones")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {loot = {mode = "always"}}})
+check(status == 400 and body.error.code == "bad_standing_mode", "so is an unknown mode")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {loot = {enabled = 1}}})
+check(status == 400 and body.error.code == "bad_standing", "and a non-boolean enabled")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {loot = {}}})
+check(status == 400 and body.error.code == "bad_standing", "and an order that sets nothing")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {autoAggressive = false, standing = {enemies = {enabled = true}}})
+check(status == 400 and body.error.code == "conflicting_settings",
+      "the old field and the enemies order may not disagree")
+
+Mock.entityCalls = {}
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {loot = {enabled = true, mode = "INTERRUPT"}}})
+check(status == 200 and body.confirmed == true
+      and body.automation.standing.loot.enabled == true
+      and body.automation.standing.loot.mode == "interrupt",
+      "a standing order is switched on, its mode normalised, and confirmed by the ship")
+check(body.automation.standing.enemies.enabled == true,
+      "leaving the other standing order as it was")
+check(#Mock.entityCalls == 1 and Json.decode(Mock.entityCalls[1].args[1]).standing.loot.mode
+      == "interrupt", "in one call that carries only what was sent")
+
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {loot = {enabled = false}}})
+check(status == 200 and body.automation.standing.loot.enabled == false
+      and body.automation.standing.loot.mode == "interrupt",
+      "and switched off again, keeping its mode")
+
+Mock.orderChainFrozen = true
+local status, body = call("POST", "/ships/Pathfinder/automation", {standing = {loot = {enabled = true}}})
+check(status == 202 and body.confirmed == false,
+      "a ship that never reports the new standing orders leaves the answer unconfirmed")
+Mock.orderChainFrozen = false
+
 local status, body = call("POST", "/ships/Pathfinder/automation/stop")
 check(status == 200 and body.automation.plan == nil, "stop ends the plan")
 check(body.automation.autoAggressive == true, "and leaves the settings as they were")

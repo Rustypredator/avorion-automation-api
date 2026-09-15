@@ -61,6 +61,7 @@
     swept: {},          // ship name -> true once its first sweep set the baseline
     autoSeen: {},       // ship name -> the last automation state seen, for notifications
     expectEnd: {},      // ship name -> true while a stop sent from here is on its way
+    standingSaving: null, // ship name whose standing orders are being saved
     recording: {},      // ship name -> boolean
     traffic: [],
 
@@ -628,10 +629,20 @@
       + 'Transporter Software of rare or better installed permanently; with either alone '
       + 'the fighters leave cargo where it is, so the ship does not wait for it.</p>',
 
-    'nav-defence':
-      'While the ship has no orders and a captain, enemies in its sector make it fight until '
-      + 'the sector is clear, then it goes back to idle. A ship you are flying is left to you. '
-      + 'The setting is saved on the ship.',
+    'standing-orders':
+      '<p>Orders the ship keeps without being told again, carried out by the ship itself '
+      + 'while its sector is loaded. They are saved on the ship and survive restarts.</p>'
+      + '<p><b>Fight enemies</b> turns aggressive until the sector has been clear for five '
+      + 'seconds. <b>Collect loot</b> sends every squad for loot in the sector, then waits for '
+      + 'the fighters to land; it needs fighters aboard, and cargo drops also need a '
+      + 'transporter block and Transporter Software. Loot is never collected under fire, '
+      + 'and after a fight the loot comes next.</p>'
+      + '<p><b>only when idle</b> acts while the ship has no orders. <b>interrupt, then '
+      + 'resume</b> acts whatever the ship is doing and puts its order chain back afterwards, '
+      + 'at the order it was on.</p>'
+      + '<p>Either needs a captain; a ship you are flying is left to you. A planned route or '
+      + 'farm brings its own enemy handling from the Travel tab, and a route also collects '
+      + 'loot after a fight when <b>Collect loot</b> may interrupt.</p>',
 
     'nav-state':
       'What the ship last reported. Live while you are in game; otherwise the ship database\'s '
@@ -1046,6 +1057,7 @@
 
     if (name === 'mission' && S.selected && !S.catalog) { loadCatalog(); }
     if (name === 'travel' && S.selected) { renderTravel(); loadAutomation(); }
+    if (name === 'orders' && S.selected) { renderStanding(); loadAutomation(); }
     if (name === 'cargo') { renderCargo(); }
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
@@ -1385,7 +1397,7 @@
     loadStation();
     renderOrders();
     renderTravel();
-    if (S.sub === 'travel') { loadAutomation(); }
+    if (S.sub === 'travel' || S.sub === 'orders') { loadAutomation(); }
     renderShipLog();
 
     if (changed && S.history.selectedOnly && historyWanted()) { loadHistory(true); }
@@ -3551,7 +3563,147 @@
 
     out.push('<div id="order-result"></div>');
 
+    out.push('<div id="standing-orders"></div>');
+
     $('#sv-orders').innerHTML = out.join('');
+    renderStanding();
+  }
+
+  /* ---------------------------- standing orders ---------------------------- */
+
+  /* Settings on the ship rather than orders on its chain, so each change is saved the
+     moment it is made. The section redraws on its own: the chain rows above it may be
+     half edited when the ship reports in. */
+
+  var STANDING = [
+    { key: 'enemies', label: 'Fight enemies', text: 'turn aggressive when enemies are sighted in the sector' },
+    { key: 'loot', label: 'Collect loot', text: 'send the fighters for loot in the sector, when there are fighters aboard' }
+  ];
+
+  var STANDING_MODES = [
+    ['idle', 'only when idle'],
+    ['interrupt', 'interrupt, then resume']
+  ];
+
+  var REACTION_PHASES = {
+    fighting: ['bad', 'fighting'],
+    looting: ['info', 'fighters collecting loot'],
+    returning: ['info', 'waiting for fighters to land']
+  };
+
+  var REACTION_ENDS = {
+    done: 'done',
+    replaced: 'other orders took over',
+    switched_off: 'switched off',
+    stopped: 'stopped'
+  };
+
+  function renderStanding() {
+    var node = $('#standing-orders');
+    if (!node || !S.selected) { return; }
+
+    var nav = S.nav;
+    var head = '<div class="section"><h2>Standing orders ' + explain('standing-orders') + '</h2>';
+
+    if (nav.automationError) {
+      node.innerHTML = head + errorBox('Could not read the standing orders', nav.automationError) + '</div>';
+      return;
+    }
+    if (!nav.automation) { node.innerHTML = head + '<p class="muted">loading…</p></div>'; return; }
+
+    var a = nav.automation.automation || {};
+    if (!nav.automation.reported || !a.standing) {
+      node.innerHTML = head + '<div class="note">'
+        + (nav.automation.reported
+          ? 'This ship runs a mod version without standing orders.'
+          : 'This ship has not reported its settings yet. It does once its sector is loaded '
+            + 'with this version of the mod.')
+        + '</div></div>';
+      return;
+    }
+
+    var saving = S.standingSaving === S.selected;
+    var off = saving ? ' disabled' : '';
+
+    var rows = STANDING.map(function (spec) {
+      var order = a.standing[spec.key] || {};
+      return '<div class="order-row standing-row">'
+        + '<label class="check switch"><input type="checkbox" data-standing-on="' + spec.key + '"'
+        + (order.enabled ? ' checked' : '') + off + '><span><b>' + esc(spec.label) + '</b></span></label>'
+        + '<span class="mute2">' + esc(spec.text) + '</span>'
+        + '<span class="spacer"></span>'
+        + '<div class="chips">' + STANDING_MODES.map(function (mode) {
+            return '<button class="chip' + (order.mode === mode[0] ? ' on' : '') + '"'
+              + ' data-standing-mode="' + mode[0] + '" data-standing-key="' + spec.key + '"' + off + '>'
+              + esc(mode[1]) + '</button>';
+          }).join('') + '</div>'
+        + '</div>';
+    }).join('');
+
+    var civilians = '<div class="row" style="margin-top:4px">'
+      + '<label class="check"><input type="checkbox" data-standing-civ'
+      + (a.attackCivilians ? ' checked' : '') + off + '><span>civilian ships count as enemies</span></label>'
+      + (saving ? '<span class="mute2">saving…</span>' : '')
+      + '</div>';
+
+    var badges = [];
+    var reaction = a.reaction;
+    if (reaction) {
+      var phase = REACTION_PHASES[reaction.phase] || ['info', reaction.phase];
+      badges.push('<span class="badge ' + phase[0] + '">' + esc(phase[1]) + '</span>');
+      badges.push('<span class="mute2">' + (reaction.resumes ? 'the order chain comes back afterwards' : 'was idle') + '</span>');
+    } else if (a.plan) {
+      badges.push('<span class="mute2">flying a ' + esc(a.plan.kind) + ' plan, which handles enemies itself</span>');
+    }
+    if (a.enemies) { badges.push('<span class="badge bad">enemies in sector</span>'); }
+
+    var stats = [];
+    if (a.defenceFights) { stats.push(num(a.defenceFights) + ' fights'); }
+    if (a.lootRuns) { stats.push(num(a.lootRuns) + ' loot runs'); }
+    var last = a.lastReaction;
+    if (last) {
+      stats.push('last: ' + esc(last.kind) + ' · ' + esc(REACTION_ENDS[last.outcome] || last.outcome)
+        + (last.lootResult ? ' · ' + esc(LOOT_RESULTS[last.lootResult] || last.lootResult) : '')
+        + (last.resumed ? ' · chain resumed' : ''));
+    }
+
+    node.innerHTML = head + rows + civilians
+      + (badges.length || stats.length
+        ? '<div class="row" style="margin-top:8px">' + badges.join('')
+          + '<span class="spacer"></span>'
+          + (reaction ? '<button class="ghost small" data-act="standing-stop" title="End it and clear the chain; the standing orders stay on">stop</button>' : '')
+          + '</div>'
+          + (stats.length ? '<div class="mute2" style="margin-top:4px">' + stats.join(' · ') + '</div>' : '')
+        : '')
+      + '</div>';
+  }
+
+  function saveStanding(body, label) {
+    var name = S.selected;
+    if (!name || S.standingSaving === name) { return; }
+
+    S.standingSaving = name;
+    renderStanding();
+
+    Api.post('/ships/' + Api.seg(name) + '/automation', body,
+             { owner: ownerParamFor(name) },
+             { priority: Api.P.USER, label: 'standing orders' })
+      .then(function (result) {
+        S.standingSaving = null;
+        toast(result.confirmed ? 'good' : 'warn', label,
+              result.confirmed ? name + ' confirmed it.' : 'Sent, but the ship did not confirm it.');
+        tookAutomation(name, result);
+        renderStanding();
+      })
+      .catch(function (error) {
+        S.standingSaving = null;
+        renderStanding();
+        apiFailed(error, 'Standing orders refused');
+      });
+  }
+
+  function standingLabel(key) {
+    return (STANDING.filter(function (spec) { return spec.key === key; })[0] || {}).label || key;
   }
 
   function dispatchOrders(button) {
@@ -3857,20 +4009,10 @@
       + '<div id="farm-result">' + farmResultHtml(nav.farm) + '</div>'
       + '</div>');
 
-    /* --- idle defence --- */
-    var automation = (nav.automation && nav.automation.automation) || {};
-    out.push('<div class="section"><h2>Idle defence ' + explain('nav-defence') + '</h2>'
-      + '<div class="row">'
-      + '<label class="check"><input type="checkbox" id="nav-auto-aggressive"'
-      + (automation.autoAggressive ? ' checked' : '') + '><span>turn aggressive when idle and '
-      + 'enemies are in the sector</span></label>'
-      + '<label class="check"><input type="checkbox" id="nav-defence-civilians"'
-      + (automation.attackCivilians ? ' checked' : '') + '><span>civilians count</span></label>'
-      + '</div></div>');
-
-    out.push('<div class="note">Captain travel missions, which work in unloaded sectors and '
-      + 'while you are logged out, are on the '
-      + '<a href="#" data-act="to-missions">Mission tab</a>.</div>');
+    out.push('<div class="note">Fighting enemies and collecting loot while the ship is not '
+      + 'flying a plan are standing orders, on the <a href="#" data-act="to-orders">Orders tab</a>. '
+      + 'Captain travel missions, which work in unloaded sectors and while you are logged out, '
+      + 'are on the <a href="#" data-act="to-missions">Mission tab</a>.</div>');
 
     $('#sv-travel').innerHTML = out.join('');
   }
@@ -3916,22 +4058,35 @@
       badges.push('<span class="badge">no plan</span>');
     }
 
+    if (a.reaction) {
+      badges.push('<span class="badge ' + ((REACTION_PHASES[a.reaction.phase] || [])[0] || 'info') + '">standing order · '
+        + esc(a.reaction.phase) + '</span>');
+    }
     if (a.enemies) { badges.push('<span class="badge bad">enemies in sector</span>'); }
-    badges.push('<span class="badge ' + (a.autoAggressive ? 'good' : '') + '">idle defence '
-      + (a.autoAggressive ? 'on' : 'off') + '</span>');
+    if (a.standing) {
+      STANDING.forEach(function (spec) {
+        var order = a.standing[spec.key] || {};
+        badges.push('<span class="badge ' + (order.enabled ? 'good' : '') + '" title="standing order, set on the Orders tab">'
+          + esc(spec.label.toLowerCase()) + ' ' + (order.enabled ? (order.mode === 'interrupt' ? 'always' : 'when idle') : 'off') + '</span>');
+      });
+    } else {
+      badges.push('<span class="badge ' + (a.autoAggressive ? 'good' : '') + '">idle defence '
+        + (a.autoAggressive ? 'on' : 'off') + '</span>');
+    }
 
     if (a.last) {
       rows.push(['last plan', esc(a.last.kind + ' · ' + a.last.outcome)
         + (a.last.reason ? ' <span class="mute2">' + esc(a.last.reason) + '</span>' : '')]);
     }
-    if (a.defenceFights) { rows.push(['defence fights', num(a.defenceFights)]); }
+    if (a.defenceFights) { rows.push(['standing fights', num(a.defenceFights)]); }
+    if (a.lootRuns) { rows.push(['standing loot runs', num(a.lootRuns)]); }
     rows.push(['source', esc(nav.automation.source)
       + (nav.automation.source === 'database' ? ' <span class="mute2">as of the last save</span>' : '')]);
 
     return head
       + '<div class="row" style="margin-bottom:8px"><div class="badges">' + badges.join('') + '</div>'
       + '<span class="spacer"></span>'
-      + (plan ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
+      + (plan || a.reaction ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
       + '</div>'
       + kv(rows)
       + '</div>';
@@ -4112,6 +4267,7 @@
                            receivedAt: Date.now() };
       S.nav.automationError = null;
       renderTravel();
+      renderStanding();
     }
     refreshFleet(true);
     sweepEvents();
@@ -4129,11 +4285,13 @@
         S.nav.automation = body;
         S.nav.automationError = null;
         if (S.sub === 'travel') { renderTravel(); }
+        if (S.sub === 'orders') { renderStanding(); }
       })
       .catch(function (error) {
         if (error.code === 'cancelled' || S.selected !== name) { return; }
         S.nav.automationError = error;
         if (S.sub === 'travel') { renderTravel(); }
+        if (S.sub === 'orders') { renderStanding(); }
       });
   }
 
@@ -4146,38 +4304,12 @@
                            { owner: ownerParamFor(name) },
                            { priority: Api.P.USER, label: 'stop automation' }))
       .then(function (result) {
-        toast('good', 'Stopped', name + ' has no plan any more.');
+        toast('good', 'Stopped', name + ' has no plan or standing order at work any more.');
         tookAutomation(name, result);
       })
       .catch(function (error) {
         delete S.expectEnd[name];
         apiFailed(error, 'Stop refused');
-      });
-  }
-
-  function saveDefence(input) {
-    var name = S.selected;
-    if (!name) { return; }
-
-    var body = {
-      autoAggressive: $('#nav-auto-aggressive').checked,
-      attackCivilians: $('#nav-defence-civilians').checked
-    };
-
-    input.disabled = true;
-    Api.post('/ships/' + Api.seg(name) + '/automation', body,
-             { owner: ownerParamFor(name) },
-             { priority: Api.P.USER, label: 'idle defence' })
-      .then(function (result) {
-        input.disabled = false;
-        toast(result.confirmed ? 'good' : 'warn', 'Idle defence ' + (body.autoAggressive ? 'on' : 'off'),
-              result.confirmed ? name + ' confirmed the setting.' : 'Sent, but the ship did not confirm it.');
-        tookAutomation(name, result);
-      })
-      .catch(function (error) {
-        input.disabled = false;
-        input.checked = !input.checked;
-        apiFailed(error, 'Setting refused');
       });
   }
 
@@ -4251,6 +4383,7 @@
         S.nav.automation = { ship: name, source: 'live', reported: true,
                              automation: event.automation, receivedAt: arrived - offset * 1000 };
         if (S.sub === 'travel') { renderTravel(); }
+        if (S.sub === 'orders') { renderStanding(); }
       }
 
       if (event.seq > (S.cursors[name] || -1)) { S.cursors[name] = event.seq; }
@@ -6764,8 +6897,20 @@
         return;
       }
 
+      if (button.dataset.standingMode) {
+        if (button.classList.contains('on')) { return; }
+        var key = button.dataset.standingKey;
+        var patch = {};
+        patch[key] = { mode: button.dataset.standingMode };
+        saveStanding({ standing: patch }, standingLabel(key) + ': '
+          + (button.dataset.standingMode === 'interrupt' ? 'interrupts' : 'only when idle'));
+        return;
+      }
+
       var act = button.dataset.act;
       var i = Number(button.dataset.i);
+
+      if (act === 'standing-stop') { stopAutomation(button); return; }
 
       if (act === 'row-add') { S.orderRows.push({ type: 'patrol' }); renderOrders(); }
       else if (act === 'row-del') { S.orderRows.splice(i, 1); renderOrders(); }
@@ -6779,6 +6924,18 @@
     $('#sv-orders').addEventListener('change', function (e) {
       var node = e.target;
       var i;
+
+      if (node.dataset.standingOn !== undefined) {
+        var patch = {};
+        patch[node.dataset.standingOn] = { enabled: node.checked };
+        saveStanding({ standing: patch }, standingLabel(node.dataset.standingOn) + (node.checked ? ' on' : ' off'));
+        return;
+      }
+      if (node.dataset.standingCiv !== undefined) {
+        saveStanding({ attackCivilians: node.checked },
+                     node.checked ? 'Civilians count as enemies' : 'Civilians left alone');
+        return;
+      }
 
       if (node.dataset.rowType !== undefined) {
         i = Number(node.dataset.rowType);
@@ -6797,10 +6954,10 @@
 
     /* --- travel tab --------------------------------------------------- */
     $('#sv-travel').addEventListener('click', function (e) {
-      var link = e.target.closest('a[data-act="to-missions"]');
+      var link = e.target.closest('a[data-act="to-missions"], a[data-act="to-orders"]');
       if (link) {
         e.preventDefault();
-        showSub('mission');
+        showSub(link.dataset.act === 'to-orders' ? 'orders' : 'mission');
         return;
       }
 
@@ -6848,9 +7005,6 @@
         var minutes = Math.round(Number(node.value));
         S.nav.cooldownMinutes = isFinite(minutes) ? Math.min(240, Math.max(0, minutes)) : 30;
         node.value = S.nav.cooldownMinutes;
-      }
-      else if (node.id === 'nav-auto-aggressive' || node.id === 'nav-defence-civilians') {
-        saveDefence(node);
       }
     });
 

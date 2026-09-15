@@ -693,8 +693,10 @@ check(state().autoAggressive == true, "the setting is published")
 
 world.enemies = true
 tick()
-check(actions() == "A" and OrderChain.chain[1].automationApi == "defence",
+check(actions() == "A" and OrderChain.chain[1].automationApi == "standing",
       "an idle ship with enemies around turns aggressive")
+check(state().standing.enemies.enabled == true and state().standing.enemies.mode == "idle",
+      "the old setting is the standing enemies order in idle mode")
 check(world.aggressive.canFinish == true, "until the sector is clear")
 check(world.aiCivilians == false, "counting civilians only when asked to")
 tick()
@@ -720,6 +722,286 @@ OrderChain.enchain({action = OrderType.Patrol})
 OrderChain.runOrders()
 tick()
 check(actions() == "?", "a ship with orders of its own is not idle")
+
+-- #### STANDING ORDERS #### --
+
+local function standing(spec)
+    OrderChain.automationApiConfigure(Json.encode({standing = spec}))
+end
+
+-- a two-hop chain, flown as far as its second hop
+local function busyChain()
+    OrderChain.enchain({action = OrderType.Jump, x = 5, y = 0})
+    OrderChain.enchain({action = OrderType.Jump, x = 10, y = 0})
+    OrderChain.runOrders()
+    jumpTo(5, 0)
+end
+
+print("\nstanding enemies, interrupt")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+check(state().standing.enemies.mode == "interrupt" and state().autoAggressive == true,
+      "the order and its mode are published, and the old field follows it")
+
+busyChain()
+check(OrderChain.activeOrder == 2, "(the ship is flying the second hop)")
+
+world.enemies = true
+tick()
+check(actions() == "A" and state().reaction and state().reaction.kind == "enemies"
+      and state().reaction.resumes == true,
+      "enemies interrupt the chain, which is put aside to come back")
+
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(actions() == "J5:0 J10:0" and OrderChain.activeOrder == 2 and OrderChain.running,
+      "when the fight is over the chain comes back at the order it was on")
+check(state().reaction == nil and state().lastReaction.outcome == "done"
+      and state().lastReaction.resumed == true, "and the reaction says it resumed")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "idle"}})
+busyChain()
+world.enemies = true
+tick()
+check(actions() == "J5:0 J10:0" and state().reaction == nil,
+      "in idle mode a ship with a chain is left to fly it")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+OrderChain.enchain({action = OrderType.Aggressive, attackCivilShips = false, canFinish = false})
+OrderChain.runOrders()
+world.enemies = true
+tick()
+check(state().reaction == nil and OrderChain.chain[1].automationApi == nil,
+      "a ship already under an aggressive order is not interrupted to be given another")
+
+print("\nloops survive an interruption")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+OrderChain.enchain({action = OrderType.Jump, x = 5, y = 0})
+OrderChain.enchain({action = OrderType.Jump, x = 0, y = 0})
+OrderChain.enchain({action = OrderType.Loop, loopIndex = 1})
+OrderChain.runOrders()
+jumpTo(5, 0)
+world.enemies = true
+tick()
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(actions() == "J5:0 J0:0 L1" and OrderChain.activeOrder == 2,
+      "the loop comes back with its index intact")
+jumpTo(0, 0)
+check(OrderChain.activeOrder == 1, "and still loops")
+
+print("\nstanding loot")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+world.loot = {{cargo = false}, {cargo = false}}
+tick()
+check(state().reaction and state().reaction.kind == "loot" and state().reaction.phase == "looting",
+      "an idle ship with fighters sends them for loot in the sector")
+tick()
+check(world.squadOrders[0] == FighterOrders.CollectLoot, "the squads are ordered to collect")
+check(state().reaction.resumes == false and state().lootRuns == 1,
+      "nothing to resume, and the run is counted")
+
+world.deployed = 5
+world.loot = {}
+tick()
+check(state().reaction.phase == "returning" and world.squadOrders[0] == FighterOrders.Return,
+      "once it is all picked up the fighters are called back")
+
+world.deployed = 0
+tick()
+check(state().reaction == nil and state().lastReaction.kind == "loot"
+      and state().lastReaction.lootResult == "collected", "and when they have landed it is done")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+busyChain()
+world.loot = {{cargo = false}}
+tick(2)
+check(state().reaction == nil and actions() == "J5:0 J10:0", "idle mode leaves a busy ship be")
+
+standing({loot = {enabled = true, mode = "interrupt"}})
+tick(2)
+check(state().reaction and state().reaction.kind == "loot" and #OrderChain.chain == 0,
+      "interrupt mode takes the ship off its chain for the loot")
+world.loot = {}
+tick(2)
+tick()
+check(actions() == "J5:0 J10:0" and OrderChain.activeOrder == 2,
+      "and puts the chain back when the fighters are home")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "interrupt"}})
+world.squadFighters = {}
+world.loot = {{cargo = false}}
+tick(2)
+check(state().reaction == nil, "a ship with no fighters aboard does not react")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+world.loot = {{cargo = true}}
+tick(2)
+check(state().reaction == nil, "nor to cargo its fighters cannot pick up")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+world.loot = {{cargo = false}}
+world.enemies = true
+tick(2)
+check(state().reaction == nil, "nobody loots under fire")
+
+print("\nloot that cannot be taken")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+world.loot = {{cargo = false}}
+tick()
+world.deployed = 5
+for _ = 1, 46 do tick() end
+check(state().reaction.phase == "returning", "a collection that picks nothing up stalls")
+world.deployed = 0
+tick()
+check(state().lastReaction.lootResult == "stalled", "and ends as stalled")
+for _ = 1, 30 do tick() end
+check(state().reaction == nil, "the same sector's loot is then left alone")
+for _ = 1, 100 do tick() end
+check(state().reaction and state().reaction.kind == "loot", "for a while, not for ever")
+
+print("\na fight, then the loot")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}, loot = {enabled = true, mode = "interrupt"}})
+busyChain()
+world.enemies = true
+tick()
+world.loot = {{cargo = false}}
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(state().reaction and state().reaction.kind == "loot" and state().reaction.phase == "looting",
+      "a fight that leaves loot goes on to the loot")
+world.enemies = true
+tick()
+check(actions() == "A" and state().reaction.phase == "fighting",
+      "enemies arriving while the fighters are out are fought")
+world.enemies = false
+world.aiState = "Idle"
+world.loot = {}
+tick()
+tick(2)
+check(actions() == "J5:0 J10:0" and OrderChain.activeOrder == 2 and state().reaction == nil,
+      "and the chain comes back after all of it")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}, loot = {enabled = true, mode = "idle"}})
+busyChain()
+world.enemies = true
+tick()
+world.loot = {{cargo = false}}
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(actions() == "J5:0 J10:0" and state().reaction == nil,
+      "an idle-only loot order does not keep an interrupted chain waiting")
+
+print("\nreactions give way")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "interrupt"}})
+busyChain()
+world.loot = {{cargo = false}}
+tick(2)
+OrderChain.enchain({action = OrderType.Patrol})
+OrderChain.runOrders()
+tick()
+check(actions() == "?" and state().reaction == nil and state().lastReaction.outcome == "replaced",
+      "orders given while it loots end the reaction, and the old chain stays gone")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+busyChain()
+world.enemies = true
+tick()
+standing({enemies = {enabled = false}})
+check(actions() == "J5:0 J10:0" and state().lastReaction.outcome == "switched_off"
+      and state().standing.enemies.mode == "interrupt",
+      "switching the order off mid-fight gives the chain back, and keeps the mode")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+busyChain()
+world.enemies = true
+tick()
+OrderChain.automationApiStop()
+check(#OrderChain.chain == 0 and state().reaction == nil
+      and state().lastReaction.outcome == "stopped", "stop ends a reaction and clears the chain")
+check(state().standing.enemies.enabled == true, "and leaves the standing order on")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}})
+busyChain()
+world.enemies = true
+tick()
+world.enemies = false
+plan({id = "rp", hops = {{x = 8, y = 0, kind = "jump"}}})
+check(actions() == "J8:0" and state().reaction == nil and state().plan.id == "rp",
+      "a plan sent during a reaction takes over from it")
+
+standing({enemies = {enabled = true, mode = "bogus"}})
+check(state().standing.enemies.mode == "interrupt", "an unknown mode is ignored")
+
+print("\nroutes and the loot order")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "interrupt"}})
+plan({id = "rl", onEnemies = "fight",
+      hops = {{x = 5, y = 0, kind = "jump"}, {x = 10, y = 0, kind = "jump"}}})
+world.enemies = true
+tick()
+world.loot = {{cargo = false}}
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(state().plan.phase == "looting", "a route's fight loots when the loot order may interrupt")
+
+newWorld()
+loadOrderChain()
+standing({loot = {enabled = true, mode = "idle"}})
+plan({id = "rn", onEnemies = "fight",
+      hops = {{x = 5, y = 0, kind = "jump"}, {x = 10, y = 0, kind = "jump"}}})
+world.enemies = true
+tick()
+world.loot = {{cargo = false}}
+world.enemies = false
+world.aiState = "Idle"
+tick()
+check(state().plan.phase == "running" and state().reaction == nil,
+      "and flies straight on when it may not")
 
 print("\nsaving and loading")
 
@@ -747,6 +1029,34 @@ tick()
 OrderChain.updateShipOrderInfo()
 check(state().plan == nil and state().autoAggressive == false,
       "a chain saved before the mod was installed restores cleanly")
+
+loadOrderChain()
+OrderChain.restore({chain = {}, activeOrder = 0, finished = false,
+                    automationApi = {settings = {autoAggressive = true, attackCivilians = false}}})
+OrderChain.updateShipOrderInfo()
+check(state().standing.enemies.enabled == true and state().standing.enemies.mode == "idle"
+      and state().standing.loot.enabled == false,
+      "a ship saved with idle defence comes back with the standing enemies order")
+
+newWorld()
+loadOrderChain()
+standing({enemies = {enabled = true, mode = "interrupt"}, loot = {enabled = true, mode = "idle"}})
+busyChain()
+world.enemies = true
+tick()
+saved = OrderChain.secure()
+loadOrderChain()
+OrderChain.restore(saved)
+OrderChain.updateShipOrderInfo()
+check(state().standing.enemies.mode == "interrupt" and state().standing.loot.enabled == true,
+      "standing orders survive a reload")
+check(state().reaction and state().reaction.resumes == true, "and so does a reaction in progress")
+world.enemies = false
+world.aiState = "Idle"
+tick()
+tick()
+check(actions() == "J5:0 J10:0" and OrderChain.activeOrder == 2,
+      "which still gives the chain back afterwards")
 
 print("\nstopping")
 

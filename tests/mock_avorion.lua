@@ -373,11 +373,25 @@ function M.install()
         end,
         automationApiConfigure = function(ship, payload)
             ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
-            for key, value in pairs(Json.decode(payload)) do ship.automation[key] = value end
+            local automation = ship.automation
+            automation.standing = automation.standing
+                or {enemies = {enabled = false, mode = "idle"}, loot = {enabled = false, mode = "idle"}}
+
+            local spec = Json.decode(payload)
+            if spec.attackCivilians ~= nil then automation.attackCivilians = spec.attackCivilians end
+            if spec.autoAggressive ~= nil then automation.standing.enemies.enabled = spec.autoAggressive end
+
+            -- merged part by part, as the ship merges them
+            for name, order in pairs(spec.standing or {}) do
+                for key, value in pairs(order) do automation.standing[name][key] = value end
+            end
+
+            automation.autoAggressive = automation.standing.enemies.enabled
         end,
         automationApiStop = function(ship)
             ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
             ship.automation.plan = nil
+            ship.automation.reaction = nil
             ship.chain = {}
             ship.chainIndex = 0
         end,

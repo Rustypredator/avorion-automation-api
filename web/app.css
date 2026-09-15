@@ -273,6 +273,7 @@ tr.best td { color: var(--good); }
 .order-row { display: flex; align-items: center; gap: 7px; padding: 6px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 4px; margin-bottom: 6px; }
 .order-row .idx { color: var(--text-mute); width: 18px; text-align: right; }
 .order-row input[type=number] { width: 78px; }
+.standing-row { flex-wrap: wrap; }
 
 /* ---------------------------------- map --------------------------------- */
 

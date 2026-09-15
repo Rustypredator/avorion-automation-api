@@ -236,11 +236,24 @@ const posts = [];
 const houndAutomation = {
     ship: 'Ore Hound', source: 'live', reported: true,
     automation: {
-        autoAggressive: false, attackCivilians: false, enemies: true, defenceFights: 0,
+        autoAggressive: true, attackCivilians: false, enemies: true, defenceFights: 2,
+        standing: { enemies: { enabled: true, mode: 'idle' }, loot: { enabled: false, mode: 'idle' } },
+        lootRuns: 0,
+        lastReaction: { kind: 'enemies', outcome: 'done', resumed: true, sector: { x: 1, y: 2 } },
         plan: { id: 'p1', kind: 'route', phase: 'fighting', hops: 4, hop: 2, loopFrom: 0,
                 jumps: 1, fights: 1, onEnemies: 'fight', target: { x: 20, y: 0 } }
     }
 };
+
+/* The ship merges standing orders part by part and confirms what it now holds. */
+function saveStanding(sent) {
+    const automation = houndAutomation.automation;
+    Object.keys(sent.standing || {}).forEach((key) => {
+        Object.assign(automation.standing[key], sent.standing[key]);
+    });
+    if (sent.attackCivilians !== undefined) { automation.attackCivilians = sent.attackCivilians; }
+    return { ship: 'Ore Hound', confirmed: true, requested: sent, automation: automation };
+}
 
 const flownRoute = (sent) => ({
     ship: 'Ore Hound', confirmed: true, planId: 'p2', reachable: true, planner: 'automation',
@@ -250,7 +263,8 @@ const flownRoute = (sent) => ({
            { x: sent.to.x, y: sent.to.y, kind: 'gate', controlled: false }],
     route: [{ x: 3, y: 0 }, { x: 5, y: 0 }, sent.to],
     automation: {
-        autoAggressive: false, attackCivilians: false, enemies: false,
+        autoAggressive: true, attackCivilians: false, enemies: false,
+        standing: houndAutomation.automation.standing,
         plan: { id: 'p2', kind: 'route', phase: 'running', hops: 2, hop: 1, loopFrom: 0,
                 jumps: 0, fights: 0, onEnemies: sent.onEnemies, target: sent.to }
     }
@@ -325,7 +339,8 @@ const dynamic = {
     '/ships/Ore%20Hound/mission/automation': saveAutomation,
     '/ships/Ore%20Hound/mission/automation/evaluate': tradeEvaluation,
     '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
-    '/ships/Ore%20Hound/route': flownRoute
+    '/ships/Ore%20Hound/route': flownRoute,
+    '/ships/Ore%20Hound/automation': saveStanding
 };
 
 const routes = {
@@ -530,6 +545,52 @@ const ready = window.document.readyState === 'loading'
           'and the state the ship confirmed replaces the older read');
     check(travel().querySelector('[data-act="farm"]').disabled,
           'boss farming cannot be started for a ship nobody is flying');
+    check(!travel().querySelector('#nav-auto-aggressive'),
+          'idle defence is no longer set here');
+    check(/fight enemies when idle/.test(travel().textContent),
+          'but the standing orders are shown with the automation state');
+
+    console.log('\nstanding orders');
+
+    tab('orders').click();
+    await settle(600);
+
+    const standing = () => $('#standing-orders');
+    check(/Standing orders/.test(standing().textContent), 'the Orders tab has a standing orders section');
+    const enemiesOn = standing().querySelector('[data-standing-on="enemies"]');
+    const lootOn = standing().querySelector('[data-standing-on="loot"]');
+    check(enemiesOn && enemiesOn.checked && lootOn && !lootOn.checked,
+          'showing which standing orders the ship reported on');
+    check(standing().querySelector('[data-standing-key="enemies"][data-standing-mode="idle"]').classList.contains('on'),
+          'and in which mode');
+    check(/chain resumed/.test(standing().textContent), 'with how the last one ended');
+
+    lootOn.checked = true;
+    lootOn.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+
+    let sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding && sentStanding.body.standing && sentStanding.body.standing.loot.enabled === true
+          && Object.keys(sentStanding.body.standing).length === 1 && sentStanding.body.standing.loot.mode === undefined,
+          'switching one on saves just that, at once');
+    check(standing().querySelector('[data-standing-on="loot"]').checked, 'and the confirmed state is shown');
+
+    standing().querySelector('[data-standing-key="loot"][data-standing-mode="interrupt"]').click();
+    await settle(400);
+
+    sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding.body.standing.loot.mode === 'interrupt' && sentStanding.body.standing.loot.enabled === undefined,
+          'choosing a mode saves only the mode');
+    check(standing().querySelector('[data-standing-key="loot"][data-standing-mode="interrupt"]').classList.contains('on'),
+          'which then shows as chosen');
+
+    const civ = standing().querySelector('[data-standing-civ]');
+    civ.checked = true;
+    civ.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+    sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding.body.attackCivilians === true && sentStanding.body.standing === undefined,
+          'and civilians are one setting for both');
 
 
     tab('overview').click();

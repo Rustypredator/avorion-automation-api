@@ -1,5 +1,5 @@
 
--- Automation API: route plans, enemy handling and idle defence, run by the ship itself.
+-- Automation API: route plans, enemy handling and standing orders, run by the ship itself.
 --
 -- The engine appends a mod file at a vanilla path onto the vanilla script, so everything
 -- below lives inside OrderChain's own namespace, on every craft that has an order chain.
@@ -61,14 +61,43 @@ local AUTOMATION_API_ORDER_REPEAT = 5
 -- ship's feed, so once a minute is enough for a client to keep an honest countdown.
 local AUTOMATION_API_COOLDOWN_PUBLISH = 60
 
+-- A standing loot order that could not take everything (a stall, fighters that would not
+-- launch) leaves that sector's loot alone for this long. Without it the same unreachable
+-- drop would send the fighters out again the moment they landed, for ever.
+local AUTOMATION_API_LOOT_RETRY = 120
+
+-- The orders a ship keeps without being told again, and when each one may take the ship:
+-- "idle" only while it has nothing to do, "interrupt" whatever it is doing, after which
+-- the chain it was flying is put back.
+local AUTOMATION_API_STANDING = {"enemies", "loot"}
+local AUTOMATION_API_STANDING_MODES = {idle = true, interrupt = true}
+
+local function automationApiDefaultStanding()
+    return
+    {
+        enemies = {enabled = false, mode = "idle"},
+        loot = {enabled = false, mode = "idle"},
+    }
+end
+
 local automationApi =
 {
-    settings = {autoAggressive = false, attackCivilians = false},
+    settings = {attackCivilians = false, standing = automationApiDefaultStanding()},
+    -- a standing order currently holding the ship, or nil. Never alongside a plan: a plan
+    -- brings its own enemy handling, and a plan being sent ends the reaction.
+    reaction = nil,
+    lastReaction = nil,
+    -- times a standing loot order sent the fighters out, over the life of the ship
+    lootRuns = 0,
+    -- {x, y, left}: the sector whose loot is being left alone, see AUTOMATION_API_LOOT_RETRY
+    lootBackoff = nil,
+    lootScanIn = 0,
     -- the plan currently driving the chain, or nil
     plan = nil,
     -- how the previous plan ended, so a caller polling after the fact can tell
     last = nil,
-    -- fights started by idle defence, over the life of the ship
+    -- fights started by the standing enemies order, over the life of the ship. The name
+    -- is from when that order was the only one and was called idle defence.
     defenceFights = 0,
     enemies = false,
 }
@@ -255,19 +284,44 @@ local function automationApiDescribePlan(plan)
     }
 end
 
+local function automationApiDescribeReaction(reaction)
+    return
+    {
+        kind = reaction.kind,
+        mode = reaction.mode,
+        phase = reaction.phase,
+        -- whether a chain was put aside and comes back when this is over
+        resumes = reaction.saved ~= nil,
+        loot = reaction.loot,
+        lootResult = reaction.lootResult,
+    }
+end
+
 local function automationApiDescribe()
     local x, y = Sector():getCoordinates()
+    local standing = automationApi.settings.standing
+
+    local described = {}
+    for _, name in ipairs(AUTOMATION_API_STANDING) do
+        described[name] = {enabled = standing[name].enabled == true, mode = standing[name].mode}
+    end
 
     return
     {
         version = 1,
-        autoAggressive = automationApi.settings.autoAggressive == true,
+        -- kept for clients from before standing orders: the enemies order, in any mode
+        autoAggressive = standing.enemies.enabled == true,
         attackCivilians = automationApi.settings.attackCivilians == true,
+        standing = described,
         defenceFights = automationApi.defenceFights,
+        lootRuns = automationApi.lootRuns,
         enemies = automationApi.enemies == true,
         sector = {x = x, y = y},
         plan = automationApi.plan and automationApiDescribePlan(automationApi.plan) or nil,
         last = automationApi.last,
+        reaction = automationApi.reaction and automationApiDescribeReaction(automationApi.reaction)
+                   or nil,
+        lastReaction = automationApi.lastReaction,
     }
 end
 
@@ -359,15 +413,20 @@ local function automationApiReplaceChain(orders)
     OrderChain.runOrders()
 end
 
-local function automationApiOwnsChain(plan)
+-- Whether every order on the chain carries `tag`: a plan's id, or "standing".
+local function automationApiChainTagged(tag)
     local chain = OrderChain.chain
     if #chain == 0 then return false end
 
     for _, order in ipairs(chain) do
-        if order.automationApi ~= plan.id then return false end
+        if order.automationApi ~= tag then return false end
     end
 
     return true
+end
+
+local function automationApiOwnsChain(plan)
+    return automationApiChainTagged(plan.id)
 end
 
 local function automationApiEndPlan(outcome, reason)
@@ -523,6 +582,9 @@ end
 
 -- Sends the fighters out for what the fight left behind, if there is any the ship's
 -- fighters can take. Returns whether looting started.
+--
+-- The looting phases work on whichever table holds them - a farm plan, or a standing
+-- order's reaction - and are handed what to do once the fighters are back.
 local function automationApiStartLooting(plan)
     local wanted, loot = automationApiLootWanted(Entity())
 
@@ -558,8 +620,14 @@ local function automationApiFinishLooting(plan, result)
     automationApiPublish()
 end
 
+-- A farm says whether it loots. A route has no say of its own, and loots when the ship
+-- has a standing loot order allowed to interrupt: the route is what it would interrupt.
 local function automationApiAfterFight(plan)
-    if plan.collectLoot and automationApiStartLooting(plan) then return end
+    local loot = automationApi.settings.standing.loot
+    local collect = plan.collectLoot
+    if collect == nil then collect = loot.enabled and loot.mode == "interrupt" end
+
+    if collect and automationApiStartLooting(plan) then return end
     automationApiAfterLoot(plan)
 end
 
@@ -600,13 +668,13 @@ local function automationApiTickLooting(plan, timeStep)
 end
 
 -- A jump leaves fighters that are out behind, so the ship waits for them to land.
-local function automationApiTickReturning(plan, timeStep)
+local function automationApiTickReturning(plan, timeStep, done)
     plan.phaseFor = plan.phaseFor + timeStep
 
     local _, deployed = automationApiFighters()
 
     if deployed == 0 then
-        automationApiAfterLoot(plan)
+        done(plan)
         return
     end
 
@@ -615,7 +683,7 @@ local function automationApiTickReturning(plan, timeStep)
         -- rather than abandoned, then the plan moves on regardless.
         pcall(function() Hangar():collectAllFighters() end)
         plan.lootResult = (plan.lootResult or "collected") .. "_recalled"
-        automationApiAfterLoot(plan)
+        done(plan)
         return
     end
 
@@ -691,7 +759,7 @@ local function automationApiTickPlan(plan, timeStep, enemies)
         elseif plan.phase == "looting" then
             automationApiTickLooting(plan, timeStep)
         elseif plan.phase == "returning" then
-            automationApiTickReturning(plan, timeStep)
+            automationApiTickReturning(plan, timeStep, automationApiAfterLoot)
         else
             automationApiTickCooldown(plan, timeStep)
         end
@@ -758,37 +826,255 @@ local function automationApiTickPlan(plan, timeStep, enemies)
     end
 end
 
--- Idle defence: a ship with nothing to do, and enemies in its sector, fights them. The
--- order finishes on its own when the sector is clear, and the ship goes back to idle.
+-- #### STANDING ORDERS #### --
+--
+-- Orders a ship keeps without a plan: fight enemies that turn up in its sector, and send
+-- its fighters for loot lying in it. Each one is allowed either only while the ship is
+-- idle, or to interrupt whatever chain it is flying. What either does while it holds the
+-- ship is a reaction:
+--
+--   enemies   an aggressive order until the sector has been clear for a moment, then
+--             the loot, if the loot order applies to what the ship was doing
+--   loot      fighters out collecting, then waiting for them to land
+--
+-- An interrupted chain is put aside whole - orders, active index and how much of it was
+-- executable - and put back the way vanilla's own restore() puts back a saved chain, so
+-- loops keep their indices and the interrupted order simply starts again.
 --
 -- A captain is required, as vanilla requires one for any order a player gives a ship
 -- they are not standing next to. A piloted ship is left alone: whoever is flying it is
 -- the one deciding what it does.
-local function automationApiTickIdle(enemies)
-    if not automationApi.settings.autoAggressive or not enemies then return end
 
-    local chain = OrderChain.chain
-    if #chain > 0 and not OrderChain.finished then return end
+local function automationApiMayAct()
+    return not automationApiPiloted() and Entity():getCaptain() ~= nil
+end
 
-    local entity = Entity()
-    if automationApiPiloted() or not entity:getCaptain() then return end
+local function automationApiIdle()
+    return #OrderChain.chain == 0 or OrderChain.finished
+end
 
+local function automationApiSaveChain()
+    if automationApiIdle() or OrderChain.activeOrder == 0 then return nil end
+
+    local orders = {}
+    for index, order in ipairs(OrderChain.chain) do
+        local copy = {}
+        for key, value in pairs(order) do copy[key] = value end
+        orders[index] = copy
+    end
+
+    return
+    {
+        chain = orders,
+        activeOrder = OrderChain.activeOrder,
+        executableOrders = OrderChain.executableOrders,
+    }
+end
+
+-- Clears whatever the reaction left on the chain and puts `saved` back, if there is one.
+local function automationApiRestoreChain(saved)
+    OrderChain.clearAllOrders()
+    if not saved or #saved.chain == 0 then return end
+
+    OrderChain.chain = saved.chain
+    OrderChain.activeOrder = math.max(0, saved.activeOrder - 1)
+    OrderChain.executableOrders = math.max(saved.executableOrders or #saved.chain,
+                                           saved.activeOrder)
+    OrderChain.running = false
+    OrderChain.finished = false
+
+    -- activates the order after activeOrder, which is the interrupted one
+    OrderChain.updateChain()
+end
+
+local function automationApiEndReaction(outcome, restore)
+    local reaction = automationApi.reaction
+    if not reaction then return end
+
+    local x, y = Sector():getCoordinates()
+
+    automationApi.reaction = nil
+    automationApi.lastReaction =
+    {
+        kind = reaction.kind,
+        outcome = outcome,
+        lootResult = reaction.lootResult,
+        resumed = restore == true and reaction.saved ~= nil,
+        sector = {x = x, y = y},
+    }
+
+    -- Loot the fighters could not finish is left alone for a while, or the ship would
+    -- keep launching at it.
+    if reaction.lootResult and reaction.lootResult ~= "collected" then
+        automationApi.lootBackoff = {x = x, y = y, left = AUTOMATION_API_LOOT_RETRY}
+    end
+
+    if restore then automationApiRestoreChain(reaction.saved) end
+
+    automationApiPublish()
+end
+
+local function automationApiReactionFight(reaction)
     automationApiReplaceChain({{
         action = OrderType.Aggressive,
         attackCivilShips = automationApi.settings.attackCivilians == true,
         canFinish = true,
-        automationApi = "defence",
+        automationApi = "standing",
     }})
+
+    reaction.phase = "fighting"
+    reaction.clearFor = 0
 
     automationApi.defenceFights = automationApi.defenceFights + 1
     automationApiPublish()
+end
+
+local function automationApiReactionLoot(reaction)
+    if not automationApiStartLooting(reaction) then return false end
+
+    automationApi.lootRuns = automationApi.lootRuns + 1
+    automationApiPublish()
+    return true
+end
+
+-- The fighters are back: the ship returns to what it was doing.
+local function automationApiReactionLooted()
+    automationApiEndReaction("done", true)
+end
+
+local function automationApiReact(kind, mode)
+    local x, y = Sector():getCoordinates()
+
+    local reaction =
+    {
+        kind = kind,
+        mode = mode,
+        saved = automationApiSaveChain(),
+        sector = {x = x, y = y},
+    }
+
+    automationApi.reaction = reaction
+
+    if kind == "enemies" then
+        automationApiReactionFight(reaction)
+    elseif not automationApiReactionLoot(reaction) then
+        -- the loot went between the scan and now; nothing was touched
+        automationApi.reaction = nil
+    end
+end
+
+local function automationApiTickReaction(reaction, timeStep, enemies)
+    local standing = automationApi.settings.standing
+
+    if reaction.phase == "fighting" then
+        -- an aggressive order that finished takes the chain with it, so an empty chain is
+        -- the fight ending as well as someone clearing it
+        if #OrderChain.chain > 0 and not automationApiChainTagged("standing") then
+            automationApiEndReaction("replaced", false)
+            return
+        end
+
+        if enemies then
+            reaction.clearFor = 0
+            if #OrderChain.chain == 0 then automationApiReactionFight(reaction) end
+            return
+        end
+
+        reaction.clearFor = (reaction.clearFor or 0) + timeStep
+        if reaction.clearFor < AUTOMATION_API_CLEAR_GRACE and #OrderChain.chain > 0 then return end
+
+        -- The loot comes next if the loot order may take the ship from what it was doing:
+        -- always when it was idle, only in interrupt mode when a chain is waiting.
+        local loot = standing.loot
+        if loot.enabled and (reaction.saved == nil or loot.mode == "interrupt") then
+            if automationApiReactionLoot(reaction) then
+                reaction.kind = "loot"
+                automationApiPublish()
+                return
+            end
+        end
+
+        automationApiEndReaction("done", true)
+        return
+    end
+
+    -- looting and returning keep the chain empty, so anything on it is somebody's orders
+    if #OrderChain.chain > 0 then
+        automationApiEndReaction("replaced", false)
+        return
+    end
+
+    if enemies and standing.enemies.enabled then
+        -- the ship is already taken from its chain, so the enemies order's mode is moot
+        automationApiReactionFight(reaction)
+        return
+    end
+
+    if reaction.phase == "looting" then
+        automationApiTickLooting(reaction, timeStep)
+    elseif reaction.phase == "returning" then
+        automationApiTickReturning(reaction, timeStep, automationApiReactionLooted)
+    end
+end
+
+local function automationApiTickStanding(timeStep, enemies)
+    local standing = automationApi.settings.standing
+
+    local backoff = automationApi.lootBackoff
+    if backoff then
+        backoff.left = backoff.left - timeStep
+        if backoff.left <= 0 then automationApi.lootBackoff = nil end
+    end
+
+    if not automationApiMayAct() then return end
+
+    local idle = automationApiIdle()
+
+    local function applies(order)
+        return order.enabled and (idle or order.mode == "interrupt")
+    end
+
+    if enemies then
+        if not applies(standing.enemies) then return end
+
+        -- an aggressive order the ship was given already does the job
+        local current = OrderChain.chain[OrderChain.activeOrder]
+        if not idle and current and current.action == OrderType.Aggressive then return end
+
+        automationApiReact("enemies", standing.enemies.mode)
+        return
+    end
+
+    -- nobody loots under fire
+    if not applies(standing.loot) then return end
+
+    automationApi.lootScanIn = (automationApi.lootScanIn or 0) - timeStep
+    if automationApi.lootScanIn > 0 then return end
+    automationApi.lootScanIn = AUTOMATION_API_SCAN_INTERVAL
+
+    backoff = automationApi.lootBackoff
+    if backoff then
+        local x, y = Sector():getCoordinates()
+        if backoff.x == x and backoff.y == y then return end
+    end
+
+    local wanted, loot = automationApiLootWanted(Entity())
+    if wanted > 0 and loot.fighters > 0 then
+        automationApiReact("loot", standing.loot.mode)
+    end
+end
+
+local function automationApiWatching()
+    local standing = automationApi.settings.standing
+    return automationApi.plan ~= nil or automationApi.reaction ~= nil
+           or standing.enemies.enabled or standing.loot.enabled
 end
 
 local function automationApiTick(timeStep)
     -- Every craft with an order chain runs this, most of them with nothing switched on.
     -- Those look at nothing and publish nothing, so a fleet sitting near a fight does not
     -- fill every ship's event log with enemies coming and going.
-    if not automationApi.plan and not automationApi.settings.autoAggressive then
+    if not automationApiWatching() then
         automationApi.enemies = false
         return
     end
@@ -802,8 +1088,10 @@ local function automationApiTick(timeStep)
 
     if automationApi.plan then
         automationApiTickPlan(automationApi.plan, timeStep, enemies)
+    elseif automationApi.reaction then
+        automationApiTickReaction(automationApi.reaction, timeStep, enemies)
     else
-        automationApiTickIdle(enemies)
+        automationApiTickStanding(timeStep, enemies)
     end
 end
 
@@ -882,6 +1170,9 @@ function OrderChain.automationApiRunPlan(payload)
     -- a plan replacing a plan still says how the previous one ended
     if automationApi.plan then automationApiEndPlan("replaced", "A new plan was sent.") end
 
+    -- and a standing order holding the ship lets go; the chain it put aside is not wanted
+    if automationApi.reaction then automationApiEndReaction("replaced", false) end
+
     automationApi.plan = plan
     automationApiReplaceChain(orders)
     automationApiPublish()
@@ -894,24 +1185,50 @@ function OrderChain.automationApiConfigure(payload)
     local ok, spec = pcall(AutomationApiJson.decode, payload)
     if not ok or type(spec) ~= "table" then return end
 
+    local standing = automationApi.settings.standing
+
+    -- the setting from before standing orders: the enemies order, leaving its mode be
     if spec.autoAggressive ~= nil then
-        automationApi.settings.autoAggressive = spec.autoAggressive == true
+        standing.enemies.enabled = spec.autoAggressive == true
     end
     if spec.attackCivilians ~= nil then
         automationApi.settings.attackCivilians = spec.attackCivilians == true
+    end
+
+    if type(spec.standing) == "table" then
+        for _, name in ipairs(AUTOMATION_API_STANDING) do
+            local order = spec.standing[name]
+            if type(order) == "table" then
+                if order.enabled ~= nil then standing[name].enabled = order.enabled == true end
+                if AUTOMATION_API_STANDING_MODES[order.mode] then standing[name].mode = order.mode end
+            end
+        end
+    end
+
+    -- A reaction whose order was just switched off stops, and the ship goes back to what
+    -- it was doing. One whose order is still on carries on under the new settings.
+    local reaction = automationApi.reaction
+    if reaction then
+        local order = standing[reaction.kind]
+        if not order.enabled then automationApiEndReaction("switched_off", true) end
     end
 
     automationApiPublish()
 end
 callable(OrderChain, "automationApiConfigure")
 
--- Stops a plan and clears the chain. Idle defence is a setting and stays as it was.
+-- Stops a plan, or a standing order holding the ship, and clears the chain. The standing
+-- orders are settings and stay as they were.
 function OrderChain.automationApiStop()
     if not automationApiPermitted() then return end
 
     if automationApi.plan then
         OrderChain.clearAllOrders()
         automationApiEndPlan("stopped", "Stopped through the API.")
+    elseif automationApi.reaction then
+        automationApiEndReaction("stopped", false)
+        OrderChain.clearAllOrders()
+        automationApiPublish()
     else
         automationApiPublish()
     end
@@ -948,7 +1265,10 @@ function OrderChain.secure()
         settings = automationApi.settings,
         plan = automationApi.plan,
         last = automationApi.last,
+        reaction = automationApi.reaction,
+        lastReaction = automationApi.lastReaction,
         defenceFights = automationApi.defenceFights,
+        lootRuns = automationApi.lootRuns,
     }
 
     return data
@@ -959,10 +1279,34 @@ function OrderChain.restore(data)
     local saved = type(data) == "table" and data.automationApi or nil
 
     if type(saved) == "table" then
-        if type(saved.settings) == "table" then
-            automationApi.settings.autoAggressive = saved.settings.autoAggressive == true
-            automationApi.settings.attackCivilians = saved.settings.attackCivilians == true
+        local settings = saved.settings
+        if type(settings) == "table" then
+            automationApi.settings.attackCivilians = settings.attackCivilians == true
+
+            local standing = automationApiDefaultStanding()
+            local stored = type(settings.standing) == "table" and settings.standing or {}
+
+            for _, name in ipairs(AUTOMATION_API_STANDING) do
+                local order = stored[name]
+                if type(order) == "table" then
+                    standing[name].enabled = order.enabled == true
+                    if AUTOMATION_API_STANDING_MODES[order.mode] then
+                        standing[name].mode = order.mode
+                    end
+                end
+            end
+
+            -- a ship saved before standing orders had idle defence, which is this
+            if stored.enemies == nil and settings.autoAggressive == true then
+                standing.enemies.enabled = true
+            end
+
+            automationApi.settings.standing = standing
         end
+        automationApi.reaction = type(saved.reaction) == "table" and saved.reaction or nil
+        automationApi.lastReaction = type(saved.lastReaction) == "table" and saved.lastReaction
+                                     or nil
+        automationApi.lootRuns = tonumber(saved.lootRuns) or 0
         automationApi.plan = type(saved.plan) == "table" and saved.plan or nil
         -- A boss seen before a reload is not proof of a kill after it: a restart sends every
         -- boss away with the sector, and resets vanilla's own cooldown with the player script.

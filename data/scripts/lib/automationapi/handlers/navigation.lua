@@ -1,4 +1,4 @@
--- Planned routes, boss farming and idle defence: order chains the ship flies by itself.
+-- Planned routes, boss farming and standing orders: order chains the ship flies by itself.
 --
 -- These are the /orders half of movement grown up. A route is planned here, with the
 -- preferences calculateJumpPath cannot take, and handed to the ship as one plan. The ship
@@ -10,8 +10,9 @@
 --               "hold"      clear the chain and stay aggressive where it is
 --               "continue"  ignore them and keep jumping
 --
--- The same watch drives idle defence: a ship with a captain, no orders and enemies in its
--- sector turns aggressive until the sector is clear.
+-- The same watch drives the standing orders, which a ship keeps without a plan: fight
+-- enemies in its sector, send fighters for loot in it. Each is allowed to take the ship
+-- only while it is idle, or to interrupt its chain and put it back afterwards.
 --
 -- Nothing on the ship can answer a call. What it does publish is its automation state,
 -- alongside the chain in the order info the engine already pushes to the owner, and the
@@ -66,6 +67,93 @@ local function onEnemiesOf(body, default)
     end
 
     return value
+end
+
+-- Standing orders: {enemies = {enabled, mode}, loot = {enabled, mode}}, every part
+-- optional. What is left out stays as the ship has it.
+local STANDING_ORDERS = {"enemies", "loot"}
+local STANDING_MODES = {idle = true, interrupt = true}
+
+local function standingOf(value)
+    if type(value) ~= "table" then
+        Router.fail(400, "bad_standing", "'standing' is an object of standing orders.",
+                    {known = Json.array(STANDING_ORDERS)})
+    end
+
+    local known = {}
+    for _, name in ipairs(STANDING_ORDERS) do known[name] = true end
+
+    for name, _ in pairs(value) do
+        if not known[name] then
+            Router.fail(400, "bad_standing", "Unknown standing order '" .. tostring(name) .. "'.",
+                        {known = Json.array(STANDING_ORDERS)})
+        end
+    end
+
+    local standing = {}
+
+    for _, name in ipairs(STANDING_ORDERS) do
+        local order = value[name]
+
+        if order ~= nil then
+            if type(order) ~= "table" then
+                Router.fail(400, "bad_standing",
+                            "'standing." .. name .. "' is an object with 'enabled' and/or 'mode'.")
+            end
+
+            local parsed = {}
+
+            if order.enabled ~= nil then
+                if type(order.enabled) ~= "boolean" then
+                    Router.fail(400, "bad_standing",
+                                "'standing." .. name .. ".enabled' must be true or false.")
+                end
+                parsed.enabled = order.enabled
+            end
+
+            if order.mode ~= nil then
+                local mode = string.lower(tostring(order.mode))
+                if not STANDING_MODES[mode] then
+                    Router.fail(400, "bad_standing_mode",
+                                "'standing." .. name .. ".mode' is idle or interrupt.",
+                                {known = Json.array({"idle", "interrupt"})})
+                end
+                parsed.mode = mode
+            end
+
+            if next(parsed) == nil then
+                Router.fail(400, "bad_standing",
+                            "'standing." .. name .. "' needs 'enabled' and/or 'mode'.")
+            end
+
+            standing[name] = parsed
+        end
+    end
+
+    if next(standing) == nil then
+        Router.fail(400, "bad_standing", "'standing' names no standing order.",
+                    {known = Json.array(STANDING_ORDERS)})
+    end
+
+    return standing
+end
+
+-- Whether the ship's published state holds the standing orders that were sent. A ship on a
+-- mod version from before standing orders publishes none, and never confirms.
+local function standingReported(automation, requested)
+    local reported = automation.standing
+    if type(reported) ~= "table" then return false end
+
+    for name, order in pairs(requested) do
+        local actual = reported[name]
+        if type(actual) ~= "table" then return false end
+
+        for key, value in pairs(order) do
+            if actual[key] ~= value then return false end
+        end
+    end
+
+    return true
 end
 
 local function shipEntry(owner, shipName)
@@ -461,6 +549,7 @@ function Navigation.register(router)
         }
     end)
 
+    -- The ship's settings: its standing orders, and whether civilians count as enemies.
     router:post("/ships/{name}/automation", function(ctx, params)
         local body = ctx.body
         local owner = Owner.findShip(ctx, params.name)
@@ -475,9 +564,20 @@ function Navigation.register(router)
             end
         end
 
+        if body.standing ~= nil then
+            settings.standing = standingOf(body.standing)
+        end
+
+        if body.autoAggressive ~= nil and settings.standing and settings.standing.enemies
+           and settings.standing.enemies.enabled ~= nil
+           and settings.standing.enemies.enabled ~= body.autoAggressive then
+            Router.fail(400, "conflicting_settings",
+                        "'autoAggressive' is the standing enemies order; the two disagree.")
+        end
+
         if next(settings) == nil then
             Router.fail(400, "no_settings",
-                        "Provide 'autoAggressive' and/or 'attackCivilians' as booleans.")
+                        "Provide 'standing', 'autoAggressive' and/or 'attackCivilians'.")
         end
 
         -- A setting gives the ship no order, so only the world has to allow the call.
@@ -490,7 +590,13 @@ function Navigation.register(router)
                              requested = settings},
                             function(automation)
                                 for name, value in pairs(settings) do
-                                    if automation[name] ~= value then return false end
+                                    if name == "standing" then
+                                        if not standingReported(automation, value) then
+                                            return false
+                                        end
+                                    elseif automation[name] ~= value then
+                                        return false
+                                    end
                                 end
                                 return true
                             end)
@@ -505,7 +611,9 @@ function Navigation.register(router)
         return dispatchCall(ctx, owner, params.name, {x = x, y = y},
                             "automationApiStop", nil,
                             {ship = params.name, owner = Owner.describe(owner)},
-                            function(automation) return automation.plan == nil end)
+                            function(automation)
+                                return automation.plan == nil and automation.reaction == nil
+                            end)
     end)
 
 end

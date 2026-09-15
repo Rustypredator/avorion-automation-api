@@ -33,7 +33,8 @@ data/scripts/                   everything the game loads
   alliance/init.lua             vanilla overlay: + addScriptOnce(agent.lua) on alliances
   entity/orderchain.lua         APPENDED onto vanilla orderchain.lua (wraps updateServer,
                                 getOrderInfo, secure, restore): route plans, enemy
-                                handling, idle defence, boss farming run on the ship
+                                handling, standing orders (enemies/loot, idle or
+                                interrupt+resume), boss farming run on the ship
   commands/apikey.lua           /apikey chat command (new/list/revoke keys)
   galaxy/automationapi/bridge.lua   Galaxy script: transport loop, auth, router, all reads,
                                     job queue for writes, stats console line
