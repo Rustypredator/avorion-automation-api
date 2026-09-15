@@ -32,6 +32,10 @@ end
 function crew:getNumMembersByProfession()
     return {[{value = CrewProfessionType.Pilot}] = 4, [{value = CrewProfessionType.Miner}] = 12}
 end
+function crew:getPassengers()
+    return {name = "Oren", displayName = "Oren Dask", level = 1, tier = 0, primaryClass = 3},
+           {name = "Ila", displayName = "Ila", level = 2, tier = 1}
+end
 
 Mock.addShip(1, "Ore Hound",
 {
@@ -55,9 +59,11 @@ Mock.addShip(1, "Ore Hound",
     systems = {[{script = "data/scripts/systems/miningsystem.lua", name = "Mining System",
                  rarity = {name = "Exotic"}}] = 1},
     planValue = 1250000, reconstructionValue = 90000,
+    -- Verbatim from a live server: a chain part-way through, with the defensive AI set.
+    orderInfo = '{"autoAIConfig":{"hullRatio":0.8,"messages":1.0},"chain":[{"action":1.0,"name":"Jump","x":-313.0,"y":259.0},{"action":1.0,"name":"Jump","x":-309.0,"y":258.0},{"action":11.0,"gate":true,"icon":"data/textures/icons/vortex.png","name":"Fly Through","pixelIcon":"data/textures/icons/pixel/gate.png","x":-308.0,"y":249.0},{"action":1.0,"name":"Jump","x":-312.0,"y":245.0},{"action":1.0,"name":"Jump","x":-315.0,"y":243.0},{"action":11.0,"gate":false,"icon":"data/textures/icons/vortex.png","name":"Fly Through","pixelIcon":"data/textures/icons/pixel/gate.png","x":-270.0,"y":192.0}],"coordinates":{"x":-309.0,"y":258.0},"currentIndex":3.0,"defenseAutoAI":"Enemy ships seen: attack combat ships","finished":false,"ship":"43b6bf7a-76b1-48f9-b071-10e78bb8e54d","customNote":"Holding"}',
 })
 
-Mock.addShip(1, "Little Scout", {x = 2, y = 3, range = 3})
+Mock.addShip(1, "Little Scout", {x = 2, y = 3, range = 3, orderInfo = "Patrolling"})
 Mock.addShip(1, "Home Base", {type = EntityType.Station, x = 0, y = 0})
 Mock.addShip(1, "Wreck", {availability = ShipAvailability.Destroyed, usableError = 1})
 Mock.addShip(77, "Alliance Freighter", {x = 10, y = 10})
@@ -134,6 +140,24 @@ local rf = assert(io.open(Config.getResponsesDir() .. "/" .. id .. ".json", "rb"
 local res = Json.decode(rf:read("*all")); rf:close()
 check(res.status == 409 and res.body.error.code == "no_alliance", "no alliance is a clean 409")
 
+-- /ping names the alliance: the HTTP bridge decides who may read an alliance's shared
+-- history off this field, so "not in one" has to be said rather than left out.
+local _, ping = call("GET", "/ping")
+check(ping.player.alliance ~= Json.null and ping.player.alliance.index == 77,
+      "ping names the caller's alliance by faction index")
+check(ping.player.alliance.name == "Rusty Industries", "and by name")
+
+seq = seq + 1
+local id = "r" .. seq
+local f = assert(io.open(Config.getRequestsDir() .. "/" .. id .. ".json", "wb"))
+f:write(Json.encode{id = id, key = otherKey, method = "GET", path = "/ping"})
+f:close()
+Bridge.update(Config.pollInterval)
+local rf = assert(io.open(Config.getResponsesDir() .. "/" .. id .. ".json", "rb"))
+local raw = rf:read("*all"); rf:close()
+check(string.find(raw, '"alliance":null', 1, true) ~= nil,
+      "a player in no alliance gets an explicit null, not a missing field")
+
 -- #### DETAIL #### --
 
 print("\nGET /ships/{name}")
@@ -150,6 +174,11 @@ check(ship.captain.level == 3, "captain level")
 check(#ship.captain.classes == 2, "both captain classes listed")
 check(ship.captain.classes[1].name == "Miner", "class int maps to its name")
 check(#ship.captain.perks == 2, "perks listed")
+
+check(#ship.passengers == 2, "every passenger listed")
+check(ship.passengers[1].displayName == "Oren Dask", "passenger identity")
+check(ship.passengers[1].classes[1].name == "Merchant", "passenger class maps to its name")
+check(#ship.passengers[2].classes == 0, "a classless passenger has an empty class list")
 
 check(ship.crew.size == 42, "crew size")
 check(ship.crew.requirementsFulfilled == true, "crew requirements")
@@ -171,6 +200,17 @@ check(ship.turrets[1].category == "Mining", "turret category resolves to a name"
 check(ship.turrets[1].mining.stoneRaw == 0.8, "turret mining efficiency")
 check(#ship.systems == 1 and ship.systems[1].rarity == "Exotic", "subsystems")
 
+check(#ship.orders.chain == 6, "order chain decoded from the orderInfo JSON")
+check(ship.orders.chain[3].name == "Fly Through" and ship.orders.chain[3].gate == true, "chain link name and gate flag")
+check(ship.orders.chain[6].gate == false, "a non-gate fly-through keeps its flag")
+check(ship.orders.chain[1].sector.x == -313 and ship.orders.chain[1].sector.y == 259, "chain link target sector")
+check(ship.orders.chain[1].icon == nil, "asset paths are not passed on")
+check(ship.orders.activeIndex == 3 and ship.orders.finished == false, "running link and finished flag")
+check(ship.orders.sector.x == -309, "chain coordinates")
+check(ship.orders.defense == "Enemy ships seen: attack combat ships", "defensive AI setting")
+check(ship.orders.autoAI.hullRatio == 0.8, "auto AI config")
+check(ship.orders.extra.customNote == "Holding" and ship.orders.extra.ship == nil, "unknown scalars kept, ship id dropped")
+
 check(ship.usable.ok == true, "a healthy ship is usable")
 
 local _, wreck = call("GET", "/ships/Wreck")
@@ -180,7 +220,9 @@ check(wreck.availability == "Destroyed", "destroyed availability")
 
 local _, scout = call("GET", "/ships/Little%20Scout")
 check(scout.captain == nil, "a captainless ship reports no captain")
+check(Json.isArray(scout.passengers) and #scout.passengers == 0, "no passengers is still an array")
 check(Json.isArray(scout.turrets) and #scout.turrets == 0, "empty turret list is still an array")
+check(scout.orders == nil and scout.orderInfo == "Patrolling", "prose orderInfo is left as text")
 
 -- everything must survive an encode/decode round trip
 local encoded = Json.encode(ship)

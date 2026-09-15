@@ -88,6 +88,23 @@ function Sectors.mayHaveContent(x, y)
     return regular == true, offgrid == true
 end
 
+-- Empty space in the sense the boss spawns use: no regular content, no offgrid content,
+-- not blocked by a rift and not a home sector. This is determineContent, the generator's
+-- real answer, rather than determineFastContent's tendency - the two disagree often enough
+-- that a farm loop picked off the fast one would reset the jump counter it is building.
+function Sectors.emptySpace(x, y)
+    local specs = getSpecifics()
+    if not specs then return false end
+
+    local ok, regular, offgrid, blocked, home = pcall(function()
+        return specs:determineContent(x, y, GameSeed())
+    end)
+
+    if not ok then return false end
+
+    return not regular and not offgrid and not blocked and not home
+end
+
 -- #### BALANCING #### --
 
 local function materialNamesByIndex()

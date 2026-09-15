@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.4.0](https://img.shields.io/badge/version-0.4.0-8957e5)](modinfo.lua)
+[![version 0.5.3](https://img.shields.io/badge/version-0.5.3-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -25,7 +25,14 @@ galaxy map.
 
 - read your fleet, including craft in unloaded sectors and while you are offline
 - preview a captain mission with the game's own yield and risk prediction, then start it
+- automate captain missions per craft: the mod sends the ship back out whenever it is free,
+  picking the duration, trade route and deposit that stay under an ambush-chance ceiling and
+  inside the trade customer's patience - shared across an alliance, running with no client
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
+- plan routes that prefer gates, keep out of rifts or stay in no man's space, and have the
+  ship fight, hold or press on when enemies show up on the way
+- farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship; the ship recognises the boss, sends fighters for the loot and sits out the 30 minute cooldown after a kill
+- let idle ships defend themselves: aggressive while enemies are in the sector, idle after
 - query known sectors, and predict unvisited ones straight from the galaxy seed
 - read your stations' books - production chain, stock, and what each one has earned - and
   keep a series of them, so a lifetime total becomes credits an hour
@@ -103,7 +110,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.4.0 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.5.3 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -178,6 +185,20 @@ underneath, turning that lifetime total into credits an hour and a bar per hour 
 the factory in the middle, results and waste on the right, one arrow each. Mission and
 Travel are not offered for a station: the game refuses both outright.
 
+The **Orders** tab moves cargo too: pick another craft of yours or your alliance in the same
+sector, see both holds, and tick the goods to give or take and how many - or all of it. A
+target out of reach is docked with or flown to first. Programs on the **Automation** tab have
+the same step, with goods picked from the hold as it is now or named for what it will hold
+when the step runs, so a craft can farm or mine, fly home and unload by itself.
+
+The **Mission** tab's **Automation** section turns whatever the planner below it holds into a
+rule: set a ceiling on the ambush chance, a duration window, how many trade flights the
+customer should have to sit through, a deposit cap or a credit reserve, and pick whether to
+optimise for profit an hour, total yield or safety. **Test limits** runs the check without
+starting anything and lists every option it weighed with why each would or would not go. Once
+saved, the mod does the rest; the fleet list badges each automated craft with what its rule is
+doing, and every alliance member's console shows the same rules and state.
+
 The **Industry** tab puts those lines together, one sector at a time. Each station in the
 sector is a card with its ingredients down one edge and its results down the other, wired
 to the stations it feeds, so a sector reads as the production chain it actually is.
@@ -236,6 +257,12 @@ directory.
 Then open `http://<your-api-host>/console/` and paste an API key. The address field is
 already filled in with the page's own origin, so there is nothing else to set.
 
+The console's browser notifications (a boss spawning, a cooldown ending) need a secure context:
+HTTPS, or the page opened on `localhost`. The stack also serves HTTPS with a self-signed
+certificate for the names in `TLS_HOSTS` - trust Caddy's local CA once and open
+`https://<name>/console/` instead. [docs/local-testing.md](docs/local-testing.md#the-bridge-over-https)
+has the steps.
+
 You can also just open `web/index.html` off disk, but then the page and the API are
 different origins and the browser has to be let through. The bridge sends the CORS
 headers for that by default (`CORS_ORIGIN` in `.env` narrows or disables them), which
@@ -258,7 +285,7 @@ readings. So the bridge samples those counters too, along with each station's st
 good, which is the only way to see what a line actually moved: the counters are one number
 for the whole station and never say which good earned it.
 
-So the bridge keeps the copy. It relays every call already, and four of them carry
+So the bridge keeps the copy. It relays every call already, and a handful of them carry
 everything the store needs:
 
 | from | what it records |
@@ -268,18 +295,20 @@ everything the store needs:
 | `GET /stations` | each station's running earnings totals and its stock per good |
 | `GET /economy` | the faction's money and resources |
 | `GET /economy/events` | every trade and production window the stations recorded, paged forward with a cursor |
+| `GET /ships/{name}` | the craft's hold and who is aboard - the latest only, for the console's goods search |
+| `GET /ping` | which player the key belongs to and which alliance they are in |
 
 Positions come from the ship database, which reads fine **with every player logged out**, so
 the travel record keeps filling whether or not anyone is flying. So do the station books:
 they are read out of the same database rows, not off a loaded sector.
 
 Read it at `/history/summary`, `/history/visits`, `/history/heatmap`, `/history/events`,
-`/history/economy/summary`, `/history/economy/series`, `/history/economy/goods`,
-`/history/economy/observed` and `/history/economy/events` - full
+`/history/manifests`, `/history/economy/summary`, `/history/economy/series`,
+`/history/economy/goods`, `/history/economy/observed` and `/history/economy/events` - full
 reference in [docs/api.md](docs/api.md#bridge-local-endpoints). The console draws the
 travel overlays on the map and the economy ones on the station's Economy tab.
 
-Two things to know about it:
+A few things to know about it:
 
 - **Nothing in the mod pushes.** Movement is only recorded when something asks for `/ships`,
   and the mod's own event log is a 200-entry ring buffer that drops its oldest entry whether
@@ -287,11 +316,25 @@ Two things to know about it:
   `POLL_KEYS` in `.env` to the keys whose fleets should be recorded. Without it the history
   only covers the moments a console happened to be open, and dwell is reported as *observed*
   seconds rather than guessed at either way.
-- **It is keyed by a hash of your API key and never stores the key.** An unknown key reads
-  an empty history rather than anyone else's, and nothing is written except off the back of
-  a call the mod itself answered - so a caller who cannot get a 200 out of the mod cannot
-  make the store exist. `POLL_KEYS` is the one place a key is held at rest, because the
-  poller has to authenticate like any other client.
+- **Alliance history is shared; your own stays yours.** A row belongs to whoever owns the
+  craft, as the mod reported it, so an alliance's fleet has one history whichever member's
+  console or poller saw it, and every current member reads it. Your own craft are readable
+  by your keys only - all of them, since it is one history per player. The bridge asks the
+  mod which alliance a key's player is in every few minutes (`HISTORY_VERIFY_TTL`, default
+  300s), so leaving an alliance takes its history with it, and while the game server is
+  down nobody reads alliance history at all. No member can clear it.
+- **It never stores your API key**, only a SHA-256 of it, and nothing is written except off
+  the back of a call the mod itself answered. A key the mod refuses reads nothing.
+  `POLL_KEYS` is the one place a key is held at rest, because the poller has to
+  authenticate like any other client. One member's key there is enough to keep an
+  alliance's fleet recorded; each player's own fleet needs that player's key.
+
+Upgrading from a bridge that kept history per key needs nothing done by hand. The schema
+migrates on the first connection, each key keeps reading exactly what it recorded, and the
+first time the mod vouches for that key again - the console connecting, or the next poller
+pass - its rows move onto the player and alliance they belong to. Two members' copies of the
+same alliance craft are merged rather than doubled. A player who has left their alliance
+since keeps their old copy of its craft, readable by that key alone.
 
 It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns it off
 entirely; `HISTORY_DAYS` (default 30) sets how far back it keeps, and the poller deletes
@@ -314,13 +357,21 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/missions/{mission}/start` | start it |
 | `GET /ships/{name}/mission` | live status |
 | `POST /ships/{name}/mission/recall`, `.../collect` | recall, and collect yields |
-| `POST /ships/{name}/travel` | send a ship anywhere in the galaxy |
+| `GET /automation/missions`, `GET`/`POST /ships/{name}/mission/automation` | mission automation rules and what they are doing |
+| `POST /ships/{name}/mission/automation/evaluate`, `.../delete` | dry-run a rule's limits, or remove it |
+| `GET /automation/programs`, `GET`/`POST /ships/{name}/program`, `.../control`, `.../delete` | order programs: steps a craft works through until conditions are met, looping |
+| `GET /automation/missions/library`, `POST /automation/missions/library/{name}`, `.../delete` | mission library: named mission rules that program mission steps fly |
+| `POST /ships/{name}/travel` | alias of the Travel captain mission's start |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
+| `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
+| `POST /ships/{name}/farm` | boss farming: loop through empty space in a boss ring |
+| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, standing orders (fight enemies, collect loot), stop |
+| `GET`/`POST /ships/{name}/transfer` | cargo transfer: the holds a craft could trade with, and moving goods into or out of another craft of yours or your alliance |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
 | `GET /stations/{name}/events`, `GET /economy/events` | what stations actually did: trades at real prices, production cycles, reload catch-up |
-| `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and the game's own pathfinder |
+| `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and route planning |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
 | `GET /history/*` | where the fleet has been, and what its stations earned - served by the bridge, not the mod |
@@ -329,7 +380,8 @@ Full reference in [docs/api.md](docs/api.md).
 
 Every read works with nobody logged in, because the bridge runs on the Galaxy.
 
-Writes do not. Starting, recalling and collecting missions, travel and in-sector orders all
+Writes do not. Starting, recalling and collecting missions, travel, routes, farming,
+automation settings, cargo transfers and in-sector orders all
 answer `409 owner_offline` when the owning player is not in game. That is a vanilla
 limitation rather than a shortcut here: mission state lives in a player script, and captain
 missions do not tick for offline players in the base game.
@@ -339,6 +391,10 @@ key holder online". Alliance craft raise their callbacks on the Alliance object 
 online member's agent registers against them, so an alliance fleet keeps recording while any
 one member is in game - whoever that is. Only personal craft go quiet when their own owner
 logs out. `recording` and `watchers` on the event feed say which case you are in.
+
+**Mission automation** keeps its rules on the server and its loop in the bridge, so no client
+has to stay connected - but each start it makes is still a start, and waits until the owner
+(or, for alliance craft, any member) is in game.
 
 Ship *positions* need nobody at all: they come from the ship database, which is why the
 bridge's [fleet history](#fleet-history) keeps filling on an empty server.
@@ -350,6 +406,7 @@ bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 | [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape |
 | [docs/protocol.md](docs/protocol.md) | the file transport, envelopes, status codes, auth |
 | [docs/external.md](docs/external.md) | writing the bridge process and clients against it |
+| [docs/local-testing.md](docs/local-testing.md) | a local server, the bridge over HTTPS, and the boss lab |
 
 ## Architecture
 
@@ -366,30 +423,40 @@ exact call shape vanilla uses, and every vanilla caller of the background simula
 player script. So the bridge parks a job and the agent, running in the one context where the
 call is legal, executes it and reports back.
 
-Everything else is pure Lua under `data/scripts/lib/automationapi/`: the JSON codec, router,
-auth, serializers and the per-endpoint handlers.
+Planned routes, boss farming and standing orders need a third place, because only a script in
+the ship's own sector can see enemies in it: `data/scripts/entity/orderchain.lua` extends
+vanilla's order chain. It puts a plan's hops on the ordinary chain, watches the sector while
+the ship flies them, and publishes its state alongside the chain in the order info the agent
+already forwards. Its state is saved with the chain's own, so no script is added to any craft.
 
-Four files share a path with the game's own, and Avorion inserts a mod's copy of such a file
+Everything else is pure Lua under `data/scripts/lib/automationapi/`: the JSON codec, router,
+auth, serializers, the route planner and the per-endpoint handlers.
+
+Six files share a path with the game's own, and Avorion inserts a mod's copy of such a file
 into the vanilla one, ahead of its final `return`, rather than replacing it:
 
-- `data/scripts/galaxy/init.lua` attaches the bridge, and `data/scripts/player/init.lua` the
-  agent, with one `addScriptOnce` line each.
+- `data/scripts/galaxy/init.lua` attaches the bridge, and `data/scripts/player/init.lua` and
+  `data/scripts/alliance/init.lua` the agent, with one `addScriptOnce` line each.
+- `data/scripts/entity/orderchain.lua` wraps `updateServer`, `getOrderInfo`, `secure` and
+  `restore`. A mod that replaces `orderchain.lua` outright instead of extending it switches
+  the automation off, which `GET /ships/{name}/automation` shows as `reported: false`.
 - `data/scripts/lib/tradingmanager.lua` and `data/scripts/entity/merchants/factory.lua` hand
   the vanilla file's locals to `automationapi/stationhooks.lua`, which wraps the trade and
   production functions to record what player and alliance stations actually do. The game's
   economy log has no read API; these are the calls that write it.
 
-All four depend on vanilla names - `TradingManager`, `production`, `newProductionError`,
-`currentProductions`, and the functions they wrap - and need re-checking against the game's
-copies after an Avorion update. A renamed one turns recording off rather than breaking a
-station: every hook checks what it wraps and records inside `pcall`.
+All six depend on vanilla names - `TradingManager`, `production`, `newProductionError`,
+`currentProductions`, the order chain's functions and whatever else they wrap - and need
+re-checking against the game's copies after an Avorion update. A renamed station hook turns
+recording off rather than breaking a station: every hook checks what it wraps and records
+inside `pcall`.
 
 ## Development
 
 The pure-Lua modules run outside the game against a mocked Avorion environment:
 
 ```bash
-for t in bridge ships missions movement map shipevents economy stationevents; do lua5.4 tests/test_$t.lua; done
+for t in bridge ships missions missionautomation movement navigation orderchain map shipevents economy stationevents; do lua5.4 tests/test_$t.lua; done
 ```
 
 The bridge's history store is PHP over Postgres, so it is tested against a throwaway
@@ -412,6 +479,11 @@ tools/uitest.sh
 It pins the parts of the console that are decided rather than displayed - which subtabs a
 craft is offered, whether the live event feed and the bridge's copy of it merge or double,
 and which end of the ship log the newest entry is at. All three are silent when they break.
+
+Against the real game, `tools/localserver.sh` runs a headless dedicated server on a test galaxy
+and drives its console, and the boss lab in `devsetup.lua` checks the engine calls the farm
+makes - see [docs/local-testing.md](docs/local-testing.md). Your paths go in the gitignored
+`tools/local.env`.
 
 `tests/mock_avorion.lua` deliberately reproduces the sandbox's hostile behaviour rather
 than a convenient version of it, so bugs that would otherwise only show up in game fail in

@@ -9,12 +9,17 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.4.0", "game": "2.5.13",
+  "api": 1, "mod": "0.5.3", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
-  "player": {"index": 1, "name": "...", "online": true}
+  "player": {"index": 1, "name": "...", "online": true,
+             "alliance": {"index": 77, "name": "..."}}
 }
 ```
+
+`player.alliance` is `null` for a player in no alliance. It is always present, so its absence
+means a mod older than the field. The bundled bridge decides who may read an alliance's
+shared history off it; see [Storage and privacy](#storage-and-privacy).
 
 ## GET /ships
 
@@ -65,6 +70,7 @@ Includes every field from the listing, plus:
 | field | notes |
 |---|---|
 | `captain` | `null` if none. `classes` resolve to names (`Miner`, `Merchant`, ...), `perks` are ints. |
+| `passengers` | captains aboard but not in command, each in the same shape as `captain`; empty array if none |
 | `crew` | `size`, `maxSize`, `requirementsFulfilled`, and `byProfession` / `ideal` breakdowns |
 | `cargo` | `capacity`, `free`, `used`, and `goods` flattened to an array |
 | `hyperspace` | `range`, `cooldown`, `canPassRifts`, `impaired` |
@@ -74,6 +80,30 @@ Includes every field from the listing, plus:
 | `systems`, `hangar` | installed subsystems and fighter squads |
 | `requirements` | crew / turret slot / fighter start / fighter squad checks |
 | `blocks`, `planValue`, `reconstructionValue` | |
+| `orders` | the order chain's state, decoded from the engine's JSON; `null` when there is none. See below. |
+| `orderInfo` | the engine's order info string, verbatim. Prefer `orders`. |
+
+`orders` uses the same chain shape as the order events, plus where each link goes:
+
+```json
+{
+  "chain": [
+    {"name": "Jump", "action": 1, "sector": {"x": -309, "y": 258}},
+    {"name": "Fly Through", "action": 11, "gate": true, "sector": {"x": -308, "y": 249}}
+  ],
+  "activeIndex": 2,
+  "finished": false,
+  "sector": {"x": -309, "y": 258},
+  "defense": "Enemy ships seen: attack combat ships",
+  "autoAI": {"hullRatio": 0.8, "messages": 1}
+}
+```
+
+`activeIndex` is 1-based, `0` when nothing runs. `gate` is only present on fly-through
+links (`false` means a wormhole). `extra` holds any other top-level values a script put in
+the chain state, and is left out when there are none. `automation` is the ship's automation
+state as of the last save, in the shape [`GET /ships/{name}/automation`](#get-shipsnameautomation)
+returns; that endpoint prefers the live copy.
 
 Errors: `404 no_such_ship` when the caller does not own it, `404 no_ship_data` when it is
 owned but has no database row yet.
@@ -154,6 +184,49 @@ with the game's own wording:
 Duration and other numeric config are clamped to the command's own limits, exactly as the
 game clamps them, and the clamped values are echoed back.
 
+### Trade routes
+
+A trade preview also carries `routes`: every route the area analysis found (up to four),
+in the game's order. A trade mission flies one of them, picked by `config.goodName`, and
+needs a `config.deposit` - the down payment the captain buys with. Without a `goodName`
+the preview still answers, with `errors.prediction` saying no route is selected, so a
+first preview with an empty config is how you learn which goods an area offers.
+
+```jsonc
+"routes": [{
+  "good": "Oil", "price": 320, "size": 2,
+  "lowest": -0.2, "highest": 0.15,
+  "margin": 0.35,                         // the order window's "%" column
+  "profitPerUnit": 112,                   // its "¢/u" column, before captain perks
+  "from": {"x": -310, "y": 318}, "to": {"x": -300, "y": 322},
+  "deposit": 98304,                       // the order window's slider maximum
+  "maxAvailable": 400, "perFlight": 200,  // the game spreads a contract evenly over its flights
+  "flights": {"from": 2, "to": 2},
+  "profitPerFlight": {"from": 25200, "to": 28000},
+  "contractProfit": {"from": 50400, "to": 56000},
+  "flightTime": 1500, "attackChance": 0.08,
+  "selected": false                       // true for the route config.goodName names
+}]
+```
+
+Every figure after `to` is the game's own `calculatePrediction` run for that route at
+`deposit`, which is what the order window offers at most: every unit on offer, or as many
+as the free cargo space holds, at the pre-perk purchase price. `contractProfit` is all of
+`maxAvailable` at the perk-adjusted margin; each flight pays out 90-100% of its figure,
+hence the range. A route the ship cannot fly at all has `error` in place of the
+predicted figures.
+
+Sending a route's `good` as `goodName` and its `deposit` as `deposit` (and `maxDeposit`)
+reproduces what the game would start at full down payment.
+
+Which routes an area offers depends on which stations fall inside it, and the ship only
+has to be somewhere in the area, not in its middle. Finding the best contract means
+previewing the area at several placements around the ship: the console's **Scan
+placements** does this, trying each of the three shapes with the ship in every corner, the
+middle of every side and the centre. Each placement is a separate area analysis, so run
+them one after another - a second analysis for the same ship answers
+`409 analysis_in_progress`.
+
 ## POST /ships/{name}/missions/{mission}/start
 
 Same request body as preview. Validates first and refuses with `422` and the full preview
@@ -197,12 +270,360 @@ command's own finalisation.
 
 Collects waiting yields into the owner's account. Returns `collected` and `remaining`.
 
+## Mission automation
+
+A rule per craft that has the mod send it back out on a captain mission whenever it is free,
+as long as the mission stays inside the rule's limits. The loop runs in the galaxy bridge -
+no client has to stay connected - and every start it makes is the ordinary start: the same
+assessment preview runs, then the same agent handshake.
+
+- **Rules are stored per owning faction**, as Server values, so they survive restarts. An
+  alliance craft's rule is one document: every member reads the same rule and the same live
+  state, and a member with `ManageShips` can change it.
+- **A start still needs someone in game**: the owner for their own craft, any alliance member
+  for alliance craft. Until then the rule waits in phase `offline`.
+- **Alliance starts run under the rank of the member who last saved the rule.** Demote them
+  and the rule stops (`blocked`) until someone with `ManageShips` saves it again. A trade
+  deposit also needs `SpendResources`.
+- **Automatable missions**: mine, salvage, trade, expedition, scout, refine, sell, procure,
+  maintenance. Travel ends elsewhere and supply never finishes, so neither can be repeated.
+
+Each check runs one area analysis and predicts every config worth trying against it:
+
+| mission | what is searched |
+|---|---|
+| mine, salvage | every half hour of duration the captain allows |
+| expedition | 30, 60, 90 and 120 minutes |
+| trade | every route in the area, at every flight count from the fewest the cargo bay allows, each with the smallest deposit that achieves it |
+| others | the config as given |
+
+Options that break a limit - or that the game itself would refuse - are dropped, and the best
+of the rest by the rule's `objective` is started. Ties go to the lower ambush chance. At most
+one check runs per pass, and never on the last free analysis slot.
+
+### Trade and the impatient customer
+
+The captain's warnings are about flights, not time. A contract always gets three flights;
+after that, each flight ends it early with a 35% chance (`TradeCommand:update`), paying for
+the flights flown plus the deposit back. So `maxFlights` is the patience limit, and the
+figures account for it: `completionChance` is 0.65^(flights - 3), `expectedFlights` and
+`value` are what the contract is expected to deliver before the customer walks.
+
+A bigger deposit means fewer flights, but past a richness-scaled threshold it also stretches
+the attack window from one hour towards three. `maxFlights` and `maxAttackChance` therefore
+pull against each other, and the trade search exists to find the deposit that satisfies both.
+
+### The rule
+
+```json
+{
+  "mission": "trade",
+  "enabled": true,
+  "objective": "hourly",
+  "area": {"mode": "ship", "size": {"x": 17, "y": 17}, "placement": {"fx": 0.5, "fy": 0.5}},
+  "limits": {
+    "maxAttackChance": 0.1,
+    "maxFlights": 3,
+    "maxDeposit": 2000000,
+    "minCreditsLeft": 5000000
+  },
+  "config": {},
+  "materials": ["Iron", "Titanium"],
+  "escorts": ["Wingman"],
+  "collectYields": true
+}
+```
+
+| field | |
+|---|---|
+| `objective` | `hourly` (value per hour away), `total` (biggest value), `safest` (lowest ambush chance) |
+| `area.mode` | `ship` recentres on the craft at every check, at `size` (default: the first the captain allows) with the craft at `placement` (fractions of each side, default the centre); `fixed` takes `lower` and `upper` |
+| `config`, `materials`, `escorts` | as for a start. A searched field (a duration, a trade route and deposit) is chosen by the check, not taken from here |
+| `collectYields` | collect waiting yields before each check |
+
+Every limit is optional. Units are the same for every mission:
+
+| limit | unit | |
+|---|---|---|
+| `maxAttackChance` | fraction, 0-1 | the order window's attack chance |
+| `maxDuration`, `minDuration` | seconds | time away; for trade, the whole contract |
+| `maxFlights` | flights | trade only: the customer's patience |
+| `maxDeposit` | credits | trade deposit, procure budget, maintenance price |
+| `minCreditsLeft` | credits | the owner's account after paying the deposit |
+| `minValue` | credits or resource units | the expected yield: trade and sell in credits, mine, salvage and refine in resources |
+
+### GET /automation/missions
+
+Every rule the caller can see with its live state. `?owner=player|alliance` narrows it; the
+default is both.
+
+```json
+{
+  "serverTime": 18234.5,
+  "automations": [{"ship": "Prospector", "owner": {"kind": "player"}, "rule": {}, "state": {}}],
+  "supported": ["expedition", "maintenance", "mine", "procure", "refine", "salvage", "scout", "sell", "trade"],
+  "limits": ["maxAttackChance", "maxDeposit", "maxDuration", "maxFlights", "minCreditsLeft", "minDuration", "minValue"]
+}
+```
+
+Timestamps in `state` are server runtime seconds, like `serverTime`, so compare them with it
+rather than with a wall clock. `state` is `null` until the loop has looked at the rule, and
+starts empty after a server restart.
+
+```json
+{
+  "phase": "blocked",
+  "message": "Nothing within the limits: ambush chance 14% is above 10%",
+  "since": 18100.2, "nextCheckAt": 18400.2, "busy": false,
+  "dispatches": 6,
+  "lastDispatch": {"at": 16020.0, "mission": "trade", "summary": "trade, Oil, 3 flights, 1.0h, ambush 8%, ~412000 ¢/h", "candidate": {}},
+  "lastEvaluation": {"at": 18100.2, "tried": 9, "passing": 0, "chosen": null, "candidates": []},
+  "lastCollect": {"at": 18099.0, "collected": 3},
+  "log": [{"at": 18100.2, "phase": "blocked", "message": "...", "detail": null}]
+}
+```
+
+| phase | |
+|---|---|
+| `waiting` | will be checked on a coming pass |
+| `evaluating` | an analysis is running for it |
+| `starting` | the start job is with the owner's agent |
+| `running` | out on a mission the automation sent it on |
+| `busy` | out on a mission started some other way |
+| `blocked` | nothing passes the limits, the ship is unusable, or the rule's author lost their rank - retried after `Config.missionAutomationRetry` (300s) |
+| `offline` | nobody who could start it is in game |
+| `missing` | the owner no longer has a craft by that name |
+| `error` | the check or start failed; `message` says how |
+| `program` | an enabled program drives the craft and flies this rule in its mission steps |
+| `disabled` | switched off |
+
+### GET /ships/{name}/mission/automation
+
+One craft's rule and state, in the shape of an `automations` entry. `rule` and `state` are
+`null` when it has none.
+
+### POST /ships/{name}/mission/automation
+
+Creates or updates the rule. Fields left out keep their stored values, so `{"enabled": false}`
+is the whole of switching a craft off. `limits`, when given, replaces the stored limits.
+
+Pass `ifRevision` - the `rule.revision` you last read, `0` for a new rule - and a save that
+would overwrite someone else's change is refused with `409 rule_changed`, the current revision
+and rule in `details`. Alliance craft need `ManageShips` (`403 missing_privilege`). An
+unknown limit or material is `400 bad_rule`; a mission that cannot be automated is
+`422 not_automatable`.
+
+### POST /ships/{name}/mission/automation/delete
+
+Removes the rule. `{"deleted": true}` if there was one.
+
+### POST /ships/{name}/mission/automation/evaluate
+
+A dry run of one check - the analysis and every option, ranked, with the reason each would or
+would not go - and nothing started. The body is merged over the stored rule without saving
+it, so limits can be tried before they are committed; `{}` checks the stored rule as is.
+Works with the owner offline.
+
+```json
+{
+  "wouldStart": true,
+  "evaluation": {
+    "objective": "hourly", "tried": 6, "passing": 2,
+    "area": {"lower": {"x": -324, "y": 311}, "upper": {"x": -308, "y": 327}},
+    "chosen": {"passes": true},
+    "candidates": [{
+      "passes": true,
+      "config": {"goodName": "Oil", "deposit": 34304, "escorts": []},
+      "route": {"good": "Oil", "from": {"x": -310, "y": 318}, "to": {"x": -300, "y": 322}},
+      "metrics": {
+        "attackChance": 0.07, "duration": 3600, "flights": 3, "expectedFlights": 3,
+        "completionChance": 1, "patience": "safe", "cost": 34304,
+        "value": 53760, "valueUnit": "credits", "hourly": 53760
+      },
+      "violations": []
+    }]
+  },
+  "assessment": ["We do not have to fly often. ..."]
+}
+```
+
+`patience` follows the captain's wording thresholds: `safe` up to 3 flights, `small risk` to
+5, `real risk` to 10, `likely lost` beyond.
+
+## Order programs
+
+A program per craft: a list of steps the mod works it through by itself, each until its
+conditions are met, then on to the next step, to a step by number - which is how a program
+loops - or to its end. For example, farm bosses until the hold is 80% full, fly to a trade
+station, go back to step 1.
+
+- **Stored and run like mission automation.** Programs are Server values per owning faction
+  with a revision; the runner is in the galaxy bridge. Alliance programs are shared, and run
+  under the rank of the member who last saved them.
+- **Every step is an ordinary request.** A route step is `POST /ships/{name}/route`, a farm
+  step `POST /ships/{name}/farm`, an orders step `POST /ships/{name}/orders`, a standing step
+  `POST /ships/{name}/automation`, issued internally with the program's authority - so each is
+  validated, refused and confirmed exactly as a client's call would be, and needs what that
+  call needs (the owner online, the sector loaded, a captain). A mission step runs the craft's
+  mission automation rule once: one analysis, the best option inside its limits, the ordinary
+  start.
+- **While a program runs, the craft's mission rule does not dispatch by itself** (its state
+  shows phase `program`). When the program finishes or is switched off, the rule takes over
+  again.
+- **A refused step is retried** every minute (`status: retrying`, `message` says why).
+- **After a restart the current step starts over.** Where a program has got to is kept apart
+  from the program, so moving on does not change its revision.
+
+### Steps
+
+```jsonc
+{
+  "name": "fill up",                       // optional
+  "action": {"type": "farm", "boss": "auto"},
+  "until": {"match": "any", "conditions": [{"type": "cargo", "op": ">=", "percent": 80}]},
+  "repeat": false,
+  "then": "next"                           // "next", "start" (step 1), "stop", or {"goto": n}
+}
+```
+
+| action | fields | ends by itself |
+|---|---|---|
+| `route` | `to {x, y}`, and optionally `onEnemies`, `attackCivilians`, `preferGates`, `avoidRifts`, `preferUncontrolled` as for `/route` | when the plan ends (arrived, or stopped) |
+| `farm` | `boss`, `onEnemies`, `attackCivilians`, `collectLoot`, `bossCooldown` as for `/farm` | never - needs a condition |
+| `orders` | `orders`, `clear` as for `/orders` | when the chain runs out |
+| `mission` | optionally `library`, the name of a [library mission](#mission-library), or `rule`, a mission automation rule of its own; with neither, the craft's stored rule | when the craft is back |
+| `travel` | `to {x, y}`, optionally `swiftness` (0-3) as for `/travel` | when the craft is back, at the destination |
+| `standing` | `standing`, `attackCivilians` as for `POST /ships/{name}/automation` | at once |
+| `transfer` | `target`, `targetOwner`, `direction`, `goods` or `all`, `approach` as for [`/transfer`](#post-shipsnametransfer) | when the ship reports the transfer over - moved, refused on the way, or given up. A target that is not in the sector yet is retried, so a route step before it can fly the ship there |
+| `wait` | - | never - needs a condition |
+
+A step with no conditions ends with its action. One with conditions ends when `any` (the
+default) or `all` of them hold, checked every two seconds; with `repeat` the action starts
+again each time it ends while they do not. A route or farm still flying when its step ends is
+stopped first.
+
+| condition | fields | met when |
+|---|---|---|
+| `cargo` | `op` (`>=`, `<=`), `percent` | the hold's used share compares so |
+| `good` | `name`, `op`, `amount` | the hold's amount of that good compares so |
+| `bossKills` | `count` | this step's farm has killed that many bosses |
+| `arrived` | - | this step's route arrived |
+| `planEnded` | - | this step's route or farm ended, however |
+| `missionReturned` | - | this step's mission is back |
+| `elapsed` | `seconds` | the step has run that long |
+| `enemies` | `present` (default true) | the ship last reported enemies in its sector, or none |
+| `idle` | - | the ship has no chain, plan or standing order at work |
+| `at` | `x`, `y` | the craft is in that sector |
+
+Cargo and position come from the ship database; enemies, plans and boss kills from what the
+ship last reported. A condition whose facts are not known yet counts as not met.
+
+### GET /automation/programs
+
+Every program the caller can see (`?owner=player|alliance|all`, default all), with what each
+is doing, and the vocabulary.
+
+```json
+{
+  "serverTime": 7310,
+  "programs": [{
+    "ship": "Ore Hound", "owner": {"kind": "player"},
+    "program": {"name": "Farm and sell", "enabled": true, "revision": 3,
+                "updatedBy": {"index": 1, "name": "Rusty"}, "steps": []},
+    "state": {
+      "status": "running", "message": "Farming bosses.", "since": 7290,
+      "step": 1, "stepSince": 7010, "phase": "active", "attempts": 0,
+      "planId": "p4-7011", "bossKills": 1,
+      "conditions": [{"text": "cargo >= 80%", "met": false}],
+      "log": [{"at": 7010, "status": "running", "step": 1, "message": "Farming bosses."}]
+    }
+  }],
+  "actions": ["farm", "mission", "orders", "route", "standing", "travel", "wait"],
+  "conditions": ["arrived", "at", "bossKills", "cargo", "elapsed", "enemies", "good", "idle", "missionReturned", "planEnded"],
+  "maxSteps": 20
+}
+```
+
+| `state.status` | meaning |
+|---|---|
+| `starting` | the step's action has been sent and not answered yet |
+| `running` | the step's action is under way, or over and waiting for the conditions |
+| `waiting` | nothing can be done yet: owner offline, or just saved |
+| `retrying` | the step's action was refused; tried again after a minute |
+| `finished` | the program ran to its end (`then: "stop"`, or past the last step) |
+| `disabled` | switched off |
+| `error` | the craft or the authority to run it is gone |
+
+### GET /ships/{name}/program
+
+One craft's program and state, in the shape of a `programs` entry; `program` is absent when
+it has none.
+
+### POST /ships/{name}/program
+
+Creates or updates the program: `name`, `enabled`, `steps`. Fields left out keep their stored
+values; `steps`, when given, replaces them all and starts the program over at step 1.
+Switching it off and on keeps its place (the step it was on starts its action again). At most
+20 steps and 8 conditions per step.
+
+Pass `ifRevision` as for mission rules: `409 program_changed` if someone saved since. A
+malformed program is `400 bad_program` (`details.known` lists actions or conditions where one
+is unknown); a mission step's own rule is checked as a mission rule is, and a `library` name
+must be in the craft owner's library. Alliance craft need `ManageShips`.
+
+### POST /ships/{name}/program/control
+
+`{"action": "restart"}` moves the program to step 1, `{"action": "goto", "step": n}` to step
+n. The step moved to starts its action on the next pass; whatever the previous step started is
+left as it is. Errors: `400 bad_control`, `400 bad_step`, `404 no_program`.
+
+### POST /ships/{name}/program/delete
+
+Removes the program. `{"deleted": true}` if there was one.
+
+### Mission library
+
+Named mission rules a faction keeps for its programs' mission steps: a rule without a craft,
+under a name like `Refine, safe`. A step names one, and the runner loads it when the step
+starts, so an edit applies to every program flying it from its next start. Player craft fly
+the player's library, alliance craft the alliance's (`?owner=alliance`), which every member
+shares.
+
+#### GET /automation/missions/library
+
+`?owner=player|alliance|all` (default all).
+
+```json
+{
+  "missions": [{
+    "name": "Refine, safe", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+    "rule": {"mission": "refine", "objective": "hourly", "area": {"mode": "ship"}, "limits": {"maxAttackChance": 0.05}},
+    "revision": 2, "updatedBy": {"index": 1, "name": "Rusty"}, "updatedAt": 1757940000,
+    "usedBy": ["Ore Hound"]
+  }],
+  "maxName": 48
+}
+```
+
+`usedBy` lists the craft whose programs name the mission.
+
+#### POST /automation/missions/library/{name}
+
+Creates or updates the mission called `name`. The body is a rule as for
+`POST /ships/{name}/mission/automation`, merged over the stored one, except that a library
+mission has no `enabled`. `rename` moves it to a new name, and the programs naming it follow
+without a new revision. `ifRevision` as for rules. Errors: `400 bad_name`, `400 bad_rule`,
+`422 not_automatable`, `409 library_changed`, `409 name_taken`, `403 missing_privilege`.
+
+#### POST /automation/missions/library/{name}/delete
+
+Removes it: `{"deleted": true}` if there was one. A mission a program still names is
+`409 mission_in_use`, with the craft in `details.usedBy`.
+
 ## POST /ships/{name}/travel
 
-Moves a ship anywhere in the galaxy. This is a Travel captain mission under a shorter
-name: it goes through the same analysis, prediction and start path as
-`/ships/{name}/missions/travel/start` and returns the same body, so the response carries
-a real route prediction and attack chance rather than just an acknowledgement.
+An alias of `POST /ships/{name}/missions/travel/start`, kept for existing callers. It takes
+the destination at the top level and `swiftness` alongside it, and returns the same body:
 
 ```jsonc
 {"to": {"x": -300, "y": 310}, "swiftness": 2}
@@ -211,11 +632,17 @@ a real route prediction and attack chance rather than just an acknowledgement.
 `swiftness` is 0 (careful, slow, unlikely to be attacked) to 3 (reckless, fast, risky) and
 defaults to 2.
 
-Prefer this to `/orders` for anything that is not tactical. It loads no sectors, works
-wherever the ship is, and the game drives it to completion.
+A Travel captain mission loads no sectors, works wherever the ship is and survives the owner
+logging out once started. To fly a route as orders instead - with gate, rift and
+faction-space preferences, and a response to enemies on the way - use
+[`POST /ships/{name}/route`](#post-shipsnameroute).
 
-The destination is checked before an area analysis is spent on it. The game refuses to
-send a ship somewhere it could already reach in one hop, so these come straight back:
+### Destination checks
+
+These apply to the travel mission however it is started - this alias, or `preview` and
+`start` on `/missions/travel`. The game refuses to send a ship somewhere it could already
+reach in one hop, and says so only after an area analysis has been spent, so the destination
+is checked first:
 
 | code | when |
 |---|---|
@@ -224,8 +651,7 @@ send a ship somewhere it could already reach in one hop, so these come straight 
 
 The same rule is enforced after the analysis too, since only then is the real route known:
 a route of two sectors or fewer sets `errors.start` to the game's own
-`"This route is too short."` and `canStart` to false. That applies to preview as well, so
-a preview of a travel mission no longer claims a start would succeed when it would not.
+`"This route is too short."` and `canStart` to false.
 
 **Requires the owning player to be logged in.**
 
@@ -319,8 +745,380 @@ target entity, which this API never has.
 
 `422 order_after_terminal` - the chain refuses to enqueue past `patrol` or a persistent
 `mine`/`salvage`; enforced here rather than discovered later.
-`409 sector_not_loaded` - the ship's sector is not in memory; use `/travel`.
+`409 sector_not_loaded` - the ship's sector is not in memory; a Travel captain mission moves
+a ship wherever it is.
 `409 ship_in_background` - it is out on a captain mission.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/route
+
+Plans a route and has the ship fly it as an order chain. The plan is this mod's own search
+rather than the game's `calculateJumpPath`, which takes no preferences:
+
+```jsonc
+{
+  "to": {"x": -120, "y": 88},
+  "preferGates": true,          // take known gates and wormholes whenever they save time
+  "avoidRifts": false,          // keep a rift-capable ship out of rifts, as if it were not
+  "preferUncontrolled": true,   // stay in no man's space where a detour allows
+  "onEnemies": "fight",         // fight | hold | continue
+  "attackCivilians": false,
+  "dryRun": false               // plan only; nothing is sent to the ship
+}
+```
+
+The response is the plan in [`GET /galaxy/route`](#get-galaxyroute)'s planner shape, plus the
+dispatch:
+
+```json
+{
+  "ship": "Ore Hound", "planId": "p4-7310", "confirmed": true,
+  "reachable": true, "planner": "automation",
+  "jumps": 9, "gates": 1, "controlledSectors": 0, "distance": 61.2,
+  "hops": [{"x": -5, "y": 3, "kind": "jump", "distance": 5.8, "controlled": false, "rift": false}],
+  "route": [{"x": 0, "y": 0}, {"x": -5, "y": 3}],
+  "onEnemies": "fight", "attackCivilians": false, "dryRun": false,
+  "automation": {"plan": {"id": "p4-7310", "kind": "route", "phase": "running"}},
+  "chain": [{"name": "Jump", "action": 1}]
+}
+```
+
+The hops go onto the ship's ordinary order chain - jumps as jumps, gates and wormholes as
+fly-through orders - so the Orders view, the galaxy map and `GET /ships/{name}/events` all
+show them. While the ship flies them it checks its sector every second:
+
+| `onEnemies` | when enemies are present |
+|---|---|
+| `fight` (default) | replace the route with an aggressive order; once the sector has been clear for five seconds, pick the route up at the hop it was interrupted on |
+| `hold` | replace the route with an aggressive order that never finishes, and stay |
+| `continue` | ignore them and keep jumping |
+
+`attackCivilians` decides both whether civilian ships count as enemies and whether the
+aggressive order attacks them.
+
+The request is held open until the ship reports the plan it took up, as `/orders` is:
+`200 confirmed: true` when it did, `422` when it refused, and `202 confirmed: false` when it
+said nothing inside the window - which is what a server where another mod replaced
+`orderchain.lua` outright looks like.
+
+| error | when |
+|---|---|
+| `422 already_there` | the ship is in that sector |
+| `422 no_route` | the planner found none; `reason` is `no_route`, `destination_in_rift`, `barrier`, `search_limit` or `timeout` |
+| `422 needs_captain` | no captain and nobody at the controls |
+| `422 plan_refused` | the ship refused a hop the engine would not allow; the message names it |
+| `400 bad_on_enemies` | |
+
+Plus the world checks `/orders` makes, before any planning: `409 owner_offline`,
+`409 ship_in_background`, `409 sector_not_loaded`. A dry run skips those. Planning is rate
+limited with `GET /galaxy/route`, one call every two seconds per player.
+
+The ship's sector has to stay loaded for the ship to fly; the engine does not simulate a
+craft in a sector nobody is near, and a plan waits with it.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/farm
+
+Boss farming. The game spawns a boss after **ten consecutive jumps into empty space** - no
+regular or off-grid content, not blocked by a rift, not a home sector - inside one of two
+rings around the core, each jump also having a 4% chance of its own:
+
+| `boss` | ring (distance from the core, exclusive) |
+|---|---|
+| `ai` | 240 - 340 |
+| `swoks` | 350 - 430 |
+| `auto` (default) | the ring the ship is in, else the nearer one |
+
+This finds two empty sectors in the ring one jump apart, plans a way there if the ship is not
+on one already, and sends the ship round the pair in a loop:
+
+```jsonc
+{"boss": "auto", "onEnemies": "fight", "attackCivilians": false,
+ "collectLoot": true, "bossCooldown": 1800, "dryRun": false}
+```
+
+| field | notes |
+|---|---|
+| `collectLoot` | default `true`: after a fight, send the fighters for the loot before jumping on |
+| `bossCooldown` | seconds to stop jumping after a boss is killed, `0` to `14400`, default `1800` (vanilla's); `0` keeps jumping |
+
+```json
+{
+  "ship": "Ore Hound", "boss": "ai", "ring": {"min": 240, "max": 340},
+  "loop": [{"x": 290, "y": 1}, {"x": 293, "y": 4}],
+  "approach": [{"x": 287, "y": 0, "kind": "jump"}],
+  "hops": [{"x": 287, "y": 0, "kind": "jump"}, {"x": 290, "y": 1, "kind": "jump"}],
+  "loopFrom": 2, "piloted": true, "collectLoot": true, "bossCooldown": 1800,
+  "planId": "p5-7322", "confirmed": true
+}
+```
+
+The rules this works around, all vanilla's (`player/story/spawnrandombosses.lua`):
+
+- **The jump counter belongs to the player, not the ship.** It counts the sector changes of
+  the player aboard, so a captain flying the loop alone never spawns anything. A farm is
+  refused with `422 needs_pilot` unless a player is at the controls, and stops itself
+  (`last.outcome: "pilot_left"`) if they leave.
+- A jump into a sector with regular content resets the counter, which is why the loop only
+  uses empty sectors. The approach may pass through anything; counting starts on the loop.
+- After a boss dies, nothing spawns for 30 minutes, for Swoks and the AI alike (one timer per
+  player), and jumps in that time are not counted at all. The timer lives in the player
+  script's memory, so the game forgets it on logout or restart.
+
+What the ship does about it, on its own:
+
+- **The boss is recognised** by the script vanilla puts on it (`entity/story/swoks.lua`,
+  `entity/story/aibehaviour.lua`) and published as `plan.bossPresent`. A farm stops for a boss
+  even before it turns hostile - Swoks arrives friendly to the player he spawned for.
+- **A kill** is a boss gone from the sector while the ship is still in it; vanilla gives a boss
+  no other way out with a player present, short of paying Swoks off through his dialog. It
+  counts in `plan.bossKills` and starts `plan.cooldown`.
+- **Looting** (`collectLoot`): once the sector is clear, if there is loot the ship may take
+  and it has fighters, the chain is cleared and every squad is ordered to collect loot. Cargo
+  drops only count when the ship's fighters can pick cargo up, which takes both a transporter
+  block and the `FighterCargoPickup` stat from Transporter Software of rare or better (either
+  alone and fighters leave cargo alone - verified in the engine); money, resources, turrets and
+  subsystems always count. Drops the ship has no room for (`Loot:isCollectable`), such as
+  torpedoes without torpedo storage, never count. It ends when none is left, nothing was picked up for 45 s, no fighter launched within
+  20 s, or after 5 minutes. The fighters are then recalled and the ship waits up to 90 s for
+  them to land before anything else, since a jump leaves them behind; stragglers after that are
+  pulled in with `Hangar.collectAllFighters`.
+- **Cooldown**: with a cooldown running, the ship sits with an empty chain until it is over,
+  then resumes the loop by itself. Enemies meanwhile are fought as `onEnemies` says, and a pilot
+  leaving the controls does not end the farm until it is about to jump again.
+
+`onEnemies` applies as for routes; with `fight` the loop resumes after the boss is dealt with.
+With `continue` the ship neither stops for a boss nor, jumping on, sees it die. A dry run needs
+nobody aboard and reports `piloted`.
+
+Errors: `400 bad_boss`, `400 bad_collect_loot`, `400 bad_boss_cooldown`, `422 needs_pilot`, `422 no_hyperspace`, `422 no_farm_loop` (no pair of
+empty sectors near the ring point), `422 no_route` (none to the loop), plus the world checks
+above.
+
+**Requires the owning player to be logged in.**
+
+## GET /ships/{name}/automation
+
+What the ship's automation is doing, as the ship itself last reported it.
+
+```json
+{
+  "ship": "Ore Hound", "source": "live", "reported": true,
+  "automation": {
+    "version": 1,
+    "standing": {"enemies": {"enabled": true, "mode": "interrupt"},
+                 "loot": {"enabled": true, "mode": "idle"}},
+    "autoAggressive": true, "attackCivilians": false,
+    "enemies": false, "defenceFights": 3, "lootRuns": 5,
+    "sector": {"x": 290, "y": 1},
+    "plan": {
+      "id": "p5-7322", "kind": "farm", "phase": "running", "onEnemies": "fight",
+      "hops": 3, "hop": 2, "loopFrom": 2, "jumps": 14, "fights": 1,
+      "target": {"x": 293, "y": 4}, "boss": "swoks",
+      "bossPresent": null, "bossKills": 1,
+      "lastKill": {"name": "swoks", "title": "Boss Swoks III", "sector": {"x": 293, "y": 4}},
+      "collectLoot": true, "lootResult": "collected",
+      "loot": {"instant": 0, "cargo": 2, "cargoPickup": false, "fighters": 6, "deployed": 0},
+      "cooldown": {"left": 1740, "total": 1800}
+    },
+    "last": {"id": "p4-7310", "kind": "route", "outcome": "arrived", "jumps": 9, "fights": 0,
+             "sector": {"x": -120, "y": 88}},
+    "reaction": null,
+    "lastReaction": {"kind": "loot", "outcome": "done", "lootResult": "collected",
+                     "resumed": true, "sector": {"x": 290, "y": 1}}
+  }
+}
+```
+
+| field | notes |
+|---|---|
+| `source` | `live` from the event feed, `database` from the ship's row (as of the last save), `none` |
+| `reported` | false until the ship has published anything - its sector has not loaded since the mod was installed, or another mod replaced `orderchain.lua` |
+| `plan.phase` | `running`, `fighting` or `holding`; farms also `looting`, `returning` (waiting for fighters to land) and `cooldown`. `plan` is absent when there is none |
+| `plan.bossPresent` | farms: `{name, title}` of the boss in the sector, absent when there is none |
+| `plan.cooldown` | farms: `{left, total}` seconds while a kill's cooldown runs. Republished once a minute, so count down from when it arrived |
+| `plan.loot` | farms: the last loot count - `instant` (any fighter), `cargo` (needs `cargoPickup`: transporter block and software), `fighters`, `deployed` |
+| `plan.lootResult` | farms: how the last looting ended - `collected`, `stalled`, `timeout`, `no_launch`, `no_fighters`; `_recalled` appended when stragglers had to be pulled in |
+| `plan.hop` | the hop being flown, 1-based, counting the approach |
+| `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
+| `standing` | the ship's standing orders, `enemies` and `loot`, each `{enabled, mode}`. Absent on ships running a mod version from before standing orders |
+| `autoAggressive` | kept for older clients: `standing.enemies.enabled` |
+| `reaction` | a standing order holding the ship right now: `{kind, mode, phase, resumes, loot, lootResult}`. `phase` is `fighting`, `looting` or `returning`; `resumes` says whether an interrupted chain comes back afterwards. Absent when there is none, and never alongside `plan` |
+| `lastReaction.outcome` | `done`, `replaced` (orders from elsewhere; the old chain is not put back), `switched_off` (the chain is put back), `stopped` |
+| `defenceFights`, `lootRuns` | fights and loot runs started by standing orders, over the life of the ship |
+| `transfer` | a [cargo transfer](#post-shipsnametransfer) on its way to a craft out of reach: `{id, target, direction, all, goods, phase}`, `phase` `docking` or `approaching`. Absent when there is none |
+| `lastTransfer` | how the last transfer ended: `{id, target, direction, outcome, reason, message, moved, short, total, approached, sector}` - see [the outcomes](#post-shipsnametransfer) |
+
+Works offline, from the database copy.
+
+## POST /ships/{name}/automation
+
+The ship's standing orders: what it does by itself, without a plan, while its sector is
+loaded.
+
+| order | what it does |
+|---|---|
+| `enemies` | turns aggressive while enemies are in the sector, until it has been clear for five seconds |
+| `loot` | sends every squad for loot in the sector, then waits for the fighters to land. Needs fighters aboard; cargo drops only count with a transporter block and Transporter Software (rare or better). Never under fire. Loot that could not all be taken (a stall, fighters that would not launch) is left alone in that sector for two minutes |
+
+Each has a `mode`:
+
+| mode | when it may take the ship |
+|---|---|
+| `idle` | only while the ship has no orders (the default) |
+| `interrupt` | whatever it is doing. The chain is put aside whole and put back afterwards, at the order it was on; loops keep their indices |
+
+A fight that leaves loot goes on to the loot when the loot order applies to what the ship was
+doing: always if it was idle, only in `interrupt` mode if a chain is waiting. Enemies arriving
+while the fighters are out are fought.
+
+Both need a captain, as vanilla requires for any order; a ship somebody is flying is left to
+them. While a plan runs, the plan's own `onEnemies` and `collectLoot` govern, and the standing
+orders wait. A planned route, which has no loot setting of its own, collects loot after its
+fights when the loot order is on in `interrupt` mode. Sending orders or a plan while a standing
+order holds the ship ends it, and the chain it put aside is not put back. Switching an order
+off while it holds the ship ends it and puts the chain back.
+
+```jsonc
+{
+  "standing": {
+    "enemies": {"enabled": true, "mode": "interrupt"},
+    "loot": {"enabled": true}
+  },
+  "attackCivilians": false
+}
+```
+
+Every part is optional: an order or field left out stays as the ship has it. `attackCivilians`
+decides whether civilian ships count as enemies, for the standing orders and the ship's enemy
+check alike. `autoAggressive` is the older name for `standing.enemies.enabled` and is still
+accepted; sending both with different values is `400 conflicting_settings`.
+
+The settings are saved on the ship and survive restarts; a ship saved with `autoAggressive`
+on comes back with the `enemies` order in `idle` mode. The answer is held until the ship
+reports the new settings, as for routes. It gives the ship no order, so only the world checks
+apply, not the captain ones.
+
+Errors: `400 no_settings`, `400 bad_setting`, `400 bad_standing` (not an object, an unknown
+order - `details.known` lists them - or an order that sets nothing), `400 bad_standing_mode`,
+`400 conflicting_settings`.
+
+**Requires the owning player to be logged in.**
+
+## POST /ships/{name}/automation/stop
+
+Ends the ship's plan, a standing order holding the ship, or a cargo transfer on its way to its
+target, and clears its order chain. The standing orders are settings and stay as they were.
+Answered once the ship reports it has none of them.
+
+**Requires the owning player to be logged in.**
+
+## GET /ships/{name}/transfer
+
+The craft's hold, and every other craft of yours and of your alliance with theirs: what a
+[transfer](#post-shipsnametransfer) could move, and where to. Alliance craft are listed only
+when your rank has ManageShips. Read from the ship database, so it works offline - and for a
+craft in a loaded sector, the hold can trail the craft by a moment.
+
+| query | notes |
+|---|---|
+| `sameSector` | `true` lists only craft in the same sector, the ones a transfer can reach now |
+
+```json
+{
+  "ship": {
+    "name": "Ore Hound", "type": "Ship", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+    "position": {"x": 12, "y": -4}, "sector": {"x": 12, "y": -4},
+    "availability": "Available", "captain": true,
+    "cargo": {"capacity": 500, "free": 180, "used": 320,
+              "goods": [{"name": "Iron", "amount": 300, "size": 1, "price": 10, "stolen": false, "...": "..."}]}
+  },
+  "targets": [
+    {"name": "Rusty Refinery", "type": "Station", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+     "position": {"x": 12, "y": -4}, "availability": "Available", "sameSector": true,
+     "cargo": {"capacity": 12000, "free": 5000, "used": 7000, "goods": ["..."]}}
+  ],
+  "count": 1
+}
+```
+
+Targets in the same sector come first, then the rest by name.
+
+## POST /ships/{name}/transfer
+
+Moves goods between the craft and another of yours or of your alliance in the same sector,
+as the game's own transfer window does.
+
+```jsonc
+{
+  "target": "Rusty Refinery",
+  "targetOwner": "player",          // optional: player or alliance, when both own a craft of that name
+  "direction": "give",              // give: into the target (default), take: out of it
+  "goods": [
+    {"name": "Iron", "amount": 120},  // amount left out (or null): all of that good
+    {"name": "Iron", "stolen": true}  // stolen: true only stolen ones, false only clean ones
+  ],
+  "approach": true                  // default true; see below
+}
+```
+
+`"all": true` instead of `goods` moves the whole hold, whatever it holds when the ship gets to
+it. A good named without `stolen` takes the clean ones first. What does not fit in the
+receiving hold stays where it is and is reported; nothing is lost.
+
+The transfer is carried out by the ship, which reads both holds as they really are - the
+request is not checked against the database's copy of either. Vanilla's rule decides whether
+the two are in reach: their nearest points at most 20 apart, or as far as the longer
+transporter reaches. Out of reach, with `approach`:
+
+- a **station** is docked with, with the game's own dock order;
+- a **ship** is flown to, until the two are in reach;
+
+and the goods move the moment they are, which the ship reports in its automation state. An
+approach is an order: it needs a captain and nobody at the controls, it ends a route, farm or
+standing order holding the ship, and it gives up after five minutes. Orders given to the ship
+meanwhile end it, as does [stop](#post-shipsnameautomationstop). A transfer in reach touches
+nothing the ship is doing, and needs no captain.
+
+A **station** in the path is served by the ship at the other end, the other way round: a
+station that gives is a ship that takes. The ship is then the one that has to be orderable,
+and its event feed is where the transfer is reported (`carriedOutBy`). Two stations cannot
+transfer between themselves.
+
+The answer is held until the ship reports the transfer done, refused, or under way:
+
+```json
+{
+  "ship": "Ore Hound", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "target": {"name": "Rusty Refinery", "owner": {"kind": "player", "index": 1, "name": "Rusty"}},
+  "sector": {"x": 12, "y": -4}, "transferId": "t3-8120",
+  "direction": "give", "all": false, "goods": [{"name": "Iron", "amount": 120}], "approach": true,
+  "summary": "give 120 Iron to Rusty Refinery",
+  "carriedOutBy": {"name": "Ore Hound", "owner": {"kind": "player", "index": 1, "name": "Rusty"}},
+  "confirmed": true, "done": true,
+  "result": {"id": "t3-8120", "outcome": "done", "total": 120, "approached": false,
+             "moved": [{"name": "Iron", "amount": 120}], "target": "Rusty Refinery", "direction": "give"}
+}
+```
+
+| field | notes |
+|---|---|
+| `done` | `true` with `result` once it is over; `false` with `phase` (`docking`, `approaching`) while the ship gets in reach |
+| `result.outcome` | `done`, `partial` (some moved, see `short`), `nothing_moved`, `refused`; later, in the automation state, also `replaced` and `stopped` |
+| `result.moved` | `[{name, amount, stolen?}]` per kind of good moved |
+| `result.short` | `[{name, wanted, moved, reason}]` for what was not: `not_held`, `no_space`, `not_enough`; with `all`, `[{reason: "no_space"}]` |
+| `result.reason` | why it was refused or given up: `target_not_here`, `target_gone`, `same_craft`, `not_permitted`, `out_of_range`, `needs_captain`, `piloted`, `timeout`, `no_goods`; `empty_hold` when `all` found nothing |
+
+Refused by the ship, the answer is `422` with `error.code` set to the reason. Errors checked
+before anything is sent: `400 no_target`, `400 no_goods`, `400 bad_goods`, `400 bad_direction`,
+`400 conflicting_goods`, `400 bad_approach`, `400 bad_target_owner`, `404 no_such_target`,
+`403 missing_privilege` (either craft is the alliance's, and your rank lacks ManageShips),
+`409 target_in_background`, `422 same_craft`, `422 not_same_sector` (`details` has both
+sectors), `422 no_ship`, and the world checks every order has: `409 owner_offline`,
+`409 ship_in_background`, `409 sector_not_loaded`. A `202` means the ship did not report
+back in time, as for [orders](#post-shipsnameorders).
 
 **Requires the owning player to be logged in.**
 
@@ -711,25 +1509,41 @@ losses and everything the owner spent it on; the two are not meant to reconcile.
 
 ## GET /galaxy/route
 
-Runs the game's own `calculateJumpPath`, the same pathfinder the travel analysis uses.
+Plans a route without sending anything. With no preferences this runs the game's own
+`calculateJumpPath`, the same pathfinder the travel analysis uses; with any of them it runs
+this mod's planner, which is what [`POST /ships/{name}/route`](#post-shipsnameroute) flies.
 
 | query | notes |
 |---|---|
 | `ship` | take origin, jump range and rift capability from a ship |
 | `fromX`, `fromY`, `range`, `rifts` | or give them explicitly |
 | `toX`, `toY` | required |
+| `preferGates`, `avoidRifts`, `preferUncontrolled` | `true`/`false`; giving any of them selects the mod's planner |
 
 ```json
 {
   "from": {"x": 0, "y": 0}, "to": {"x": 60, "y": 0},
   "reachable": true, "jumps": 12, "distance": 60.0,
   "route": [{"x": 0, "y": 0}, "..."],
-  "jumpRange": 5.0, "canPassRifts": false
+  "jumpRange": 5.0, "canPassRifts": false, "planner": "engine"
 }
 ```
 
 `reachable` is false when the pathfinder stopped short of the destination - check it rather
 than assuming the last sector in `route` is where you asked to go.
+
+The mod's planner (`"planner": "automation"`) answers in the same shape and adds `hops` - each
+with `kind` (`jump`, `gate`, `wormhole`), `distance`, `controlled` (faction space) and `rift` -
+along with `gates`, `controlledSectors`, `preferences`, and `reason` when unreachable. It
+works from the same facts the engine does: jump range, rift geometry, the barrier, and the
+gates and wormholes the player or their alliance know about. It is not an exhaustive search:
+each step considers a fixed set of directions at full and two-thirds range rather than every
+sector in reach, which keeps it affordable at long jump ranges and costs little in route
+length. Crossing the barrier is only planned for ships that can pass rifts. Every jump is
+re-checked against the engine when the ship takes the route up.
+
+It is sliced across server ticks (`Config.routePlanStepsPerTick`) and gives up after
+`Config.routePlanMaxExpansions` sectors, answering unreachable with `reason: "search_limit"`.
 
 Explicitly expensive and rate limited to one call every two seconds per player;
 `429 route_busy` otherwise.
@@ -934,6 +1748,8 @@ written only when a craft changes sector, so a parked fleet costs nothing.
 | `GET /ships/{name}/events` | the mod's own order and status events, kept past the 200 and past a restart |
 | `GET /stations` | each station's running earnings totals and its stock per good, as a **sample** |
 | `GET /economy` | the faction's money and resources, likewise |
+| `GET /ships/{name}` | the craft's hold, captain and passengers, as a **manifest** - the latest only |
+| `GET /ping` | which player the key belongs to, and which alliance they are in |
 | `GET /economy/events`, `GET /stations/{name}/events` | the stations' recorded trades, production windows and catch-ups, as **station events** |
 
 Positions come from the ship database, which the mod reads **with every player logged out**,
@@ -971,14 +1787,49 @@ timeline, not one crowded second.
 
 ## Storage and privacy
 
-The store is keyed by a SHA-256 of the API key and never holds the key itself. That has two
-consequences worth stating:
+**A row belongs to the faction that owns the craft** - the player, or their alliance - as the
+mod reported it in the answer being recorded, not to the key that relayed it. So an
+alliance's fleet has one history however many members are polling it, and a player with two
+keys has one history rather than two.
 
-- An unknown key reads an **empty** history rather than anyone else's, which is why these
-  routes need no key check of their own.
-- Nothing is ever written except off the back of a call the mod itself answered 2xx, which
-  is the real authentication. A caller who cannot get a 200 out of the mod cannot make the
-  store exist.
+What a key may read:
+
+- **its player's rows**, always;
+- **its alliance's rows**, only while the mod has confirmed the membership within
+  `HISTORY_VERIFY_TTL` seconds (default 300). A read that finds the confirmation older than
+  that relays a `GET /ping` for the key through the transport first. If that cannot be done -
+  the game server is down - the read gets the player's rows and no alliance rows. A player
+  who left the alliance still has a working key, so an old confirmation is not good enough;
+- **rows recorded before rows had owners**, until they are adopted - see below.
+
+A key the mod refuses (`401`) reads nothing. Nothing is ever written except off the back of a
+call the mod itself answered 2xx, and a row's owner comes out of that answer rather than out
+of anything the caller sent. The store keeps a SHA-256 of each key and never the key itself.
+
+### Upgrading from per-key history
+
+A bridge from before faction ownership kept every row against the key that recorded it. The
+schema migrates on first connection and each key goes on reading exactly what it recorded.
+The first time the mod vouches for that key again - a relayed `/ping`, which the console makes
+on connecting and the poller makes every pass, or the check a `/history` read makes - its rows
+move onto their owners: player craft to the player, alliance craft to the alliance the player
+is in now. A visit another member already contributed for the same stay is widened rather than
+duplicated, and an event both collected is kept once.
+
+A player in no alliance at that moment keeps their old alliance rows private to the key,
+rather than carrying them into whichever alliance they join next.
+
+Station events came after rows had owners and have nothing to adopt: each is stored under
+the faction that owns the station, as the feed names it, and an alliance event whose feed
+does not say which alliance is dropped rather than guessed at. The mod numbers the feed once
+per server run, so the same event collected by two members is stored once. Only the
+collector's position in the feed is kept per key, since a key's feed covers its player and
+alliance together. Clearing history takes the player's station events and leaves that
+position where it is, so what was just cleared is not collected again.
+
+A database built by the first, unmerged cut of station recording also reads as version 3,
+without the ownership step. The migration tells it apart, drops the two station tables it
+made, which name no owner, and runs the ownership step before creating them again.
 
 It lives in Postgres, in the `history` Docker volume. `HISTORY_DB_HOST=""` turns the whole
 thing off and every route below answers `404 history_disabled`; `HISTORY_DAYS` (default 30)
@@ -994,13 +1845,18 @@ What is on disk, per craft.
 ```json
 {
   "ships": [
-    {"name": "Ore Hound", "visits": 41, "events": 190, "samples": 0, "sectors": 12,
-     "first": 1757630000, "last": 1757719400}
+    {"name": "Ore Hound", "owner": "player", "visits": 41, "events": 190, "samples": 0,
+     "sectors": 12, "first": 1757630000, "last": 1757719400}
   ],
   "rows": 231, "retentionDays": 30, "recording": true,
+  "scope": {"player": {"index": 1, "name": "..."}, "alliance": {"index": 77, "name": "..."},
+            "verified": true},
   "economy": {"samples": 560, "stations": 2, "since": 1757630100, "interval": 300}
 }
 ```
+
+`scope` is whose history the answer covers. `alliance` is `null` for a player in no alliance,
+and also when the membership could not be confirmed just now - `verified` is `false` then.
 
 `economy` says whether there is a station series at all, which is what tells a client to
 offer the view rather than draw an empty chart - a deployment upgraded mid-month has travel
@@ -1219,10 +2075,37 @@ the same filters as above, plus `kind` - `trade`, `production` or `catchup`.
 ]}
 ```
 
+## GET /history/manifests
+
+The last hold and crew list the bridge relayed for each craft, newest first. One per craft,
+replaced whenever anyone reads `GET /ships/{name}` - not a series.
+
+| query | notes |
+|---|---|
+| `ship` | one craft by name |
+| `owner` | `player` or `alliance` |
+| `from` | Unix seconds; only manifests read since |
+
+```json
+{"manifests": [
+  {"ship": "Ore Hound", "owner": "player", "at": 1757719400,
+   "cargo": {"capacity": 6000, "free": 1100, "used": 4900, "goods": [{"name": "Iron Ore", "amount": 2400}]},
+   "captain": {"name": "Vex", "...": "..."}, "passengers": []}
+]}
+```
+
+`cargo`, `captain` and `passengers` are exactly as `GET /ships/{name}` returned them. `at` is
+when that was, and judging it is up to the caller: the console searches stored manifests
+straight away and re-reads any older than two minutes live.
+
 ## POST /history/clear
 
-Drops everything stored for this key, or one craft's share of it with `?ship=`.
+Drops this player's own history, or one craft's share of it with `?ship=`. That is the
+player's rows under every one of their keys.
 
 ```json
 {"cleared": true, "ship": "Ore Hound", "removed": 231}
 ```
+
+Alliance history is never cleared: it belongs to every member, and the bridge cannot ask the
+game which of them may delete it. `?owner=alliance` answers `403 history_shared`.

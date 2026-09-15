@@ -140,6 +140,83 @@ local _, explicit = call("POST", "/ships/Prospector/missions/mine/preview",
                          {area = {lower = {x = 0, y = 0}, upper = {x = 14, y = 14}}})
 check(explicit.area.lower.x == 0 and explicit.area.upper.x == 14, "an explicit area is used as given")
 
+-- #### TRADE ROUTES #### --
+
+print("\ntrade routes")
+
+-- What TradeCommand:onAreaAnalysisFinished leaves behind: up to four routes, best first.
+local tradeAnalysis =
+{
+    sectors = 289, reachable = 280, unreachable = 9,
+    sectorsByFaction = {[0] = 120}, reachableCoordinates = {}, biggestFactionInArea = 0,
+    routes =
+    {
+        {name = "Oil", lowest = -0.2, highest = 0.15, profit = 112, profitPerSize = 56,
+         from = {x = -310, y = 318}, to = {x = -300, y = 322}},
+        {name = "Ore", lowest = -0.1, highest = 0.2, profit = 9, profitPerSize = 9,
+         from = {x = -312, y = 320}, to = {x = -305, y = 311}},
+    },
+}
+
+-- Stands in for TradeCommand:calculatePrediction: 400 Oil or 1000 Ore on offer, 20% more
+-- per unit than the analysis figure after perks, and the deposit caps a flight's load.
+Mock.predictionFor = function(config)
+    local prediction = {attackChance = {value = 0.05}, flightTime = {value = 1200},
+                        flights = {from = 0, to = 0}, profitPerFlight = {from = 0, to = 0},
+                        maxAvailable = {value = 0}, transportedPerFlight = 0}
+
+    local route
+    for _, r in ipairs(tradeAnalysis.routes) do
+        if r.name == config.goodName then route = r end
+    end
+    if not route then prediction.error = "No route selected."; return prediction end
+
+    local good = goods[route.name]
+    local available = route.name == "Oil" and 400 or 1000
+    local buyPrice = math.floor(good.price * (1 + route.lowest))
+    local perFlight = math.min(math.floor(768 / good.size), math.floor(config.deposit / buyPrice),
+                               available)
+    if perFlight == 0 then prediction.error = "Not enough cargo space!"; return prediction end
+
+    prediction.maxAvailable.value = available
+    prediction.transportedPerFlight = perFlight
+    prediction.flights = {from = math.ceil(available / perFlight), to = math.ceil(available / perFlight)}
+    prediction.profitPerFlight = {from = 0, to = perFlight * route.profit * 1.2}
+    return prediction
+end
+
+local function callWith(results, method, path, body)
+    local read = send(method, path, body)
+    Mock.flushAsync(results)
+    Bridge.update(Config.pollInterval)
+    return read()
+end
+
+local status, trade = callWith(tradeAnalysis, "POST", "/ships/Prospector/missions/trade/preview", {})
+check(status == 200, "a trade preview with no route chosen still answers")
+check(trade.canStart == false, "and cannot start without a route")
+check(Json.isArray(trade.routes) and #trade.routes == 2, "every route the analysis found is listed")
+
+local oil = trade.routes[1]
+check(oil.good == "Oil" and oil.margin == 0.35, "a route carries its good and price margin")
+check(oil.from.x == -310 and oil.to.y == 322, "and where it buys and sells")
+check(oil.maxAvailable == 400 and oil.perFlight == 384, "predicted at the cargo bay's limit")
+check(oil.flights.to == 2, "which sets the number of flights")
+check(oil.deposit == 384 * 256, "the deposit is the order window's slider maximum")
+check(oil.contractProfit.to == math.floor(400 * 112 * 1.2),
+      "the contract's profit is every unit on offer at the perk-adjusted margin")
+check(oil.selected == false, "nothing is selected until goodName says so")
+
+local _, chosen = callWith(tradeAnalysis, "POST", "/ships/Prospector/missions/trade/preview",
+                           {config = {goodName = "Ore", deposit = oil.deposit}})
+check(chosen.routes[2].selected == true and chosen.routes[1].selected == false,
+      "goodName marks the chosen route")
+
+local _, plain = call("POST", "/ships/Prospector/missions/mine/preview", {})
+check(plain.routes == nil, "other missions carry no routes")
+
+Mock.predictionFor = nil
+
 -- #### VALIDATION #### --
 
 print("\nvalidation gating")
@@ -223,6 +300,11 @@ for _, c in ipairs(Mock.simulationCalls) do
 end
 check(commandCall ~= nil and commandCall.args[1] == "Prospector",
       "startCommand was issued for the right ship")
+-- The job crosses to the agent as JSON, which turns every table key into a string, and
+-- MineCommand indexes its material selection by number. Selected "0" is selected nothing.
+check(commandCall ~= nil and commandCall.args[3].collected[0] == true
+      and commandCall.args[3].collected["0"] == nil,
+      "the material selection reaches startCommand keyed by number")
 
 -- startCommand reports failure only by chat message, so the mod must verify afterwards
 Mock.addShip(1, "Stubborn", {x = 0, y = 0, refuseStart = true,
@@ -236,6 +318,61 @@ local status, refused = read()
 check(status == 422 and refused.started == false,
       "a silently refused start is detected and reported")
 check(refused.error.code == "start_rejected", "with a specific code")
+
+-- #### ALLIANCE START #### --
+
+print("\nalliance start")
+
+-- An alliance's Simulation lives on the alliance's own thread: a player script calling it
+-- gets result code 7 for everything. So the same agent script is attached to the alliance
+-- too - its own instance, as the engine gives every attached script its own state - and
+-- the bridge hands alliance simulation jobs to that one only.
+dofile("data/scripts/player/automationapi/agent.lua")
+local AllianceAgent = AutomationApiAgent
+
+local privileges = {[AlliancePrivilege.ManageShips] = true}
+Mock.addAlliance(77, "Rusty Industries", 1, privileges)
+Mock.addShip(77, "Alliance Miner", {x = 0, y = 0,
+                                    captain = {name = "Vex", level = 3, tier = 3, primaryClass = 4}})
+
+local function allianceTick(seconds)
+    Mock.advanceClock(seconds)
+    Mock.asPlayerAgent(1, function() Agent.update(seconds) end)
+    Mock.asAllianceAgent(77, function() AllianceAgent.update(seconds) end)
+    Bridge.update(seconds)
+end
+
+Mock.simulationCalls = {}
+local read = send("POST", "/ships/Alliance Miner/missions/mine/start", {}, {owner = "alliance"})
+Mock.flushAsync()
+Bridge.update(Config.pollInterval)
+
+-- the player agent alone must leave it alone: from there every call would come back 7
+tick(0.3)
+check(#Mock.simulationCalls == 0, "the player agent does not claim alliance simulation jobs")
+
+for _ = 1, 6 do allianceTick(0.6) end
+
+local status, allianceStarted = read()
+check(status == 200 and allianceStarted.started == true,
+      "the alliance's own agent starts the mission (got " .. tostring(status) .. ")")
+check(Mock.simulationCalls[1] and Mock.simulationCalls[1].fn == "startAreaAnalysis",
+      "and ran the analysis on the alliance's simulation")
+
+local read = send("GET", "/ships/Alliance Miner/mission", nil, {owner = "alliance"})
+for _ = 1, 2 do allianceTick(0.3) end
+local status = read()
+check(status == 200, "status of an alliance mission is readable (got " .. tostring(status) .. ")")
+
+-- Simulation only checks ManageShips against callingPlayer, which a call on the alliance's
+-- own thread does not have, so the agent checks it on the caller's behalf.
+privileges[AlliancePrivilege.ManageShips] = false
+local read = send("POST", "/ships/Alliance Miner/mission/recall", {}, {owner = "alliance"})
+for _ = 1, 2 do allianceTick(0.3) end
+local status, denied = read()
+check(status == 403 and denied.error.code == "missing_privilege",
+      "a member without ManageShips cannot recall alliance craft (got " .. tostring(status) .. ")")
+privileges[AlliancePrivilege.ManageShips] = true
 
 -- #### OFFLINE #### --
 

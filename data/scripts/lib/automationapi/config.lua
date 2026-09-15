@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.4.0"
+Config.version = "0.5.3"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -76,6 +76,17 @@ Config.scanDetailsPerTick = 40
 -- runs on the server tick.
 Config.routeCooldown = 2
 
+-- The route planner behind POST /ships/{name}/route and the preference options on
+-- GET /galaxy/route. It is this mod's own search rather than calculateJumpPath, which
+-- takes no preferences, so it is sliced across ticks like a map scan. A step is one
+-- candidate hop considered - one rift check and one controlling-faction lookup at most.
+Config.routePlanStepsPerTick = 1500
+-- Sectors expanded before the planner gives up and reports the destination unreachable.
+Config.routePlanMaxExpansions = 6000
+-- Directions sampled around each sector. More finds tighter routes around rifts, at a
+-- proportional cost per expansion.
+Config.routePlanDirections = 36
+
 -- How long POST /ships/{name}/orders waits for the ship's order chain to change before
 -- answering unconfirmed. Dispatch is one tick delayed and the chain publishes back on the
 -- tick after that, so this only has to cover a couple of ticks plus slack.
@@ -86,6 +97,66 @@ Config.orderConfirmWindow = 3
 Config.shipEventsPerShip = 200
 Config.maxShipEventsPerRead = 200
 
+-- #### MISSION AUTOMATION #### --
+
+-- How often the automation looks over its rules, in seconds. A look is cheap - a few
+-- availability reads per rule - and nothing happens to an idle ship until one runs, so this
+-- is the longest a ship back from a mission waits before being sent out again.
+Config.missionAutomationInterval = 10
+
+-- How long a ship waits before trying again after a check found nothing inside its limits,
+-- or the game refused the start. Most of what blocks a dispatch - the ambush chance, the
+-- money on hand, a trade route the last contract depleted - changes over minutes, not
+-- seconds, and every retry spends one of the server's area analyses.
+Config.missionAutomationRetry = 300
+
+-- The same, for a ship that could not be looked at at all: owner offline, ship busy, an
+-- analysis slot not free. Nothing about the rule failed, so it is checked again soon.
+Config.missionAutomationRecheck = 30
+
+-- Recent decisions kept per rule, for the console to show why a ship did or did not go.
+Config.missionAutomationLogSize = 20
+
+-- Candidates reported back per evaluation. All are checked; only the best are listed.
+Config.missionAutomationReportedCandidates = 8
+
+-- Server value keys the rules are stored under, one per owning faction. On the Server
+-- rather than the faction so the galaxy script reads them without touching a Player or
+-- Alliance object, and so every member of an alliance reads the same copy.
+Config.missionAutomationValuePrefix = "automationapi_missionauto_"
+Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
+
+-- Server value key prefix of the mission library, one document per owning faction: named
+-- rules that programs' mission steps fly.
+Config.missionLibraryValuePrefix = "automationapi_missionlib_"
+
+-- #### ORDER PROGRAMS #### --
+
+-- How often the program runner looks at each running program, in seconds. A look reads the
+-- ship database row and the ship's last reported state, both in memory or cheap.
+Config.programInterval = 2
+
+-- How long a step whose action was refused (owner offline, sector not loaded, nothing inside
+-- a mission rule's limits) waits before it is tried again.
+Config.programRetry = 60
+
+-- A dispatched action that has not answered in this long is given up on and retried. Longer
+-- than requestTimeout, since a route plan is searched before it is sent.
+Config.programDispatchTimeout = 60
+
+-- An orders step's chain counts as run out only after this long, so the chain it replaced -
+-- empty for a moment while the new one goes on - is not mistaken for the end of the new one.
+Config.programOrdersGrace = 5
+
+-- Recent decisions kept per program.
+Config.programLogSize = 30
+
+-- Server value keys: programs, one document per owning faction, the index of factions with
+-- any, and where each running program has got to, kept apart so a step moving on does not
+-- rewrite (and re-revision) the program itself.
+Config.programValuePrefix = "automationapi_program_"
+Config.programIndexValue = "automationapi_program_factions"
+Config.programCursorPrefix = "automationapi_programcursor_"
 -- Station activity feed, one ring buffer per owning faction. Stations push trades as they
 -- happen and a production window a minute per factory, so this has to hold what a busy
 -- industry generates between two polls of the bridge's collector - a few hundred events on

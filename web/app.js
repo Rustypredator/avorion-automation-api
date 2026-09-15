@@ -19,12 +19,13 @@
     filters: 'avoconsole.filters',
     dock: 'avoconsole.dock',
     history: 'avoconsole.history',
+    notify: 'avoconsole.notify',
     basis: 'avoconsole.basis'
   };
 
   /* Intervals, in seconds. The mod refreshes mission progress text once a minute and
      pushes events as they happen, so polling faster buys nothing but queue depth. */
-  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60 };
+  var EVERY = { fleet: 10, events: 4, mission: 20, detail: 45, history: 60, automations: 10 };
 
   var S = {
     connected: false,
@@ -48,9 +49,26 @@
     catalog: null,
     missionForm: null,
 
+    /* Mission automation, off /automation/missions. The rules and their live state belong
+       to the mod; `autoForm` is the editor open for the selected craft, `autoDry` a
+       "check now" run against its stored rule. */
+    automations: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
+    autoForm: null,
+    autoDry: null,
+
     events: [],
     eventKeys: {},
     cursors: {},        // ship name -> highest seq seen for that ship
+    swept: {},          // ship name -> true once its first sweep set the baseline
+    autoSeen: {},       // ship name -> the last automation state seen, for notifications
+    expectEnd: {},      // ship name -> true while a stop sent from here is on its way
+    standingSaving: null, // ship name whose standing orders are being saved
+    autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
+    /* Order programs, off /automation/programs, shaped like `automations`. `progForm` is the
+       program editor open for the selected craft. */
+    programs: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
+    library: { byKind: { player: [], alliance: [] }, loaded: false, error: null },
+    progForm: null,
     recording: {},      // ship name -> boolean
     traffic: [],
 
@@ -60,7 +78,15 @@
     follow: true,
 
     galaxy: null,
-    lastRoute: null,
+
+    /* The Travel tab. Preferences and enemy handling stick across craft, since they
+       describe how the player likes to fly; results and the automation read do not. */
+    nav: {
+      preferGates: false, avoidRifts: false, preferUncontrolled: false,
+      onEnemies: 'fight', attackCivilians: false, boss: 'auto',
+      collectLoot: true, cooldownMinutes: 30,
+      result: null, farm: null, automation: null, automationError: null
+    },
 
     /* The bridge's own history store. Separate from S.events, which is the mod's
        in-memory ring buffer read live: the two overlap but neither contains the other. */
@@ -83,6 +109,14 @@
                 basis: 'observed' },
 
     orderRows: [{ type: 'jump', x: 0, y: 0 }],
+
+    /* Cargo transfers. `transferData` is GET /ships/{name}/transfer per craft - its own hold
+       and every craft it could transfer with, each with theirs - which the Orders tab and
+       the program editor both pick goods from. `transfer` is the Orders tab's form. */
+    transferData: {},
+    transfer: { ship: null, target: '', direction: 'give', all: false, picks: {}, approach: true,
+                sending: false, result: null },
+
     busy: {}
   };
 
@@ -226,6 +260,103 @@
     }, kind === 'bad' ? 9000 : 4500);
   }
 
+  /* Browser notifications, for what happens while nobody is watching the page: a boss
+     turning up, a cooldown running out, a plan ending. Everything notified is toasted as
+     well; the system notification is added only while the page is hidden or unfocused,
+     since a toast is already in front of anyone looking at it.
+
+     Background tabs get their timers throttled (Chrome to once a minute after a while), so
+     a notification can trail the event by up to that much. */
+  function notifySupported() { return typeof window.Notification === 'function'; }
+
+  function notifyEnabled() {
+    return notifySupported() && window.Notification.permission === 'granted'
+      && localStorage.getItem(LS.notify) !== 'off';
+  }
+
+  function renderNotifyToggle() {
+    var button = $('#notify-toggle');
+    if (!button) { return; }
+
+    if (!notifySupported()) {
+      button.disabled = true;
+      button.title = 'This browser offers no notifications';
+      return;
+    }
+
+    var permission = window.Notification.permission;
+    var on = notifyEnabled();
+    button.innerHTML = on ? '&#128276;' : '&#128277;';
+    button.classList.toggle('primary', permission === 'default');
+    button.title = permission === 'denied'
+      ? 'Notifications are blocked for this page; allow them in the browser\'s site settings'
+      : permission === 'default'
+        ? 'Allow notifications for bosses, cooldowns and ended plans'
+        : on ? 'Notifications on — click to mute' : 'Notifications muted — click to turn on';
+  }
+
+  /* Browsers only show the permission prompt from a click, so this is called from the
+     toggle and from buttons that start something worth being told about. */
+  function requestNotify() {
+    if (!notifySupported() || window.Notification.permission !== 'default') {
+      return Promise.resolve();
+    }
+
+    var asked;
+    try {
+      // older Safari takes a callback and returns nothing
+      asked = window.Notification.requestPermission(renderNotifyToggle);
+    } catch (e) {
+      asked = null;
+    }
+
+    return Promise.resolve(asked).then(function () {
+      renderNotifyToggle();
+      if (window.Notification.permission === 'granted') {
+        toast('good', 'Notifications on', 'Bosses, cooldowns and ended plans reach you with the page in the background.');
+      }
+    }, renderNotifyToggle);
+  }
+
+  function toggleNotify() {
+    if (!notifySupported()) { return; }
+
+    var permission = window.Notification.permission;
+    if (permission === 'default') { requestNotify(); return; }
+    if (permission === 'denied') {
+      toast('warn', 'Notifications blocked', 'Allow them for this page in the browser\'s site settings.');
+      return;
+    }
+
+    localStorage.setItem(LS.notify, notifyEnabled() ? 'off' : 'on');
+    renderNotifyToggle();
+  }
+
+  function notify(kind, title, text, ship) {
+    toast(kind, title, text);
+
+    if (!notifyEnabled()) { return; }
+    if (!document.hidden && (!document.hasFocus || document.hasFocus())) { return; }
+
+    try {
+      var note = new window.Notification(title, {
+        body: text || '',
+        // a newer notice about the same ship and subject replaces the older one
+        tag: ship ? 'avo:' + ship + ':' + title : undefined
+      });
+      note.onclick = function () {
+        window.focus();
+        if (ship && S.byName[ship]) {
+          if (S.selected !== ship) { select(ship); }
+          showSub('travel');
+        }
+        note.close();
+      };
+    } catch (e) {
+      // Chrome on Android only notifies through a service worker; the toast stands
+    }
+  }
+
   function apiFailed(error, what) {
     var detail = error.status ? (error.status + ' ' + error.code) : error.code;
     toast('bad', what || 'Request failed', detail + ' — ' + error.message);
@@ -306,6 +437,18 @@
     'one-shot':
       'Each of these is an engine wrapper that clears the chain, adds one order and runs '
       + 'it, so it cannot be combined with anything. Mine and salvage need a captain.',
+
+    'cargo-transfer':
+      '<p>Moves goods between this craft and another of yours or your alliance\'s in the same '
+      + 'sector, as the game\'s own transfer window does. <b>Give</b> fills the other hold, '
+      + '<b>take</b> empties it into this one. What fits is moved; the rest stays and is reported.</p>'
+      + '<p>The craft have to be within 20 of each other, or of the longer transporter\'s reach. '
+      + 'Further apart, <b>approach</b> sends the ship: it docks at a station, or flies alongside a '
+      + 'ship. That is an order, so it needs a captain and nobody at the controls, and it ends a '
+      + 'route or farm the ship was flying. In reach, the ship\'s orders are not touched.</p>'
+      + '<p>A station cannot fly: picked here, the ship at the other end carries the transfer out. '
+      + 'The holds shown are the ship database\'s, which can trail a loaded craft by a moment; '
+      + 'the ship moves what it really has.</p>',
 
     'log-not-recording':
       'No player whose agent watches this craft is online. A quiet log means nobody was '
@@ -394,6 +537,12 @@
       'The bridge builds the history out of the calls this console makes, so it fills in '
       + 'while a tab is open on it.',
 
+    'history-shared':
+      'Alliance craft are recorded once for the whole alliance, whichever member\'s '
+      + 'console or poller saw them, and every current member reads the same history. '
+      + 'Your own craft stay private to you. The bridge checks your membership with the '
+      + 'game every few minutes, so leaving the alliance takes its history with it.',
+
     'history-observed':
       'Only observed time is counted. The bridge records what it relays, so this is '
       + 'continuous if the poller service is running and otherwise covers only the '
@@ -415,15 +564,148 @@
       + 'a start runs &mdash; including the game\'s own calculatePrediction, the function '
       + 'behind the order window\'s yield and risk figures. It takes a second or two.',
 
+    'auto-overview':
+      '<p>The mod sends this craft back out on its own whenever it is free and the mission '
+      + 'stays inside the limits. It runs on the server: closing the console stops nothing, '
+      + 'but the owner &mdash; or, for alliance craft, any member &mdash; has to be logged '
+      + 'in for a start to go through, exactly as for a start by hand.</p>'
+      + '<p>Each check runs one area analysis, tries every way of flying the mission that '
+      + 'is worth trying against it, and sends the best one that passes. An alliance '
+      + 'craft&rsquo;s rule is shared: every member sees and edits the same one.</p>',
+
+    'program-overview':
+      '<p>A program works the craft through its steps by itself, each until its conditions '
+      + 'are met, then moves to the next step, to a step by number &mdash; which is how a '
+      + 'program loops &mdash; or stops. It runs on the server: closing the console stops '
+      + 'nothing, but every step that gives the ship an order needs the owner (or, for '
+      + 'alliance craft, a member) logged in, and in-sector steps need the sector loaded.</p>'
+      + '<p>A step without conditions ends with its action: a route when it arrives, orders '
+      + 'when the chain runs out, a mission when the craft is back, standing orders at once. '
+      + '<b>Repeat</b> starts the action again each time it ends until the conditions are '
+      + 'met &mdash; mission after mission until the hold is full. A route or farm still '
+      + 'flying when its step ends is stopped.</p>'
+      + '<p>Mission steps fly a mission from the library, or the craft&rsquo;s own mission rule, '
+      + 'under its limits; while a program runs, the rule does not send the craft out on its '
+      + 'own. Travel steps start a Travel mission, which crosses any distance without loading '
+      + 'sectors, and end when the craft arrives. Conditions read the ship '
+      + 'database and what the ship last reported, so cargo is as fresh as the game keeps '
+      + 'that row. A failed step is retried every minute.</p>',
+
+    'mission-library':
+      '<p>Missions kept under a name &mdash; &ldquo;Refine, safe&rdquo;, &ldquo;Mine 2h&rdquo; &mdash; '
+      + 'for programs to fly. A program&rsquo;s mission step picks one, and the mod loads it '
+      + 'when the step starts, so an edit here changes every program that flies it from its '
+      + 'next start on. Each is a mission rule without a craft: mission, area, config, '
+      + 'materials, escorts, what to optimise for and the limits.</p>'
+      + '<p>An area that follows the ship recentres on whichever craft flies it. Materials and '
+      + 'escorts are taken as they are named, so a mission with escorts only suits craft those '
+      + 'escorts can join. Your craft fly your library; alliance craft fly the alliance&rsquo;s, '
+      + 'which every member shares. A mission a program still flies cannot be deleted.</p>',
+
+    'auto-evaluation':
+      'Every option the check weighed, best first: everything inside the limits ahead of '
+      + 'everything outside them, then by what the rule optimises for. Mining and salvage '
+      + 'try each half hour of duration, expeditions each half hour, trade every route at '
+      + 'every flight count, each with the smallest deposit that achieves it. Yield for '
+      + 'mining is resource units; for trade, the credits the contract is expected to pay '
+      + 'allowing for the customer walking away.',
+
+    'auto-area':
+      'Following the ship recentres the area on wherever the craft is when it is checked, '
+      + 'at the same size &mdash; the right choice for trade, whose ship ends each contract '
+      + 'somewhere else. A fixed area always searches the same rectangle.',
+
+    'auto-objective':
+      '<b>Profit / hour</b> weighs yield against time away. <b>Total yield</b> takes the '
+      + 'biggest haul the limits allow. <b>Lowest ambush</b> takes the safest option that '
+      + 'still passes. Ties go to the safer option.',
+
+    'auto-patience':
+      'The captain&rsquo;s warnings about an impatient customer are about flights, not '
+      + 'time: past three, every flight can end the contract early. The deposit you spend '
+      + 'decides the flight count &mdash; more up front, fewer flights &mdash; but a large '
+      + 'deposit also raises the ambush chance, so max flights and max ambush chance pull '
+      + 'against each other and the check finds the deposit that satisfies both.',
+
+    'trade-scan':
+      'Previews the trade area with the ship in each corner, the middle of each side and '
+      + 'the centre, for every area shape the captain allows, and ranks every route found. '
+      + 'Each placement is its own area analysis, so a full scan takes a while. Nothing '
+      + 'is started; pick a row to load it into the form and preview it.',
+
+    'trade-routes':
+      'The routes the game offers for this area. Figures assume the full down payment the '
+      + 'order window allows &mdash; every unit on offer, in as few flights as the cargo '
+      + 'bay fits. Total profit is the contract&rsquo;s upper bound: each flight pays out '
+      + '90&ndash;100% of its figure.',
+
+    'trade-capital':
+      'The down payment the captain buys the goods with &mdash; the order window&rsquo;s '
+      + 'slider. It runs from a tenth of the carriable goods to all of them, at the purchase '
+      + 'price before perks, and the captain returns whatever is not spent. A smaller budget '
+      + 'buys less per flight, so the contract takes more flights; a bigger one raises the '
+      + 'attack chance, since the cargo is worth more.',
+
     'orders-unconfirmed':
       'Not proof of failure: a one-shot order that finishes instantly can land and clear '
       + 'again inside the window. The event log below shows what actually happened.',
 
-    'travel':
-      'A Travel captain mission under a shorter name &mdash; the same analysis, '
-      + 'prediction and start path &mdash; so the answer carries a real route prediction '
-      + 'rather than an acknowledgement. Prefer it to orders for anything that is not '
-      + 'tactical: it loads no sectors and works wherever the ship is.',
+    'nav-route':
+      'The route is planned by the mod, not the game\'s pathfinder, so it can prefer gates, '
+      + 'keep a rift-capable ship out of rifts and stay in no man\'s space. The ship flies it '
+      + 'as an ordinary order chain &mdash; the Orders tab and the map show the jumps. Its '
+      + 'sector has to be loaded, and it needs a captain or you at the controls.',
+
+    'nav-enemies':
+      '<p>The ship checks its sector every second while it flies a plan.</p>'
+      + '<p><b>fight</b> drops the route, fights until the sector has been clear for five '
+      + 'seconds, then picks the route up at the hop it was on. <b>hold</b> stays aggressive '
+      + 'where it is and ends the plan. <b>ignore</b> keeps jumping.</p>',
+
+    'nav-farm':
+      '<p>The game spawns a boss after ten consecutive jumps into <b>empty</b> sectors '
+      + '&mdash; no stations, no asteroid fields, no rift &mdash; in two rings: The AI between '
+      + '240 and 340 sectors from the core, Swoks between 350 and 430. Each jump also has a 4% '
+      + 'chance on its own.</p>'
+      + '<p>The counter belongs to the <b>player aboard</b>, not the ship, so this only works '
+      + 'while you are flying it; the loop stops if you leave. A jump into a sector with '
+      + 'stations resets the counter, which is why the loop only uses empty ones.</p>'
+      + '<p>The ship recognises the boss itself, and stays for it even before it turns '
+      + 'hostile. After a kill nothing spawns for <b>30 minutes</b>, for Swoks and the AI '
+      + 'alike, and jumps in that time do not count at all &mdash; so the loop sends the '
+      + 'fighters for the loot, then waits out the cooldown and resumes by itself. Set the '
+      + 'pause to 0 to keep jumping.</p>'
+      + '<p>The game keeps its timer in memory, so logging out or a server restart clears it. '
+      + 'The ship\'s wait survives both; after either, start the farm again to skip it.</p>',
+
+    'nav-loot':
+      '<p>After a fight the ship stays put and orders every squad to collect loot, until '
+      + 'nothing it can take is left, nothing has been picked up for 45 seconds, or five '
+      + 'minutes have passed. Then it calls the fighters back and waits for them to land '
+      + 'before it jumps.</p>'
+      + '<p>Money, resources, turrets and subsystems are picked up by any fighter. '
+      + '<b>Cargo</b> drops only count when the ship has a transporter block <b>and</b> '
+      + 'Transporter Software of rare or better installed permanently; with either alone '
+      + 'the fighters leave cargo where it is, so the ship does not wait for it.</p>',
+
+    'standing-orders':
+      '<p>Orders the ship keeps without being told again, carried out by the ship itself '
+      + 'while its sector is loaded. They are saved on the ship and survive restarts.</p>'
+      + '<p><b>Fight enemies</b> turns aggressive until the sector has been clear for five '
+      + 'seconds. <b>Collect loot</b> sends every squad for loot in the sector, then waits for '
+      + 'the fighters to land; it needs fighters aboard, and cargo drops also need a '
+      + 'transporter block and Transporter Software. Loot is never collected under fire, '
+      + 'and after a fight the loot comes next.</p>'
+      + '<p><b>only when idle</b> acts while the ship has no orders. <b>interrupt, then '
+      + 'resume</b> acts whatever the ship is doing and puts its order chain back afterwards, '
+      + 'at the order it was on.</p>'
+      + '<p>Either needs a captain; a ship you are flying is left to you. A planned route or '
+      + 'farm brings its own enemy handling from the Travel tab, and a route also collects '
+      + 'loot after a fight when <b>Collect loot</b> may interrupt.</p>',
+
+    'nav-state':
+      'What the ship last reported. Live while you are in game; otherwise the ship database\'s '
+      + 'copy, which is as fresh as the last save.',
 
     'connect-network':
       '<p>The browser reports no status for this, which means either the bridge is not '
@@ -691,9 +973,16 @@
         // A fresh session has no cursors, so the first sweep takes each ship's recent
         // history rather than only what happens from now on.
         S.cursors = {};
+        S.swept = {};
+        S.autoSeen = {};
         S.shipHistory = {};
+        // Holds are per key as much as history is - a different key may see different
+        // craft - and the bridge's stored manifests make starting over cheap.
+        S.cargoIndex = {};
+        manifestsAt = 0;
         startLoops();
         refreshFleet();
+        loadAutomations(true);
         loadGalaxy();
         loadHistory(true);
       })
@@ -721,6 +1010,7 @@
     setStatus(online ? 'on' : 'warn',
       esc(p.galaxy && p.galaxy.name || 'galaxy') + ' · '
       + esc(p.player && p.player.name || 'player ' + p.player.index)
+      + (p.player && p.player.alliance ? ' · ' + esc(p.player.alliance.name) : '')
       + (online ? '' : ' (offline)'),
       'mod ' + p.mod + ' · game ' + p.game + ' · api ' + p.api
       + ' · ' + p.server.players + ' players · up ' + duration(p.server.runtime));
@@ -771,6 +1061,9 @@
   function startLoops() {
     loop('fleet', EVERY.fleet, refreshFleet);
     loop('events', EVERY.events, sweepEvents);
+    loop('automations', EVERY.automations, loadAutomations);
+    loop('programs', EVERY.automations, loadPrograms);
+    loop('library', EVERY.automations, loadLibrary);
     loop('mission', EVERY.mission, function () {
       if (!S.selected) { return; }
       var ship = S.byName[S.selected];
@@ -837,6 +1130,15 @@
     $$('.view').forEach(function (v) { v.classList.toggle('active', v.id === 'view-' + name); });
     if (name === 'map') { setTimeout(GalaxyMap.resize, 0); }
     if (name === 'galaxy') { renderGalaxy(); }
+    if (name === 'automation') {
+      renderAutomationView();
+      if (S.connected) {
+        loadAutomations(true);
+        loadPrograms(true);
+        loadLibrary(true);
+        if (S.selected) { loadAutomation(); }
+      }
+    }
     if (name === 'industry') {
       renderIndustry();
       if (S.connected) { loadIndustry(true); }
@@ -849,6 +1151,8 @@
     $$('.subview').forEach(function (v) { v.classList.toggle('active', v.dataset.sub === name); });
 
     if (name === 'mission' && S.selected && !S.catalog) { loadCatalog(); }
+    if (name === 'travel' && S.selected) { renderTravel(); loadAutomation(); }
+    if (name === 'orders' && S.selected) { renderStanding(); loadAutomation(); loadTransfer(S.selected); }
     if (name === 'cargo') { renderCargo(); }
     if (name === 'loadout') { renderLoadout(); }
     if (name === 'log') { renderShipLog(); loadShipHistory(S.selected); }
@@ -909,6 +1213,7 @@
 
         S.fleetCount = body.count;
         renderFleet();
+        renderAutomationList();
         sweepCargo();
         GalaxyMap.setShips(S.ships);
 
@@ -941,7 +1246,20 @@
                coords(ship.position), ship.usable && ship.usable.code,
                ship.owner && ship.owner.name].join(' ').toLowerCase();
     if (hay.indexOf(S.search) !== -1) { return true; }
-    return cargoMatches(ship.name).length > 0;
+    return cargoMatches(ship.name).length > 0 || peopleMatches(ship.name).length > 0;
+  }
+
+  /* The captain and passengers aboard a craft that the search term names, off the same
+     per-craft index as the hold - it is the same detail read. */
+  function peopleMatches(name) {
+    if (!S.search) { return []; }
+
+    var entry = S.cargoIndex[name];
+    if (!entry || !entry.people) { return []; }
+
+    return entry.people.filter(function (p) {
+      return p.hay.indexOf(S.search) !== -1;
+    });
   }
 
   /* The goods in a craft's hold that the current search term names. Empty for anything
@@ -966,10 +1284,22 @@
   var cargoPending = {};
 
   function indexCargo(name, detail) {
+    detail = detail || {};
+    var aboard = (detail.captain ? [{ role: 'captain', who: detail.captain }] : [])
+      .concat((detail.passengers || []).map(function (p) { return { role: 'passenger', who: p }; }));
+
     S.cargoIndex[name] = {
       at: Date.now(),
-      goods: cargoGoods(detail || {}).map(function (g) {
+      goods: cargoGoods(detail).map(function (g) {
         return { name: String(g.name || g.good || ''), amount: g.amount || 0 };
+      }),
+      people: aboard.map(function (a) {
+        var label = String(a.who.displayName || a.who.name || '');
+        return {
+          role: a.role,
+          name: label,
+          hay: [label, a.who.name, a.who.nickName].concat(names(a.who.classes)).join(' ').toLowerCase()
+        };
       })
     };
   }
@@ -979,9 +1309,49 @@
     return !!entry && (Date.now() - entry.at) < CARGO_TTL;
   }
 
+  /* The bridge keeps the last manifest anyone read for each craft - this console, another
+     tab, a fellow alliance member's - so a search starts from those in one call instead of
+     from nothing. Each keeps the time it was read: one still inside CARGO_TTL spares its
+     craft a call, and an older one shows a match straight away while the sweep re-reads
+     the hold behind it. A bridge that keeps no history answers 404 and the sweep simply
+     reads every hold, as it always did. */
+  var manifestsAt = 0;
+
+  function seedCargo() {
+    if (Date.now() - manifestsAt < CARGO_TTL) { return Promise.resolve(); }
+    manifestsAt = Date.now();
+
+    return Api.get('/history/manifests', null, { priority: Api.P.DETAIL, label: 'manifests' })
+      .then(function (body) {
+        (body.manifests || []).forEach(function (manifest) {
+          var ship = S.byName[manifest.ship];
+          var at = (manifest.at || 0) * 1000;
+          var known = S.cargoIndex[manifest.ship];
+
+          // A player and their alliance can each own a craft by this name; the listing
+          // says which one this row is.
+          if (!ship || (ship.owner && ship.owner.kind !== manifest.owner)) { return; }
+          if (known && known.at >= at) { return; }
+
+          indexCargo(manifest.ship, manifest);
+          S.cargoIndex[manifest.ship].at = at;
+        });
+
+        renderFleetCount();
+        if (S.search) { renderFleet(); }
+      })
+      .catch(function () { /* no stored manifests: every hold is read live instead */ });
+  }
+
   function sweepCargo() {
     // Two characters: one letter matches most of the goods in the game, and the sweep is
     // a call per craft.
+    if (!S.connected || S.paused || S.search.length < 2) { return; }
+
+    seedCargo().then(sweepHolds);
+  }
+
+  function sweepHolds() {
     if (!S.connected || S.paused || S.search.length < 2) { return; }
 
     S.ships.forEach(function (ship) {
@@ -1046,20 +1416,27 @@
     var html = rows.map(function (ship) {
       var last = lastEventFor(ship.name);
       var hits = cargoMatches(ship.name);
+      var people = peopleMatches(ship.name);
       var sub = [];
-      if (ship.status) { sub.push(esc(ship.status)); }
+      if (ship.status && !looksLikeJson(ship.status)) { sub.push(esc(ship.status)); }
       sub.push(coords(ship.position));
       if (ship.owner && ship.owner.kind === 'alliance') { sub.push('alliance'); }
+      if (people.length) {
+        sub.push('· <span class="hit-goods">' + people.map(function (p) {
+          return p.role + ' ' + esc(p.name);
+        }).join(', ') + '</span>');
+      }
       if (hits.length) {
         sub.push('· <span class="hit-goods">carrying ' + hits.map(function (g) {
           return esc(g.name) + ' ' + num(g.amount);
         }).join(', ') + '</span>');
-      } else if (last) { sub.push('· ' + esc(eventSummaryText(last))); }
+      } else if (last && !people.length) { sub.push('· ' + esc(eventSummaryText(last))); }
 
       return '<div class="ship-row' + (S.selected === ship.name ? ' sel' : '')
         + '" data-ship="' + esc(ship.name) + '">'
         + '<div class="n">' + esc(ship.name) + '</div>'
-        + '<div class="badges">' + availabilityBadge(ship) + usableBadge(ship) + '</div>'
+        + '<div class="badges">' + availabilityBadge(ship) + usableBadge(ship)
+        + automationBadge(ship) + '</div>'
         + '<div class="s">' + sub.join(' ') + '</div>'
         + '</div>';
     }).join('');
@@ -1078,12 +1455,20 @@
     S.mission = null;
     S.catalog = null;
     S.missionForm = null;
-    S.lastRoute = null;
+    S.autoForm = null;
+    S.autoDry = null;
+    S.progForm = null;
+    if (changed) { GalaxyMap.setArea(null); }
+    S.nav.result = null;
+    S.nav.farm = null;
+    S.nav.automation = null;
+    S.nav.automationError = null;
     renderFleet();
 
     if (!name) {
       $('#ship-detail').classList.add('hidden');
       $('#ship-empty').classList.remove('hidden');
+      renderAutomationView();
       return;
     }
 
@@ -1110,6 +1495,9 @@
     loadStation();
     renderOrders();
     renderTravel();
+    if (S.sub === 'travel' || S.sub === 'orders' || S.view === 'automation') { loadAutomation(); }
+    if (S.sub === 'orders') { loadTransfer(name); }
+    renderAutomationView();
     renderShipLog();
 
     if (changed && S.history.selectedOnly && historyWanted()) { loadHistory(true); }
@@ -1168,7 +1556,7 @@
 
     var bits = [d.type || '', coords(d.position)];
     if (d.owner) { bits.push(d.owner.kind === 'alliance' ? 'alliance craft' : esc(d.owner.name)); }
-    if (d.status) { bits.push(esc(d.status)); }
+    if (d.status && !looksLikeJson(d.status)) { bits.push(esc(d.status)); }
     $('#ship-sub').innerHTML = bits.filter(Boolean).join(' · ');
 
     var badges = availabilityBadge(d) + usableBadge(d);
@@ -1264,6 +1652,17 @@
         '<div class="note warn">No captain ' + explain('no-captain', 'warn') + '</div>'));
     }
 
+    /* --- passengers --------------------------------------------------- */
+    var passengers = d.passengers || [];
+    if (passengers.length) {
+      cards.push(meterCard('Passengers (' + passengers.length + ')',
+        '<table><tbody>' + passengers.map(function (p) {
+          return '<tr><td>' + esc(p.displayName || p.name || '—') + '</td>'
+            + '<td class="mute2">' + esc(names(p.classes).join(', ') || '—') + '</td>'
+            + '<td class="num">L' + num(p.level) + '</td></tr>';
+        }).join('') + '</tbody></table>'));
+    }
+
     /* --- crew --------------------------------------------------------- */
     var crew = d.crew || {};
     var professions = (crew.byProfession || []).filter(function (p) { return p.count; });
@@ -1341,14 +1740,76 @@
       ['icon', d.icon ? pathLabel(d.icon) : '—']
     ])));
 
+    /* orderInfo is only worth a line when it is prose. Chain state comes back parsed on
+       `orders`; a JSON string the server could not decode is still not for reading. */
     var statusMessage = message(d.statusMessage);
-    var header = statusMessage
-      ? '<div class="okbox"><b>' + esc(statusMessage) + '</b>'
-        + (d.orderInfo ? ' <span class="mute2">· ' + esc(d.orderInfo) + '</span>' : '')
+    var info = d.orders || looksLikeJson(d.orderInfo) ? '' : (d.orderInfo || '');
+    var header = statusMessage || info
+      ? '<div class="okbox"><b>' + esc(statusMessage || info) + '</b>'
+        + (statusMessage && info ? ' <span class="mute2">· ' + esc(info) + '</span>' : '')
         + '</div>'
       : '';
 
-    $('#sv-overview').innerHTML = header + '<div class="cards">' + cards.join('') + '</div>';
+    $('#sv-overview').innerHTML = header + ordersCard(d.orders)
+      + '<div class="cards">' + cards.join('') + '</div>';
+  }
+
+  function looksLikeJson(text) {
+    return typeof text === 'string' && /^\s*[\[{]/.test(text);
+  }
+
+  // "hullRatio" -> "hull ratio"
+  function words(key) {
+    return String(key).replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase();
+  }
+
+  function scalarText(value) {
+    if (typeof value === 'boolean') { return value ? 'yes' : 'no'; }
+    if (typeof value === 'number') { return num(value, value % 1 ? 2 : 0); }
+    return pathLabel(value);
+  }
+
+  /* The ship database's copy of the order chain: what is queued, which link is running
+     (activeIndex is the engine's 1-based index) and how the craft defends itself. */
+  function ordersCard(orders) {
+    if (!orders) { return ''; }
+
+    var chain = orders.chain || [];
+    var active = orders.finished ? 0 : (orders.activeIndex || 0);
+
+    var list = chain.length
+      ? '<ol class="order-list">' + chain.map(function (link, i) {
+          var state = active === 0 ? 'queued' : (i + 1 < active ? 'done' : (i + 1 === active ? 'running' : 'queued'));
+          var tags = [];
+          if (link.sector) { tags.push(esc(coords(link.sector))); }
+          if (link.gate === true) { tags.push('gate'); }
+          if (link.gate === false) { tags.push('wormhole'); }
+          return '<li class="' + state + '"><span class="order-name">'
+            + pathLabel(link.name || ('action ' + link.action)) + '</span>'
+            + (tags.length ? ' <span class="mute2">' + tags.join(' · ') + '</span>' : '')
+            + (state === 'running' ? ' <span class="badge info">running</span>' : '')
+            + '</li>';
+        }).join('') + '</ol>'
+      : '<div class="mute2">no orders queued</div>';
+
+    var progress = orders.finished
+      ? '<span class="badge good">finished</span>'
+      : (chain.length && active ? 'order ' + active + ' of ' + chain.length : '');
+
+    var rows = [];
+    if (orders.sector) { rows.push(['chain at', esc(coords(orders.sector))]); }
+    if (orders.defense) { rows.push(['defense', esc(orders.defense)]); }
+    [orders.autoAI, orders.extra].forEach(function (group) {
+      Object.keys(group || {}).sort().forEach(function (key) {
+        var value = group[key];
+        var shown = group === orders.autoAI && /ratio$/i.test(key) ? pct(value) : scalarText(value);
+        rows.push([esc(words(key)), shown]);
+      });
+    });
+
+    return '<div class="cards"><div class="card wide"><h3>Orders'
+      + (progress ? ' <span class="mute2">' + progress + '</span>' : '') + '</h3>'
+      + list + (rows.length ? kv(rows) : '') + '</div></div>';
   }
 
   /* ================================= CARGO ================================= */
@@ -1655,11 +2116,27 @@
     return body;
   }
 
+  /* Ships that could escort the selected one, those sharing its sector first: they are
+     the ones a player actually means to send along, and with a big fleet they were lost
+     somewhere in an alphabetical wall of chips. */
+  function escortCandidates() {
+    var here = (S.byName[S.selected] || {}).position;
+    var list = S.ships.filter(function (s) {
+      return s.name !== S.selected && s.type === 'Ship' && s.availability === 'Available';
+    }).map(function (s) {
+      var near = !!(here && s.position && s.position.x === here.x && s.position.y === here.y);
+      return { ship: s, near: near };
+    });
+    // Array sort is stable, so each group keeps the fleet's own order
+    return list.sort(function (a, b) { return (b.near ? 1 : 0) - (a.near ? 1 : 0); });
+  }
+
   function renderMission() {
     if (!S.selected) { return; }
     var out = [];
 
     out.push(renderMissionStatus());
+    out.push(renderMissionAutomationSummary());
     out.push(renderMissionPlanner());
 
     $('#sv-mission').innerHTML = out.join('');
@@ -1709,12 +2186,7 @@
       ['uncollected yields', num(m.yields)]
     ])));
 
-    if (m.areaStats) {
-      cards.push(meterCard('Area', kv(Object.keys(m.areaStats).map(function (k) {
-        return [esc(k), typeof m.areaStats[k] === 'object'
-          ? esc(JSON.stringify(m.areaStats[k])) : num(m.areaStats[k])];
-      }))));
-    }
+    if (m.areaStats) { cards.push(areaCard(m.areaStats, m.areaStats.area)); }
     if (prediction.attackChance) {
       cards.push(meterCard('Risk',
         '<div class="mute2">attack chance</div>'
@@ -1804,10 +2276,14 @@
       left.push('<div class="mute2">size ' + area.size.x + '×' + area.size.y + '</div>');
     }
 
-    left.push('<div class="mute2" data-area style="margin-top:6px">'
+    left.push('<div class="row tight" style="margin-top:6px">'
+      + '<span class="mute2" data-area>'
       + area.lower.x + ':' + area.lower.y + ' → ' + area.upper.x + ':' + area.upper.y
-      + ' (inclusive)</div>');
+      + ' (inclusive)</span>'
+      + '<button class="ghost small" data-act="area-map-form">show on map</button></div>');
     left.push('</div>');
+
+    if (form.mission === 'trade') { left.push(renderCapital(form)); }
 
     /* --- configurable ------------------------------------------------- */
     var fields = Object.keys(entry.configurable || {});
@@ -1858,15 +2334,19 @@
     }
 
     /* --- escorts ------------------------------------------------------ */
-    var candidates = S.ships.filter(function (s) {
-      return s.name !== S.selected && s.type === 'Ship' && s.availability === 'Available';
-    });
+    var candidates = escortCandidates();
     if (candidates.length) {
-      left.push('<div class="card"><h3>Escorts</h3><div class="chips">'
-        + candidates.map(function (s) {
-            var on = form.escorts.indexOf(s.name) !== -1;
-            return '<button class="chip' + (on ? ' on' : '') + '" data-escort="'
-              + esc(s.name) + '">' + esc(s.name) + '</button>';
+      var nearby = candidates.filter(function (c) { return c.near; }).length;
+      left.push('<div class="card"><h3>Escorts'
+        + (nearby ? ' <span class="mute2">' + nearby + ' in this sector</span>'
+            + ' <button class="ghost small" data-act="escorts-near">select these</button>' : '')
+        + '</h3><div class="chips">'
+        + candidates.map(function (c) {
+            var on = form.escorts.indexOf(c.ship.name) !== -1;
+            return '<button class="chip' + (on ? ' on' : '') + (c.near ? ' near' : '')
+              + '" data-escort="' + esc(c.ship.name) + '"'
+              + (c.near ? ' title="In the same sector as ' + esc(S.selected) + '"' : '')
+              + '>' + esc(c.ship.name) + '</button>';
           }).join('')
         + '</div></div>');
     }
@@ -1887,17 +2367,497 @@
     }
 
     var canStart = preview && preview.canStart;
+    var scanning = !!(form.scan && form.scan.running);
+    var scannable = form.mission === 'trade' && (entry.areaSizes || []).length > 0;
 
     var actions = '<div class="row" style="margin:12px 0">'
-      + '<button class="primary" data-act="preview"' + (form.running ? ' disabled' : '') + '>Preview</button>'
-      + '<button data-act="start"' + (canStart ? ' class="primary"' : ' disabled')
+      + '<button class="primary" data-act="preview"' + (form.running || scanning ? ' disabled' : '') + '>Preview</button>'
+      + '<button data-act="start"' + (canStart && !scanning ? ' class="primary"' : ' disabled')
       + '>Start ' + esc(form.mission) + '</button>'
+      + (scannable
+          ? (scanning
+              ? '<button class="ghost" data-act="scan-stop">Stop scan</button>'
+              : '<button data-act="scan"' + (form.running ? ' disabled' : '') + '>Scan placements</button>')
+            + ' ' + explain('trade-scan')
+          : '')
       + (form.running ? '<span class="mute2">running the area analysis…</span>' : '')
       + '</div>';
 
     return '<div class="section"><h2>Start a mission</h2>' + body + actions
+      + (form.scan ? renderScan(form.scan) : '')
       + '<div class="grid2"><div>' + left.join('') + '</div><div>' + right.join('') + '</div></div>'
       + '</div>';
+  }
+
+  /* ============================ TRADE PLACEMENTS ============================
+   *
+   * A trade area has to contain the ship, but the ship does not have to sit in its
+   * middle, and which stations fall inside decides which routes the game offers. Finding
+   * the best contract by hand means re-placing the area around the ship over and over:
+   * every corner, the middle of every side, for each of the three shapes. That is what
+   * the scan does, one preview at a time - each needs its own area analysis, the server
+   * runs one per ship at once, and two dozen of them will not fit in one request.
+   */
+
+  /* Where the ship sits inside the area, as a fraction of each side: 0 is the low edge
+     (left, bottom - map y grows upwards), 1 the high edge. */
+  var PLACEMENTS = [
+    { label: 'top-left corner',     fx: 0,   fy: 1 },
+    { label: 'top-right corner',    fx: 1,   fy: 1 },
+    { label: 'bottom-left corner',  fx: 0,   fy: 0 },
+    { label: 'bottom-right corner', fx: 1,   fy: 0 },
+    { label: 'top side',            fx: 0.5, fy: 1 },
+    { label: 'bottom side',         fx: 0.5, fy: 0 },
+    { label: 'left side',           fx: 0,   fy: 0.5 },
+    { label: 'right side',          fx: 1,   fy: 0.5 },
+    { label: 'centre',              fx: 0.5, fy: 0.5 }
+  ];
+
+  var SCAN_RANKS = {
+    margin:   { label: 'margin',        value: function (r) { return r.margin; } },
+    contract: { label: 'total profit',  value: function (r) { return r.contractProfit && r.contractProfit.to; } },
+    hourly:   { label: 'profit / hour', value: routeHourly }
+  };
+
+  /* Offset of the ship from the area's low edge. The middle matches formArea's rounding,
+     so a placement turns back into a centre without drifting a sector. */
+  function placementOffset(fraction, length) {
+    if (fraction === 0) { return 0; }
+    if (fraction === 1) { return length - 1; }
+    return Math.floor((length - 1) / 2);
+  }
+
+  function placementArea(position, size, placement) {
+    var lower = {
+      x: position.x - placementOffset(placement.fx, size.x),
+      y: position.y - placementOffset(placement.fy, size.y)
+    };
+    return { lower: lower, upper: { x: lower.x + size.x - 1, y: lower.y + size.y - 1 } };
+  }
+
+  /* The whole contract over the time it takes to fly it. */
+  function routeHourly(route) {
+    if (!route.contractProfit || !route.flights || !route.flightTime) { return null; }
+    var seconds = route.flights.to * route.flightTime;
+    return seconds > 0 ? route.contractProfit.to / seconds * 3600 : null;
+  }
+
+  function routeKey(route) {
+    return route.good + '@' + coords(route.from) + '>' + coords(route.to);
+  }
+
+  function runScan() {
+    var form = S.missionForm;
+    var name = S.selected;
+    var ship = S.byName[name];
+    if (!form || !ship || !ship.position) { return; }
+
+    var jobs = [];
+    (form.entry.areaSizes || []).forEach(function (size, sizeIndex) {
+      PLACEMENTS.forEach(function (placement) {
+        var area = placementArea(ship.position, size, placement);
+        jobs.push({ sizeIndex: sizeIndex, size: size, placement: placement,
+                    lower: area.lower, upper: area.upper });
+      });
+    });
+
+    var scan = form.scan = {
+      running: true, done: 0, total: jobs.length, found: [], failed: [],
+      from: { x: ship.position.x, y: ship.position.y },
+      rank: form.scan ? form.scan.rank : 'margin'
+    };
+    renderMission();
+
+    function stale() {
+      return scan.stopped || S.selected !== name || S.missionForm !== form || form.scan !== scan;
+    }
+
+    function finish() {
+      scan.running = false;
+      renderMission();
+      var best = rankedScan(scan)[0];
+      if (best) {
+        toast('good', 'Scan finished', 'Best by ' + SCAN_RANKS[scan.rank].label + ': '
+              + best.route.good + ', ship at the ' + best.placement.label + ' of '
+              + best.size.x + '×' + best.size.y + '.');
+      } else {
+        toast('warn', 'Scan finished', 'No trade routes in any placement.');
+      }
+    }
+
+    function next(index, attempt) {
+      if (stale()) { return; }
+      if (index >= jobs.length) { finish(); return; }
+
+      var job = jobs[index];
+      // No route or deposit: they belong to one area, and every placement is a new one.
+      var body = { area: { lower: job.lower, upper: job.upper }, config: {}, escorts: form.escorts };
+
+      Api.post('/ships/' + Api.seg(name) + '/missions/trade/preview', body,
+               { owner: ownerParamFor(name) },
+               { priority: Api.P.USER, label: 'scan ' + (index + 1) + '/' + jobs.length })
+        .then(function (result) {
+          if (stale()) { return; }
+          (result.routes || []).forEach(function (route) {
+            if (!route.error) { scan.found.push({ job: job, route: route }); }
+          });
+          scan.done++;
+          renderMission();
+          next(index + 1, 0);
+        })
+        .catch(function (error) {
+          if (stale()) { return; }
+          // The analysis slots are shared with every other caller; wait for one.
+          var busy = error.code === 'analysis_busy' || error.code === 'analysis_in_progress';
+          if (busy && attempt < 5) {
+            setTimeout(function () { next(index, attempt + 1); }, 1500);
+            return;
+          }
+          scan.failed.push({ job: job, error: error });
+          scan.done++;
+          renderMission();
+          next(index + 1, 0);
+        });
+    }
+
+    next(0, 0);
+  }
+
+  function stopScan() {
+    var scan = S.missionForm && S.missionForm.scan;
+    if (!scan) { return; }
+    scan.stopped = true;
+    scan.running = false;
+    renderMission();
+  }
+
+  /* One row per distinct route, best first. The same route turns up in every placement
+     whose area holds both its stations, at the same prices; only the attack chance
+     differs, so the safest placement stands for it. */
+  function rankedScan(scan) {
+    var byRoute = {};
+    scan.found.forEach(function (hit) {
+      var key = routeKey(hit.route);
+      var kept = byRoute[key];
+      if (!kept) {
+        byRoute[key] = { route: hit.route, job: hit.job, placements: 1 };
+        return;
+      }
+      kept.placements++;
+      if ((hit.route.attackChance || 0) < (kept.route.attackChance || 0)) {
+        kept.route = hit.route;
+        kept.job = hit.job;
+      }
+    });
+
+    var value = SCAN_RANKS[scan.rank].value;
+    return Object.keys(byRoute).map(function (key) {
+      var row = byRoute[key];
+      return { route: row.route, placements: row.placements, sizeIndex: row.job.sizeIndex,
+               size: row.job.size, placement: row.job.placement, lower: row.job.lower };
+    }).sort(function (a, b) { return (value(b.route) || 0) - (value(a.route) || 0); });
+  }
+
+  function renderScan(scan) {
+    var rows = rankedScan(scan);
+    scan.rows = rows;
+
+    // Once a row is in the form the table has done its job; it folds down to what was
+    // taken from it, and opens again for another pick.
+    if (scan.collapsed && !scan.running) {
+      var used = scan.used;
+      return '<div class="card" style="margin-bottom:12px">'
+        + '<div class="row" style="justify-content:space-between">'
+        + '<h3 style="margin-bottom:0">Placement scan <span class="mute2">'
+        + rows.length + ' route' + (rows.length === 1 ? '' : 's') + ' around ' + coords(scan.from)
+        + '</span></h3>'
+        + '<button class="ghost small" data-act="scan-open">change</button></div>'
+        + (used
+            ? '<div class="mute2" style="margin-top:4px">using <b>' + esc(used.good) + '</b>, ship at the '
+              + esc(used.placement) + ' of ' + used.size.x + '×' + used.size.y + '</div>'
+            : '')
+        + '</div>';
+    }
+
+    var head = '<div class="row" style="justify-content:space-between">'
+      + '<h3>Placement scan <span class="mute2">around ' + coords(scan.from) + '</span></h3>'
+      + '<div class="row tight">'
+      + (scan.used && !scan.running
+          ? '<button class="ghost small" data-act="scan-close">collapse</button>' : '')
+      + '<span class="mute2">rank by</span>'
+      + Object.keys(SCAN_RANKS).map(function (key) {
+          return '<button class="chip' + (scan.rank === key ? ' on' : '') + '" data-scan-rank="'
+            + key + '">' + SCAN_RANKS[key].label + '</button>';
+        }).join('')
+      + '</div></div>';
+
+    var status = scan.running
+      ? '<div class="mute2">' + scan.done + ' of ' + scan.total + ' placements analysed…</div>'
+        + bar(scan.done / scan.total, '')
+      : '<div class="mute2">' + scan.done + ' of ' + scan.total + ' placements analysed'
+        + (scan.stopped ? ', stopped' : '') + '.</div>';
+
+    if (scan.failed.length) {
+      status += '<div class="note warn">' + scan.failed.length + ' failed: '
+        + esc(scan.failed.map(function (f) {
+            return f.job.size.x + '×' + f.job.size.y + ' ' + f.job.placement.label
+              + ' (' + (f.error.code || 'error') + ')';
+          }).join(', '))
+        + '</div>';
+    }
+
+    var table = '';
+    if (rows.length) {
+      table = '<div class="scan-table"><table><thead><tr>'
+        + '<th>good</th><th class="num">margin</th><th class="num">¢/u</th>'
+        + '<th class="num">total profit</th><th class="num">flights</th>'
+        + '<th class="num">profit/h</th><th class="num">attack</th>'
+        + '<th>buy → sell</th><th>area</th><th></th>'
+        + '</tr></thead><tbody>'
+        + rows.map(function (row, i) {
+            var r = row.route;
+            return '<tr' + (i === 0 ? ' class="best"' : '') + '>'
+              + '<td>' + esc(r.good) + '</td>'
+              + '<td class="num">' + marginText(r.margin) + '</td>'
+              + '<td class="num">' + credits(r.profitPerUnit) + '</td>'
+              + '<td class="num">' + credits(r.contractProfit && r.contractProfit.to) + '</td>'
+              + '<td class="num">' + num(r.flights && r.flights.to) + '</td>'
+              + '<td class="num">' + credits(routeHourly(r)) + '</td>'
+              + '<td class="num">' + pct(r.attackChance) + '</td>'
+              + '<td>' + coords(r.from) + ' → ' + coords(r.to) + '</td>'
+              + '<td>' + row.size.x + '×' + row.size.y + ' <span class="mute2">'
+              + esc(row.placement.label)
+              + (row.placements > 1 ? ' +' + (row.placements - 1) + ' more' : '') + '</span></td>'
+              + '<td><button class="ghost small" data-scan-use="' + i + '"'
+              + (scan.running ? ' disabled' : '') + '>use</button></td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>';
+    } else if (!scan.running) {
+      table = '<div class="note">No placement found a trade route. Routes need known sectors '
+        + 'with stations buying and selling the same good.</div>';
+    }
+
+    return '<div class="card" style="margin-bottom:12px">' + head + status + table + '</div>';
+  }
+
+  function marginText(margin) {
+    if (margin == null) { return '—'; }
+    return '+' + Math.round(margin * 100) + '%';
+  }
+
+  /* Points the form at a route in the current area and previews it. The deposit is the
+     order window's slider maximum, which the server worked out for the route. */
+  function useRoute(good) {
+    var form = S.missionForm;
+    var routes = form && form.preview && form.preview.routes || [];
+    var route = routes.filter(function (r) { return r.good === good; })[0];
+    if (!route) { return; }
+
+    form.config.goodName = route.good;
+    form.config.deposit = route.deposit;
+    form.config.maxDeposit = route.deposit;
+    form.route = route;
+    form.routesOpen = false;
+    runPreview();
+  }
+
+  function useScanRow(index) {
+    var form = S.missionForm;
+    var row = form && form.scan && form.scan.rows && form.scan.rows[index];
+    if (!row) { return; }
+
+    form.sizeIndex = row.sizeIndex;
+    form.center = {
+      x: row.lower.x + Math.floor((row.size.x - 1) / 2),
+      y: row.lower.y + Math.floor((row.size.y - 1) / 2)
+    };
+    form.config.goodName = row.route.good;
+    form.config.deposit = row.route.deposit;
+    form.config.maxDeposit = row.route.deposit;
+    form.route = row.route;
+    form.routesOpen = false;
+    form.scan.collapsed = true;
+    form.scan.used = { good: row.route.good, placement: row.placement.label, size: row.size };
+    form.preview = null;
+    runPreview();
+  }
+
+  /* The route the form is set up to fly, as the last preview (or the scan) described it. */
+  function chosenRoute(form) {
+    var route = form.route;
+    return route && !route.error && route.good === form.config.goodName ? route : null;
+  }
+
+  /* The order window's down payment slider. It counts units of the good, from a tenth of
+     what the ship can carry to all of it, each at the pre-perk purchase price; the route's
+     deposit is the top of that range, so the price and the range both come back out of it. */
+  function depositRange(route) {
+    var unitPrice = Math.ceil(route.price * (1 + route.lowest));
+    var max = Math.round(route.deposit / unitPrice);
+    return { unitPrice: unitPrice, min: Math.max(1, Math.floor(max * 0.1)), max: max };
+  }
+
+  function capitalText(units, range) {
+    return credits(units * range.unitPrice) + ' <span class="mute2">' + num(units) + ' u</span>';
+  }
+
+  function capitalStale(form) {
+    var accepted = form.preview && form.preview.config;
+    return !!(accepted && accepted.deposit !== form.config.deposit);
+  }
+
+  function renderCapital(form) {
+    var head = '<div class="card"><h3>Starting capital ' + explain('trade-capital') + '</h3>';
+    var route = chosenRoute(form);
+    if (!route) {
+      return head + '<div class="mute2">Pick a trade route first.</div></div>';
+    }
+
+    var range = depositRange(route);
+    var units = Math.round((form.config.deposit || route.deposit) / range.unitPrice);
+    units = Math.max(range.min, Math.min(range.max, units));
+
+    return head
+      + '<div class="row" style="justify-content:space-between">'
+      + '<span class="mute2">' + esc(route.good) + ' at ' + credits(range.unitPrice) + ' / u</span>'
+      + '<span data-capital>' + capitalText(units, range) + '</span></div>'
+      + '<input type="range" data-capital-range min="' + range.min + '" max="' + range.max
+      + '" step="1" value="' + units + '"' + (range.min === range.max ? ' disabled' : '') + '>'
+      + '<div class="mute2" style="font-size:11px">' + num(range.min) + ' – ' + num(range.max)
+      + ' units</div>'
+      + '<div class="note warn" data-capital-stale' + (capitalStale(form) ? '' : ' hidden')
+      + '>Preview again to update the prediction.</div>'
+      + '</div>';
+  }
+
+  function renderRoutes(p) {
+    var form = S.missionForm || {};
+    var goodName = p.config && p.config.goodName;
+    var chosen = p.routes.filter(function (r) { return r.good === goodName && !r.error; })[0];
+
+    if (chosen && !form.routesOpen) {
+      return '<div class="card"><div class="row" style="justify-content:space-between">'
+        + '<h3 style="margin-bottom:0">Trade routes <span class="mute2">' + p.routes.length
+        + ' in this area</span></h3>'
+        + '<button class="ghost small" data-act="routes-open">change</button></div>'
+        + '<div class="row tight" style="margin-top:4px"><b>' + esc(chosen.good) + '</b>'
+        + '<span class="mute2">' + marginText(chosen.margin) + ' · '
+        + credits(chosen.contractProfit && chosen.contractProfit.to) + ' total · '
+        + num(chosen.flights && chosen.flights.to) + ' flights · '
+        + coords(chosen.from) + ' → ' + coords(chosen.to) + '</span></div>'
+        + '</div>';
+    }
+
+    return '<div class="card"><div class="row" style="justify-content:space-between">'
+      + '<h3>Trade routes ' + explain('trade-routes') + '</h3>'
+      + (chosen ? '<button class="ghost small" data-act="routes-close">collapse</button>' : '')
+      + '</div>'
+      + (p.routes.length ? '<div class="scan-table"><table><thead><tr>'
+        + '<th>good</th><th class="num">margin</th><th class="num">total profit</th>'
+        + '<th class="num">flights</th><th class="num">deposit</th><th></th>'
+        + '</tr></thead><tbody>'
+        + p.routes.map(function (r) {
+            var chosen = r.good === goodName;
+            return '<tr' + (chosen ? ' class="sel"' : '') + '>'
+              + '<td>' + esc(r.good) + '</td>'
+              + '<td class="num">' + marginText(r.margin) + '</td>'
+              + (r.error
+                  ? '<td colspan="3" class="note warn">' + esc(message(r.error)) + '</td><td></td>'
+                  : '<td class="num">' + credits(r.contractProfit && r.contractProfit.to) + '</td>'
+                    + '<td class="num">' + num(r.flights && r.flights.to) + '</td>'
+                    + '<td class="num">' + credits(r.deposit) + '</td>'
+                    + '<td>' + (chosen ? '<span class="mute2">chosen</span>'
+                        : '<button class="ghost small" data-route="' + esc(r.good) + '">use</button>')
+                    + '</td>')
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>'
+        : '<div class="note">No routes in this area.</div>')
+      + '</div>';
+  }
+
+  /* What the game's predictable values are called when they carry no displayName of
+     their own, and how each is written. Yields and attack chance have cards of their own;
+     the route is the Trade routes card. */
+  var PREDICTION_SKIP = { yields: true, attackChance: true, error: true, errorArgs: true, route: true };
+  var PREDICTION_LABELS = {
+    transportedPerFlight: 'Goods / Flight',
+    freeCargoSpace: 'Free Cargo Space',
+    attackLocation: 'Attack Location'
+  };
+  var PREDICTION_FORMATS = {
+    flightTime: function (v) { return esc(duration(v)); },
+    profitPerFlight: credits
+  };
+
+  /* Predictions arrive as the game builds them: {displayName, value}, or {displayName,
+     from, to} for a range. */
+  function predictionRows(prediction) {
+    return Object.keys(prediction).filter(function (k) { return !PREDICTION_SKIP[k]; }).map(function (k) {
+      var v = prediction[k];
+      var format = PREDICTION_FORMATS[k] || function (n) { return num(n); };
+      var label = PREDICTION_LABELS[k] || k;
+      var text;
+
+      if (v && typeof v === 'object') {
+        if (v.displayName) { label = v.displayName; }
+        if (v.value !== undefined) { text = format(v.value); }
+        else if (v.from !== undefined && v.to !== undefined) {
+          text = v.from === v.to ? format(v.to) : format(v.from) + ' – ' + format(v.to);
+        } else if (v.x !== undefined && v.y !== undefined) { text = esc(coords(v)); }
+        else { text = esc(JSON.stringify(v)); }
+      } else if (typeof v === 'number') {
+        text = format(v);
+      } else {
+        text = esc(String(v));
+      }
+
+      return [esc(label), text];
+    });
+  }
+
+  /* SimulationUtility.getAreaStats: sector counts, and the share of the reachable ones by
+     who controls them, in whole percent. */
+  var AREA_STATS = [
+    ['numSectors', 'sectors', function (v) { return num(v); }],
+    ['unreachableSectors', 'unreachable', function (v) { return num(v); }],
+    ['noMansSectors', 'no man&rsquo;s space', function (v) { return num(v) + '%'; }],
+    ['outerSectors', 'faction outskirts', function (v) { return num(v) + '%'; }],
+    ['centralSectors', 'faction core', function (v) { return num(v) + '%'; }]
+  ];
+
+  function areaCard(stats, bounds) {
+    var rows = [];
+    if (bounds && bounds.lower && bounds.upper) {
+      rows.push(['bounds', coords(bounds.lower) + ' → ' + coords(bounds.upper)]);
+      if (bounds.origin) { rows.push(['origin', coords(bounds.origin)]); }
+    }
+
+    var known = { area: true };
+    AREA_STATS.forEach(function (spec) {
+      known[spec[0]] = true;
+      if (stats[spec[0]] != null) { rows.push([spec[1], spec[2](stats[spec[0]])]); }
+    });
+    Object.keys(stats).forEach(function (k) {
+      if (known[k]) { return; }
+      var v = stats[k];
+      rows.push([esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : num(v)]);
+    });
+
+    var button = bounds && bounds.lower && bounds.upper
+      ? '<button class="ghost small card-link" data-area-map="' + [bounds.lower.x, bounds.lower.y,
+          bounds.upper.x, bounds.upper.y].join(',') + '">show on map</button>'
+      : '';
+
+    return meterCard('Area' + button, kv(rows));
+  }
+
+  function showAreaOnMap(area) {
+    GalaxyMap.setArea({ lower: area.lower, upper: area.upper, label: S.selected });
+    showView('map');
+    // after showView's own resize, once the canvas has a size to fit into
+    setTimeout(function () { GalaxyMap.resize(); GalaxyMap.fitArea(area); }, 0);
   }
 
   function renderPreview(p) {
@@ -1919,6 +2879,8 @@
       out.push('<div class="okbox"><b>Ready to start.</b></div>');
     }
 
+    if (p.routes) { out.push(renderRoutes(p)); }
+
     var cards = [];
     var prediction = p.prediction || {};
 
@@ -1937,22 +2899,10 @@
         + '<div>' + pct(prediction.attackChance.value) + '</div>'));
     }
 
-    var extra = Object.keys(prediction).filter(function (k) {
-      return k !== 'yields' && k !== 'attackChance' && k !== 'error' && k !== 'errorArgs';
-    });
-    if (extra.length) {
-      cards.push(meterCard('Prediction', kv(extra.map(function (k) {
-        var v = prediction[k];
-        return [esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : esc(String(v))];
-      }))));
-    }
+    var extra = predictionRows(prediction);
+    if (extra.length) { cards.push(meterCard('Prediction', kv(extra))); }
 
-    if (p.area && p.area.stats) {
-      cards.push(meterCard('Area', kv(Object.keys(p.area.stats).map(function (k) {
-        var v = p.area.stats[k];
-        return [esc(k), typeof v === 'object' ? esc(JSON.stringify(v)) : num(v)];
-      }))));
-    }
+    if (p.area && p.area.stats) { cards.push(areaCard(p.area.stats, p.area)); }
 
     if (p.config) {
       cards.push(meterCard('Config as accepted', kv(Object.keys(p.config).map(function (k) {
@@ -1992,6 +2942,10 @@
       if (S.selected !== name || S.missionForm !== form) { return; }
       form.running = false;
       form.preview = body;
+      // fresher figures for the chosen route, for the capital slider
+      (body.routes || []).forEach(function (r) {
+        if (r.good === form.config.goodName && !r.error) { form.route = r; }
+      });
       renderMission();
     }).catch(function (error) {
       if (S.missionForm !== form) { return; }
@@ -2061,6 +3015,1756 @@
         loadMission();
       })
       .catch(function (error) { apiFailed(error, 'Command failed'); });
+  }
+
+  /* =========================== MISSION AUTOMATION ===========================
+   *
+   * The mod runs the automation, not this page: rules are stored on the server and the
+   * loop that sends a ship back out runs in the galaxy bridge, so closing the console stops
+   * nothing. What lives here is the view onto it and the editor for it.
+   *
+   * An alliance craft's rule is one document shared by every member, and the live state
+   * comes back with it. Polling /automation/missions is therefore all it takes for two
+   * members' consoles to agree on what a craft is doing - and saving with the revision a
+   * console last saw is what stops one member quietly overwriting the other's change.
+   */
+
+  var AUTO_PHASES = {
+    running:    { tone: 'good', label: 'out on mission' },
+    starting:   { tone: 'busy', label: 'starting' },
+    evaluating: { tone: 'busy', label: 'checking' },
+    waiting:    { tone: 'info', label: 'waiting' },
+    busy:       { tone: 'info', label: 'busy elsewhere' },
+    offline:    { tone: 'warn', label: 'owner offline' },
+    blocked:    { tone: 'warn', label: 'blocked' },
+    missing:    { tone: 'bad',  label: 'craft missing' },
+    error:      { tone: 'bad',  label: 'error' },
+    program:    { tone: 'info', label: 'program drives it' },
+    disabled:   { tone: '',     label: 'off' }
+  };
+
+  var AUTO_OBJECTIVES = [
+    { key: 'hourly', label: 'profit / hour' },
+    { key: 'total',  label: 'total yield' },
+    { key: 'safest', label: 'lowest ambush' }
+  ];
+
+  /* The editor's limit fields, in the units a player thinks in. `scale` turns the field
+     into the API's unit: fractions for chances, seconds for durations. */
+  var AUTO_LIMITS = [
+    { key: 'maxAttackChance', label: 'max ambush chance', unit: '%', scale: 0.01, step: 1 },
+    { key: 'maxDuration', label: 'max duration', unit: 'h', scale: 3600, step: 0.5 },
+    { key: 'minDuration', label: 'min duration', unit: 'h', scale: 3600, step: 0.5 },
+    { key: 'maxFlights', label: 'max flights', unit: '', scale: 1, step: 1, mission: 'trade' },
+    { key: 'maxDeposit', label: 'max deposit', unit: '¢', scale: 1, step: 10000, missions: ['trade', 'procure', 'maintenance'] },
+    { key: 'minCreditsLeft', label: 'keep in account', unit: '¢', scale: 1, step: 100000 },
+    { key: 'minValue', label: 'min yield', unit: '', scale: 1, step: 100, missions: ['trade', 'sell', 'mine', 'salvage', 'refine'] }
+  ];
+
+  function autoKey(kind, ship) {
+    return (kind === 'alliance' ? 'alliance' : 'player') + '/' + ship;
+  }
+
+  function automationFor(name) {
+    var ship = S.byName[name];
+    var kind = ship && ship.owner && ship.owner.kind === 'alliance' ? 'alliance' : 'player';
+    return S.automations.byKey[autoKey(kind, name)] || null;
+  }
+
+  /* Seconds since a server-runtime timestamp, carried forward by the local clock since the
+     list arrived. The mod stamps with uptime, which dates nothing on its own. */
+  function autoAge(at) {
+    if (typeof at !== 'number' || typeof S.automations.serverTime !== 'number') { return null; }
+    return Math.max(0, S.automations.serverTime - at + (Date.now() - S.automations.receivedAt) / 1000);
+  }
+
+  function agoText(at) {
+    var age = autoAge(at);
+    return age == null ? '' : duration(age) + ' ago';
+  }
+
+  function loadAutomations(userInitiated) {
+    return Api.get('/automation/missions', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'automations' })
+      .then(function (body) {
+        var byKey = {};
+        (body.automations || []).forEach(function (entry) {
+          byKey[autoKey(entry.owner && entry.owner.kind, entry.ship)] = entry;
+        });
+        S.automations = { byKey: byKey, serverTime: body.serverTime, receivedAt: Date.now(),
+                          error: null, loaded: true };
+        renderFleet();
+        refreshAutomationStatus();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        // a mod older than this console answers 404 here, which is not worth a toast
+        S.automations.error = error;
+        S.automations.loaded = true;
+        refreshAutomationStatus();
+      });
+  }
+
+  /* Folds one entry the API just answered with into the list, so a save shows at once
+     rather than on the next poll. */
+  function storeAutomation(body) {
+    var key = autoKey(body.owner && body.owner.kind, body.ship);
+    if (body.rule) { S.automations.byKey[key] = body; } else { delete S.automations.byKey[key]; }
+    if (typeof body.serverTime === 'number') {
+      S.automations.serverTime = body.serverTime;
+      S.automations.receivedAt = Date.now();
+    }
+    renderFleet();
+  }
+
+  function automationBadge(ship) {
+    var entry = S.automations.byKey[autoKey(ship.owner && ship.owner.kind, ship.name)];
+    if (!entry || !entry.rule) { return ''; }
+    if (!entry.rule.enabled) { return '<span class="badge" title="Automation is switched off">auto off</span>'; }
+
+    var phase = AUTO_PHASES[(entry.state || {}).phase] || { tone: 'info', label: 'auto' };
+    return '<span class="badge ' + phase.tone + '" title="' + esc((entry.state || {}).message || '')
+      + '">auto · ' + esc(phase.label) + '</span>';
+  }
+
+  /* The poll only ever redraws the status half: the editor below it may have focus. */
+  function refreshAutomationStatus() {
+    var node = $('#automation-pane [data-auto-status]');
+    if (node && S.selected) { node.innerHTML = renderAutomationStatus(); }
+    var summary = $('#sv-mission [data-auto-summary]');
+    if (summary && S.selected) { summary.innerHTML = missionAutomationSummary(); }
+    renderAutomationList();
+  }
+
+  function renderAutomation() {
+    return '<div class="section auto-section"><h2>Mission automation ' + explain('auto-overview') + '</h2>'
+      + '<div data-auto-status>' + renderAutomationStatus() + '</div>'
+      + '<div data-auto-editor>' + renderAutomationEditor(false) + '</div>'
+      + '</div>';
+  }
+
+  /* What the Mission tab keeps of automation: a line saying whether this craft has a rule,
+     and the way into the editor. A new rule is still started from here, since it is made
+     of what the planner below holds. */
+  function renderMissionAutomationSummary() {
+    return '<div class="section auto-section"><h2>Automation ' + explain('auto-overview') + '</h2>'
+      + '<div class="row" data-auto-summary>' + missionAutomationSummary() + '</div></div>';
+  }
+
+  function missionAutomationSummary() {
+    if (!S.automations.loaded) { return '<span class="muted">loading…</span>'; }
+
+    var entry = automationFor(S.selected);
+    if (entry && entry.rule) {
+      var st = entry.state || {};
+      var phase = entry.rule.enabled
+        ? AUTO_PHASES[st.phase] || { tone: 'info', label: st.phase || 'unknown' }
+        : { tone: '', label: 'off' };
+      return '<span class="badge ' + phase.tone + '">' + esc(entry.rule.mission) + ' · ' + esc(phase.label) + '</span>'
+        + '<span class="auto-message">' + esc(entry.rule.enabled ? st.message || '' : 'Automation is switched off for this craft.') + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-auto-act="open">Open in Automation</button>';
+    }
+
+    return '<span class="note">Not automated. Set a mission up below, then let the mod keep '
+      + 'sending ' + esc(S.selected) + ' out on it whenever it is free.</span>'
+      + '<span class="spacer"></span>'
+      + '<button data-auto-act="new"' + (S.missionForm ? '' : ' disabled') + '>Automate '
+      + esc(S.missionForm ? S.missionForm.mission : 'a mission') + '…</button>';
+  }
+
+  /* ============================= AUTOMATION TAB =============================
+   *
+   * Everything a craft does by itself, in one place: the mission automation rule the
+   * galaxy bridge runs, and the standing orders the ship runs. It shares the Fleet tab's
+   * selection, so picking a craft on either picks it on both.
+   */
+
+  /* The ship's own automation as last seen: the event feed has it for every craft it
+     sweeps, and the selected craft's read may be fresher still. */
+  function shipAutomation(name) {
+    if (S.selected === name && S.nav.automation && S.nav.automation.automation) {
+      return S.nav.automation.automation;
+    }
+    return S.autoSeen[name] || null;
+  }
+
+  function standingOn(automation) {
+    var standing = automation && automation.standing;
+    if (!standing) { return automation && automation.autoAggressive ? ['enemies'] : []; }
+    return STANDING.filter(function (spec) {
+      return standing[spec.key] && standing[spec.key].enabled;
+    }).map(function (spec) { return spec.key; });
+  }
+
+  function isAutomated(ship) {
+    var entry = automationFor(ship.name);
+    if (entry && entry.rule) { return true; }
+    if (programFor(ship.name)) { return true; }
+    var automation = shipAutomation(ship.name);
+    return !!(automation && (automation.plan || automation.reaction || automation.transfer
+                             || standingOn(automation).length));
+  }
+
+  function shipAutomationBadges(ship) {
+    var automation = shipAutomation(ship.name);
+    var out = [programBadge(ship.name), automationBadge(ship)];
+    if (!automation) { return out.join(''); }
+
+    if (automation.plan) {
+      out.push('<span class="badge ' + (PHASE_TONE[automation.plan.phase] || 'info') + '">'
+        + esc(automation.plan.kind) + ' · ' + esc(automation.plan.phase) + '</span>');
+    }
+    if (automation.reaction) {
+      out.push('<span class="badge ' + ((REACTION_PHASES[automation.reaction.phase] || [])[0] || 'info') + '">'
+        + esc(automation.reaction.kind) + ' · ' + esc(automation.reaction.phase) + '</span>');
+    }
+    if (automation.transfer) {
+      out.push('<span class="badge info" title="' + esc(transferText(automation.transfer, true)) + '">transfer · '
+        + esc(automation.transfer.phase || 'moving') + '</span>');
+    }
+    var on = standingOn(automation);
+    if (on.length) {
+      out.push('<span class="badge" title="standing orders">standing · ' + esc(on.map(function (key) {
+        return standingLabel(key).toLowerCase();
+      }).join(', ')) + '</span>');
+    }
+    return out.join('');
+  }
+
+  function renderAutomationList() {
+    var rows = $('#automation-rows');
+    if (!rows) { return; }
+
+    var ships = S.ships.filter(function (ship) { return !isStation(ship); });
+    var automated = ships.filter(isAutomated);
+    var shown = S.autoFilter === 'all' ? ships : automated;
+
+    $('#automation-count').textContent = numText(automated.length) + ' of ' + numText(ships.length) + ' ships automated';
+
+    rows.innerHTML = shown.map(function (ship) {
+      var entry = automationFor(ship.name);
+      var automation = shipAutomation(ship.name);
+      var sub = [];
+      if (entry && entry.rule) { sub.push(esc(entry.rule.mission) + ': ' + esc((entry.state || {}).message || '')); }
+      if (automation && automation.plan && automation.plan.target) { sub.push('heading for ' + esc(coords(automation.plan.target))); }
+      if (!sub.length) { sub.push(esc(coords(ship.position))); }
+
+      return '<div class="ship-row' + (ship.name === S.selected ? ' sel' : '') + '" data-auto-ship="' + esc(ship.name) + '">'
+        + '<div class="n">' + esc(ship.name) + '</div>'
+        + '<div class="badges">' + (isAutomated(ship) ? shipAutomationBadges(ship) : '<span class="badge">manual</span>') + '</div>'
+        + '<div class="s">' + sub.join(' · ') + '</div>'
+        + '</div>';
+    }).join('')
+      || '<div class="empty muted">' + (S.connected
+        ? (S.autoFilter === 'all' ? 'No ships listed. The Fleet tab\'s owner filter applies here too.'
+          : 'No ship is automated yet. Pick one under All ships.')
+        : 'Connect first.') + '</div>';
+  }
+
+  function renderAutomationPane() {
+    var pane = $('#automation-pane');
+    if (!pane) { return; }
+
+    var name = S.selected;
+    var ship = name && S.byName[name];
+
+    if (!name) {
+      pane.innerHTML = '<div class="empty muted">Select a ship.</div>';
+      return;
+    }
+    if (isStation(ship)) {
+      pane.innerHTML = '<div class="empty muted">' + esc(name) + ' is a station, which has no automation to set here.</div>';
+      return;
+    }
+
+    pane.innerHTML = '<div class="ship-head" style="padding:0 0 10px">'
+      + '<div><h1>' + esc(name) + '</h1><div class="muted">'
+      + esc(ship ? coords(ship.position) + (ship.owner && ship.owner.kind === 'alliance' ? ' · alliance craft' : '') : '')
+      + '</div></div>'
+      + '<div class="badges">' + (ship ? availabilityBadge(ship) : '') + '</div>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-act="open-fleet">open in Fleet</button>'
+      + '</div>'
+      + renderProgram()
+      + renderAutomation()
+      + renderLibrary()
+      + '<div data-standing-orders></div>';
+
+    renderStanding();
+  }
+
+  function renderAutomationView() {
+    renderAutomationList();
+    renderAutomationPane();
+  }
+
+  /* ============================== ORDER PROGRAMS ==============================
+   *
+   * A program is a list of steps the mod works a craft through by itself, each until its
+   * conditions are met: farm until the hold is full, fly to the station, loop. Like mission
+   * automation it is stored and run on the server; this is the view onto it and its editor.
+   * The editor keeps the program in the API's own shape, so saving sends the form as it is.
+   */
+
+  var PROGRAM_STATUS = {
+    running:  { tone: 'good', label: 'running' },
+    starting: { tone: 'busy', label: 'starting a step' },
+    waiting:  { tone: 'info', label: 'waiting' },
+    retrying: { tone: 'warn', label: 'retrying' },
+    finished: { tone: '',     label: 'finished' },
+    disabled: { tone: '',     label: 'off' },
+    error:    { tone: 'bad',  label: 'error' }
+  };
+
+  var PROGRAM_ACTIONS = [
+    ['route', 'fly a route'],
+    ['farm', 'farm bosses'],
+    ['orders', 'run orders'],
+    ['mission', 'go on a mission'],
+    ['travel', 'travel (mission)'],
+    ['standing', 'set standing orders'],
+    ['transfer', 'transfer cargo'],
+    ['wait', 'wait']
+  ];
+
+  var PROGRAM_CONDITIONS = [
+    ['cargo', 'cargo'],
+    ['good', 'good in hold'],
+    ['bossKills', 'boss kills'],
+    ['arrived', 'arrived'],
+    ['planEnded', 'plan ended'],
+    ['missionReturned', 'back from mission'],
+    ['elapsed', 'time in step'],
+    ['enemies', 'enemies'],
+    ['idle', 'ship idle'],
+    ['at', 'in sector']
+  ];
+
+  /* Actions that end by themselves; the rest need a condition. */
+  var PROGRAM_NATURAL_END = { route: 'when it arrives', orders: 'when the chain runs out',
+                              mission: 'when it is back', travel: 'when it arrives', standing: 'at once',
+                              transfer: 'when the cargo has moved' };
+
+  /* The Travel mission's swiftness, as the order window offers it. */
+  var SWIFTNESS = [['0', 'careful'], ['1', 'cautious'], ['2', 'swift'], ['3', 'reckless']];
+
+  var PROGRAM_ORDER_TYPES = ['patrol', 'repair', 'aggressive', 'mine', 'salvage', 'refine', 'jump'];
+
+  function programKey(name) {
+    var ship = S.byName[name];
+    return autoKey(ship && ship.owner && ship.owner.kind, name);
+  }
+
+  function programFor(name) {
+    return S.programs.byKey[programKey(name)] || null;
+  }
+
+  function loadPrograms(userInitiated) {
+    return Api.get('/automation/programs', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'programs' })
+      .then(function (body) {
+        var byKey = {};
+        (body.programs || []).forEach(function (entry) {
+          byKey[autoKey(entry.owner && entry.owner.kind, entry.ship)] = entry;
+        });
+        S.programs = { byKey: byKey, serverTime: body.serverTime, receivedAt: Date.now(),
+                       error: null, loaded: true };
+        refreshProgramStatus();
+        renderAutomationList();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.programs.error = error;
+        S.programs.loaded = true;
+        refreshProgramStatus();
+      });
+  }
+
+  function storeProgram(body) {
+    var key = autoKey(body.owner && body.owner.kind, body.ship);
+    if (body.program) { S.programs.byKey[key] = body; } else { delete S.programs.byKey[key]; }
+    if (typeof body.serverTime === 'number') {
+      S.programs.serverTime = body.serverTime;
+      S.programs.receivedAt = Date.now();
+    }
+    renderAutomationList();
+  }
+
+  function programAgo(at) {
+    if (typeof at !== 'number' || typeof S.programs.serverTime !== 'number') { return ''; }
+    var age = Math.max(0, S.programs.serverTime - at + (Date.now() - S.programs.receivedAt) / 1000);
+    return duration(age) + ' ago';
+  }
+
+  function programBadge(name) {
+    var entry = programFor(name);
+    if (!entry || !entry.program) { return ''; }
+    var st = entry.state || {};
+    var status = entry.program.enabled ? PROGRAM_STATUS[st.status] || { tone: 'info', label: st.status } : PROGRAM_STATUS.disabled;
+    return '<span class="badge ' + status.tone + '" title="' + esc(st.message || '') + '">program · '
+      + (entry.program.enabled && st.status !== 'finished' ? 'step ' + num(st.step) : esc(status.label)) + '</span>';
+  }
+
+  /* --- words for a step --- */
+
+  function actionText(action) {
+    if (!action) { return '—'; }
+    if (action.type === 'route') {
+      return 'fly to ' + coords(action.to) + (action.onEnemies ? ', on enemies ' + esc(action.onEnemies) : '');
+    }
+    if (action.type === 'farm') {
+      return 'farm ' + esc(BOSS_NAMES[action.boss] || 'the nearest boss ring')
+        + (action.collectLoot === false ? ', leaving the loot' : '');
+    }
+    if (action.type === 'orders') {
+      return 'orders: ' + esc((action.orders || []).map(function (o) {
+        return typeof o === 'string' ? o : o.type + (o.to ? ' ' + o.to.x + ':' + o.to.y : '');
+      }).join(' → '));
+    }
+    if (action.type === 'mission') {
+      if (action.library) { return 'mission: <b>' + esc(action.library) + '</b> <span class="mute2">from the library</span>'; }
+      return action.rule ? 'mission: ' + esc(action.rule.mission) + ' (own limits)' : 'mission under the craft\'s rule';
+    }
+    if (action.type === 'travel') {
+      var swift = SWIFTNESS.filter(function (s) { return Number(s[0]) === (action.swiftness == null ? 2 : action.swiftness); })[0];
+      return 'travel to ' + coords(action.to) + (swift ? ', ' + swift[1] : '');
+    }
+    if (action.type === 'standing') {
+      var parts = [];
+      STANDING.forEach(function (spec) {
+        var order = action.standing && action.standing[spec.key];
+        if (!order) { return; }
+        parts.push(spec.label.toLowerCase() + ' ' + (order.enabled === false ? 'off' : order.mode === 'interrupt' ? 'always' : order.enabled ? 'when idle' : order.mode || ''));
+      });
+      if (action.attackCivilians != null) { parts.push('civilians ' + (action.attackCivilians ? 'count' : 'spared')); }
+      return 'standing orders: ' + esc(parts.join(', ') || 'unchanged');
+    }
+    if (action.type === 'transfer') {
+      return transferText(action);
+    }
+    return 'wait';
+  }
+
+  function conditionText(c) {
+    if (c.type === 'cargo') { return 'cargo ' + esc(c.op || '>=') + ' ' + num(c.percent) + '%'; }
+    if (c.type === 'good') { return esc(c.name) + ' ' + esc(c.op || '>=') + ' ' + num(c.amount); }
+    if (c.type === 'bossKills') { return num(c.count) + ' boss kills'; }
+    if (c.type === 'elapsed') { return duration(c.seconds) + ' in the step'; }
+    if (c.type === 'enemies') { return c.present === false ? 'no enemies' : 'enemies in sector'; }
+    if (c.type === 'at') { return 'in ' + coords(c); }
+    var named = PROGRAM_CONDITIONS.filter(function (p) { return p[0] === c.type; })[0];
+    return esc(named ? named[1] : c.type);
+  }
+
+  function untilText(step) {
+    var until = step['until'] || {};
+    var conditions = until.conditions || [];
+    if (!conditions.length) { return PROGRAM_NATURAL_END[step.action.type] || 'never'; }
+    return 'until ' + conditions.map(conditionText).join(until.match === 'all' ? ' and ' : ' or ')
+      + (step['repeat'] ? ', repeating' : '');
+  }
+
+  function thenText(step, index, count) {
+    if (step['then'] === 'stop') { return 'then stop'; }
+    if (step['then'] === 'start') { return 'then back to step 1'; }
+    if (step['then'] === 'goto') { return 'then step ' + num(step['goto']); }
+    return index + 1 < count ? 'then next' : 'then the program ends';
+  }
+
+  /* --- status --- */
+
+  function refreshProgramStatus() {
+    var node = $('#automation-pane [data-program-status]');
+    if (node && S.selected) { node.innerHTML = renderProgramStatus(); }
+  }
+
+  function renderProgram() {
+    return '<div class="section auto-section"><h2>Program ' + explain('program-overview') + '</h2>'
+      + '<div data-program-status>' + renderProgramStatus() + '</div>'
+      + '<div data-program-editor>' + renderProgramEditor() + '</div>'
+      + '</div>';
+  }
+
+  function renderProgramStatus() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.programs.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without order programs.</div>';
+    }
+    if (failed && !Object.keys(S.programs.byKey).length) { return errorBox('Programs unavailable', failed); }
+    if (!S.programs.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var entry = programFor(name);
+    var editing = S.progForm && S.progForm.ship === name;
+
+    if (!entry || !entry.program) {
+      if (editing) { return ''; }
+      return '<div class="row"><span class="note">No program. A program works the craft through steps '
+        + 'by itself &mdash; farm until the hold is full, fly to a station, go again.</span>'
+        + '<button data-prog-act="new">New program…</button></div>';
+    }
+
+    var program = entry.program;
+    var st = entry.state || {};
+    var status = program.enabled ? PROGRAM_STATUS[st.status] || { tone: 'info', label: st.status || 'unknown' } : PROGRAM_STATUS.disabled;
+    var out = [];
+
+    out.push('<div class="row auto-head">'
+      + '<label class="check switch"><input type="checkbox" data-prog-toggle' + (program.enabled ? ' checked' : '')
+      + '><span><b>' + esc(program.name || 'Program') + '</b></span></label>'
+      + '<span class="badge ' + status.tone + '">' + esc(status.label) + '</span>'
+      + '<span class="auto-message">' + esc(st.message || '') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-prog-act="restart" title="Back to step 1">restart</button>'
+      + (editing ? '' : '<button class="ghost small" data-prog-act="edit">edit</button>')
+      + '<button class="ghost small danger" data-prog-act="remove">remove</button>'
+      + '</div>');
+
+    out.push('<div class="program-steps">' + (program.steps || []).map(function (step, i) {
+      var current = st.step === i + 1 && st.status !== 'finished';
+      var conditions = current && st.conditions && st.conditions.length
+        ? '<div class="row tight" style="margin-top:4px">' + st.conditions.map(function (c) {
+            return '<span class="badge ' + (c.met ? 'good' : '') + '">' + esc(c.text) + '</span>';
+          }).join('') + (st.bossKills ? '<span class="mute2">' + num(st.bossKills) + ' kills so far</span>' : '')
+          + '<span class="mute2">' + esc(programAgo(st.stepSince)) + '</span></div>'
+        : '';
+      return '<div class="order-row program-step' + (current ? ' current' : '') + '">'
+        + '<span class="idx">' + (i + 1) + '</span>'
+        + '<div class="program-step-body"><div>' + (step.name ? '<b>' + esc(step.name) + '</b> · ' : '')
+        + actionText(step.action) + '</div>'
+        + '<div class="mute2">' + untilText(step) + ' · ' + thenText(step, i, program.steps.length) + '</div>'
+        + conditions + '</div>'
+        + '<span class="spacer"></span>'
+        + (current ? '<span class="badge good">now</span>'
+          : '<button class="ghost small" data-prog-goto="' + (i + 1) + '" title="Move the program to this step">go here</button>')
+        + '</div>';
+    }).join('') + '</div>');
+
+    if (st.log && st.log.length) {
+      out.push('<details class="card auto-log" style="margin-top:10px"><summary>Program log '
+        + '<span class="mute2">' + st.log.length + '</span></summary>'
+        + st.log.slice().reverse().map(function (line) {
+            var tone = (PROGRAM_STATUS[line.status] || {}).tone || '';
+            return '<div class="log-line ' + (tone === 'bad' ? 'err' : tone === 'warn' ? 'warn' : '') + '">'
+              + '<span class="t">' + esc(programAgo(line.at)) + '</span>'
+              + '<span class="k">step ' + esc(String(line.step)) + '</span>'
+              + '<span class="m">' + esc(line.message) + (line.detail ? ' <span class="dim">· ' + esc(line.detail) + '</span>' : '') + '</span>'
+              + '</div>';
+          }).join('')
+        + '</details>');
+    }
+
+    out.push('<div class="mute2" style="margin-top:6px">saved by ' + esc((program.updatedBy && program.updatedBy.name) || '—')
+      + ' · rev ' + num(program.revision) + '</div>');
+
+    return out.join('');
+  }
+
+  /* --- editor --- */
+
+  function blankStep(type) {
+    var action = { type: type };
+    if (type === 'route' || type === 'travel') {
+      var ship = S.byName[S.selected] || {};
+      action.to = { x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 };
+    }
+    if (type === 'travel') { action.swiftness = 2; }
+    if (type === 'farm') { action.boss = 'auto'; }
+    if (type === 'orders') { action.orders = [{ type: 'patrol' }]; }
+    if (type === 'standing') { action.standing = { enemies: { enabled: true, mode: 'interrupt' } }; }
+    if (type === 'transfer') {
+      var here = transferTargets(S.selected).filter(function (t) { return t.sameSector; })[0];
+      action.target = here ? here.name : '';
+      if (here) { action.targetOwner = here.owner.kind; }
+      action.direction = 'give';
+      action.all = true;
+      action.approach = true;
+      if (!S.transferData[S.selected]) { loadTransfer(S.selected); }
+    }
+
+    var needs = !PROGRAM_NATURAL_END[type];
+    return {
+      action: action,
+      'until': { match: 'any', conditions: needs ? [blankCondition(type === 'farm' ? 'cargo' : 'elapsed')] : [] },
+      'repeat': false,
+      'then': 'next'
+    };
+  }
+
+  function blankCondition(type) {
+    if (type === 'cargo') { return { type: 'cargo', op: '>=', percent: 80 }; }
+    if (type === 'good') { return { type: 'good', name: '', op: '>=', amount: 100 }; }
+    if (type === 'bossKills') { return { type: 'bossKills', count: 1 }; }
+    if (type === 'elapsed') { return { type: 'elapsed', seconds: 600 }; }
+    if (type === 'enemies') { return { type: 'enemies', present: false }; }
+    if (type === 'at') {
+      var ship = S.byName[S.selected] || {};
+      return { type: 'at', x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 };
+    }
+    return { type: type };
+  }
+
+  function openProgramEditor(entry) {
+    var program = entry && entry.program;
+    S.progForm = {
+      ship: S.selected,
+      name: program ? program.name : 'Program',
+      steps: program ? JSON.parse(JSON.stringify(program.steps)) : [blankStep('route')],
+      revision: program ? program.revision : 0,
+      existing: !!program,
+      error: null
+    };
+    redrawProgram();
+  }
+
+  function pfInput(path, value, attrs) {
+    return '<input data-pf="' + path + '" value="' + esc(value == null ? '' : String(value)) + '" ' + (attrs || '') + '>';
+  }
+
+  function pfSelect(path, value, options, attrs) {
+    return '<select data-pf="' + path + '" ' + (attrs || '') + '>' + options.map(function (o) {
+      return '<option value="' + esc(o[0]) + '"' + (String(value) === String(o[0]) ? ' selected' : '') + '>' + esc(o[1]) + '</option>';
+    }).join('') + '</select>';
+  }
+
+  function actionFields(step, i) {
+    var a = step.action;
+    var p = 'steps.' + i + '.action.';
+
+    if (a.type === 'route') {
+      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">on enemies</span>'
+        + pfSelect(p + 'onEnemies', a.onEnemies || 'fight', ON_ENEMIES);
+    }
+    if (a.type === 'farm') {
+      return pfSelect(p + 'boss', a.boss || 'auto', BOSSES)
+        + '<label class="check"><input type="checkbox" data-pf="' + p + 'collectLoot" data-pf-bool'
+        + (a.collectLoot === false ? '' : ' checked') + '><span>collect loot</span></label>';
+    }
+    if (a.type === 'orders') {
+      var order = (a.orders && a.orders[0]) || { type: 'patrol' };
+      return pfSelect(p + 'orders.0.type', order.type, PROGRAM_ORDER_TYPES.map(function (t) { return [t, t]; }), 'data-pf-rerender')
+        + (order.type === 'jump'
+          ? '<span class="mute2">to</span>' + pfInput(p + 'orders.0.to.x', (order.to || {}).x || 0, 'type="number" data-pf-num style="width:78px"')
+            + '<span class="mute2">:</span>' + pfInput(p + 'orders.0.to.y', (order.to || {}).y || 0, 'type="number" data-pf-num style="width:78px"')
+          : '');
+    }
+    if (a.type === 'mission') {
+      var names = libraryFor(S.selected).map(function (m) { return m.name; });
+      if (a.library && names.indexOf(a.library) === -1) { names.push(a.library); }
+      return pfSelect(p + 'library', a.library || '', [['', 'the craft\'s mission rule']].concat(names.map(function (n) {
+          return [n, n];
+        })), 'data-pf-rerender')
+        + '<span class="mute2">' + (a.library ? 'from the mission library, as it is when the step starts'
+          : names.length ? 'under its limits' : 'under its limits &mdash; add missions to the library below to pick others') + '</span>';
+    }
+    if (a.type === 'travel') {
+      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+        + pfSelect(p + 'swiftness', a.swiftness == null ? 2 : a.swiftness, SWIFTNESS, 'data-pf-num');
+    }
+    if (a.type === 'transfer') {
+      var slot = S.transferData[S.selected];
+      if (!slot) { loadTransfer(S.selected); }
+      var targets = transferTargets(S.selected);
+      var options = [['', slot && slot.loading ? 'loading craft…' : 'pick a craft…']].concat(targets.map(function (t) {
+        return [t.name, t.name + (t.owner.kind === 'alliance' ? ' (alliance)' : '')
+          + (t.sameSector ? ' · here' : ' · ' + coords(t.position))];
+      }));
+      if (a.target && !targets.some(function (t) { return t.name === a.target; })) { options.push([a.target, a.target]); }
+      return pfSelect(p + 'target', a.target || '', options, 'data-pf-rerender data-pf-transfer-target')
+        + pfSelect(p + 'direction', a.direction || 'give', [['give', 'give to it'], ['take', 'take from it']], 'data-pf-rerender')
+        + '<label class="check"><input type="checkbox" data-pf="' + p + 'all" data-pf-bool data-pf-rerender'
+        + (a.all ? ' checked' : '') + '><span>everything</span></label>'
+        + '<label class="check" title="Dock at a station, or fly alongside a ship, when it is out of reach"><input type="checkbox" data-pf="'
+        + p + 'approach" data-pf-bool' + (a.approach === false ? '' : ' checked') + '><span>approach</span></label>';
+    }
+    if (a.type === 'standing') {
+      return STANDING.map(function (spec) {
+        var order = a.standing && a.standing[spec.key];
+        var value = !order ? '' : order.enabled === false ? 'off' : order.mode || 'idle';
+        return '<span class="mute2">' + esc(spec.label.toLowerCase()) + '</span>'
+          + '<select data-pf-standing="' + i + '" data-pf-standing-key="' + spec.key + '">'
+          + [['', 'unchanged'], ['off', 'off'], ['idle', 'when idle'], ['interrupt', 'interrupt']].map(function (o) {
+              return '<option value="' + o[0] + '"' + (value === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+            }).join('') + '</select>';
+      }).join('');
+    }
+    return '';
+  }
+
+  /* Fields an action needs below its row: a transfer's goods, picked from the hold they
+     come out of as it is now, or named for whatever it will hold when the step runs. */
+  function actionBlock(step, i) {
+    var a = step.action;
+    if (a.type !== 'transfer') { return ''; }
+
+    var p = 'steps.' + i + '.action.';
+    var source = transferSource(S.selected, a.target, a.targetOwner, a.direction);
+    var held = source && source.cargo ? source.cargo.goods || [] : [];
+    var sourceName = !source ? '' : source.name;
+
+    var heldHtml = source
+      ? '<span class="mute2">' + esc(sourceName) + ' holds now:</span>'
+        + (held.length
+          ? held.map(function (g) {
+              return '<button class="chip" data-prog-good-pick="' + i + '" data-good="' + esc(g.name) + '"'
+                + (g.stolen ? ' data-stolen="1"' : '') + (a.all ? ' disabled' : '')
+                + ' title="add to the goods">+ ' + esc(g.name) + (g.stolen ? ' (stolen)' : '') + ' ' + num(g.amount) + '</button>';
+            }).join('')
+          : '<span class="mute2">nothing</span>')
+      : '<span class="mute2">pick a craft to see what the hold it comes out of has</span>';
+
+    if (a.all) {
+      return '<div class="row tight program-condition">' + heldHtml + '</div>';
+    }
+
+    var goods = a.goods || [];
+    var names = {};
+    held.forEach(function (g) { names[g.name] = true; });
+
+    return '<datalist id="pf-goods-' + i + '">' + Object.keys(names).map(function (n) {
+        return '<option value="' + esc(n) + '">';
+      }).join('') + '</datalist>'
+      + goods.map(function (g, j) {
+          var have = held.filter(function (h) {
+            return h.name === g.name && (g.stolen == null || !!h.stolen === g.stolen);
+          }).reduce(function (sum, h) { return sum + (h.amount || 0); }, 0);
+          return '<div class="row tight program-condition">'
+            + '<span class="mute2">good</span>'
+            + pfInput(p + 'goods.' + j + '.name', g.name, 'type="text" list="pf-goods-' + i + '" placeholder="good, e.g. Iron" style="width:150px"')
+            + pfInput(p + 'goods.' + j + '.amount', g.amount == null ? '' : g.amount,
+                      'type="number" min="1" step="1" placeholder="all of it" data-pf-optnum style="width:96px"')
+            + (g.stolen ? '<span class="badge warn">stolen only</span>' : g.stolen === false ? '<span class="badge">not stolen</span>' : '')
+            + (source && g.name ? '<span class="mute2">' + num(have) + ' there now</span>' : '')
+            + '<button class="ghost small" data-prog-good-del="' + i + ':' + j + '">×</button></div>';
+        }).join('')
+      + '<div class="row tight program-condition">'
+      + '<button class="ghost small" data-prog-good-add="' + i + '">+ good</button>'
+      + heldHtml + '</div>';
+  }
+
+  function conditionFields(c, i, j) {
+    var p = 'steps.' + i + '.until.conditions.' + j + '.';
+    var ops = [['>=', 'at least'], ['<=', 'at most']];
+    if (c.type === 'cargo') {
+      return pfSelect(p + 'op', c.op || '>=', ops) + pfInput(p + 'percent', c.percent, 'type="number" min="0" max="100" data-pf-num style="width:64px"') + '<span class="mute2">%</span>';
+    }
+    if (c.type === 'good') {
+      return pfInput(p + 'name', c.name, 'type="text" placeholder="good, e.g. Iron" style="width:130px"')
+        + pfSelect(p + 'op', c.op || '>=', ops) + pfInput(p + 'amount', c.amount, 'type="number" min="0" data-pf-num style="width:78px"');
+    }
+    if (c.type === 'bossKills') { return pfInput(p + 'count', c.count, 'type="number" min="1" data-pf-num style="width:64px"'); }
+    if (c.type === 'elapsed') {
+      return pfInput(p + 'seconds', Math.round(c.seconds / 60), 'type="number" min="1" data-pf-num data-pf-scale="60" style="width:64px"') + '<span class="mute2">min</span>';
+    }
+    if (c.type === 'enemies') { return pfSelect(p + 'present', c.present === false ? 'false' : 'true', [['true', 'present'], ['false', 'gone']], 'data-pf-boolsel'); }
+    if (c.type === 'at') {
+      return pfInput(p + 'x', c.x, 'type="number" data-pf-num style="width:78px"') + '<span class="mute2">:</span>'
+        + pfInput(p + 'y', c.y, 'type="number" data-pf-num style="width:78px"');
+    }
+    return '';
+  }
+
+  function renderProgramEditor() {
+    var form = S.progForm;
+    if (!form || form.ship !== S.selected) { return ''; }
+
+    var count = form.steps.length;
+    var steps = form.steps.map(function (step, i) {
+      var until = step['until'];
+      var conditions = until.conditions.map(function (c, j) {
+        return '<div class="row tight program-condition">'
+          + pfSelect('steps.' + i + '.until.conditions.' + j + '.type', c.type, PROGRAM_CONDITIONS, 'data-pf-condition-type')
+          + conditionFields(c, i, j)
+          + '<button class="ghost small" data-prog-cond-del="' + i + ':' + j + '">×</button></div>';
+      }).join('');
+
+      return '<div class="card program-edit-step" style="margin-top:8px">'
+        + '<div class="row tight"><span class="idx"><b>' + (i + 1) + '</b></span>'
+        + pfInput('steps.' + i + '.name', step.name, 'type="text" placeholder="name (optional)" style="width:140px"')
+        + pfSelect('steps.' + i + '.action.type', step.action.type, PROGRAM_ACTIONS, 'data-pf-action-type')
+        + actionFields(step, i)
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-prog-step-up="' + i + '"' + (i ? '' : ' disabled') + '>↑</button>'
+        + '<button class="ghost small" data-prog-step-del="' + i + '"' + (count > 1 ? '' : ' disabled') + '>×</button></div>'
+        + actionBlock(step, i)
+        + '<div class="row tight" style="margin-top:6px"><span class="mute2">until</span>'
+        + (until.conditions.length > 1 ? pfSelect('steps.' + i + '.until.match', until.match, [['any', 'any of'], ['all', 'all of']]) : '')
+        + (until.conditions.length ? '' : '<span class="mute2">' + esc(PROGRAM_NATURAL_END[step.action.type] || 'a condition is needed') + '</span>')
+        + '<button class="ghost small" data-prog-cond-add="' + i + '">+ condition</button>'
+        + (until.conditions.length
+          ? '<label class="check"><input type="checkbox" data-pf="steps.' + i + '.repeat" data-pf-bool' + (step['repeat'] ? ' checked' : '')
+            + (PROGRAM_NATURAL_END[step.action.type] && step.action.type !== 'standing' ? '' : ' disabled')
+            + '><span>repeat the action until then</span></label>'
+          : '')
+        + '</div>'
+        + conditions
+        + '<div class="row tight" style="margin-top:6px"><span class="mute2">then</span>'
+        + pfSelect('steps.' + i + '.then', step['then'] || 'next', [['next', i + 1 < count ? 'next step' : 'end'], ['start', 'go to start'], ['goto', 'go to step'], ['stop', 'stop']], 'data-pf-rerender')
+        + (step['then'] === 'goto'
+          ? pfInput('steps.' + i + '.goto', step['goto'] || 1, 'type="number" min="1" max="' + count + '" data-pf-num style="width:56px"')
+          : '')
+        + '</div></div>';
+    }).join('');
+
+    return '<div class="card auto-editor program-editor" style="margin-top:10px">'
+      + '<div class="row"><h3 style="margin-bottom:0">' + (form.existing ? 'Edit program' : 'New program') + '</h3>'
+      + pfInput('name', form.name, 'type="text" style="width:200px"') + '</div>'
+      + steps
+      + '<div class="row" style="margin-top:10px">'
+      + '<button class="ghost small" data-prog-act="add-step">+ step</button>'
+      + '<span class="spacer"></span>'
+      + '<button class="primary" data-prog-act="save">' + (form.existing ? 'Save program' : 'Save and start') + '</button>'
+      + '<button class="ghost" data-prog-act="cancel">Cancel</button></div>'
+      + (form.error ? '<div style="margin-top:8px">' + errorBox('Not saved', form.error) + '</div>' : '')
+      + (form.existing ? '<div class="mute2" style="margin-top:6px">Saving changed steps starts the program over at step 1.</div>' : '')
+      + '</div>';
+  }
+
+  function redrawProgram() {
+    var editor = $('#automation-pane [data-program-editor]');
+    if (editor) { editor.innerHTML = renderProgramEditor(); }
+    refreshProgramStatus();
+  }
+
+  function setPath(target, path, value) {
+    var keys = path.split('.');
+    var node = target;
+    for (var i = 0; i < keys.length - 1; i++) {
+      if (node[keys[i]] == null) { node[keys[i]] = /^\d+$/.test(keys[i + 1]) ? [] : {}; }
+      node = node[keys[i]];
+    }
+    node[keys[keys.length - 1]] = value;
+  }
+
+  /* Reads one field back into the form. Returns whether the editor has to redraw. */
+  function programField(node) {
+    var form = S.progForm;
+    if (!form) { return false; }
+
+    if (node.dataset.pfStanding !== undefined) {
+      var step = form.steps[Number(node.dataset.pfStanding)];
+      step.action.standing = step.action.standing || {};
+      var key = node.dataset.pfStandingKey;
+      if (!node.value) { delete step.action.standing[key]; }
+      else if (node.value === 'off') { step.action.standing[key] = { enabled: false }; }
+      else { step.action.standing[key] = { enabled: true, mode: node.value }; }
+      return false;
+    }
+
+    var path = node.dataset.pf;
+    if (!path) { return false; }
+
+    var value = node.value;
+    if (node.dataset.pfOptnum !== undefined) {
+      var parent = path.split('.');
+      var leaf = parent.pop();
+      var holder = form;
+      parent.forEach(function (key) { holder = holder == null ? null : holder[key]; });
+      if (!holder) { return false; }
+      if (value === '' || !isFinite(Number(value)) || Number(value) < 1) { delete holder[leaf]; }
+      else { holder[leaf] = Math.round(Number(value)); }
+      return false;
+    }
+    if (node.dataset.pfBool !== undefined) { value = node.checked; }
+    else if (node.dataset.pfBoolsel !== undefined) { value = value === 'true'; }
+    else if (node.dataset.pfNum !== undefined) {
+      value = Number(value) * (Number(node.dataset.pfScale) || 1);
+      if (!isFinite(value)) { return false; }
+    }
+
+    if (node.dataset.pfActionType !== undefined) {
+      var index = Number(path.split('.')[1]);
+      var keep = form.steps[index];
+      var fresh = blankStep(value);
+      fresh.name = keep.name;
+      fresh['then'] = keep['then'];
+      fresh['goto'] = keep['goto'];
+      if (keep['until'].conditions.length) { fresh['until'] = keep['until']; }
+      form.steps[index] = fresh;
+      return true;
+    }
+
+    if (node.dataset.pfConditionType !== undefined) {
+      var parts = path.split('.');
+      form.steps[Number(parts[1])]['until'].conditions[Number(parts[4])] = blankCondition(value);
+      return true;
+    }
+
+    if (path === 'name') { form.name = value; return false; }
+    if (node.dataset.pfTransferTarget !== undefined) {
+      var transferAction = form.steps[Number(path.split('.')[1])].action;
+      var picked = transferTargets(S.selected).filter(function (t) { return t.name === value; })[0];
+      transferAction.target = value;
+      if (picked) { transferAction.targetOwner = picked.owner.kind; } else { delete transferAction.targetOwner; }
+      return true;
+    }
+    if (/^steps\.\d+\.action\.library$/.test(path) && !value) {
+      delete form.steps[Number(path.split('.')[1])].action.library;
+      return true;
+    }
+    setPath(form, path, value);
+    // The step box shows 1 as soon as "go to step" is picked; store it too, or a save
+    // without retyping the number sends no goto at all.
+    if (/^steps\.\d+\.then$/.test(path) && value === 'goto') {
+      var target = form.steps[Number(path.split('.')[1])];
+      if (target['goto'] == null) { target['goto'] = 1; }
+    }
+    return node.dataset.pfRerender !== undefined;
+  }
+
+  function programBody(form) {
+    var steps = form.steps.map(function (step) {
+      var copy = JSON.parse(JSON.stringify(step));
+      if (copy['then'] !== 'goto') { delete copy['goto']; }
+      if (!copy.name) { delete copy.name; }
+      if (copy.action.type === 'orders') {
+        copy.action.orders = copy.action.orders.map(function (o) {
+          return o.type === 'jump' ? { type: 'jump', to: o.to || { x: 0, y: 0 } } : { type: o.type };
+        });
+      }
+      if (copy.action.type === 'transfer') {
+        if (copy.action.all) {
+          delete copy.action.goods;
+        } else {
+          delete copy.action.all;
+          copy.action.goods = (copy.action.goods || []).filter(function (g) {
+            return g.name && String(g.name).trim();
+          }).map(function (g) {
+            var good = { name: String(g.name).trim() };
+            if (g.amount) { good.amount = Math.round(g.amount); }
+            if (g.stolen != null) { good.stolen = g.stolen; }
+            return good;
+          });
+        }
+        if (!copy.action.targetOwner) { delete copy.action.targetOwner; }
+      }
+      if (!copy['until'].conditions.length) { copy['repeat'] = false; }
+      return copy;
+    });
+    return { name: form.name, steps: steps };
+  }
+
+  function programPath(name, suffix) {
+    return '/ships/' + Api.seg(name) + '/program' + (suffix || '');
+  }
+
+  function programConflict(error) {
+    if (error.code !== 'program_changed') { return false; }
+    toast('warn', 'Program changed elsewhere',
+          'Someone else saved this program since it was loaded. It has been reloaded; apply your change again.');
+    S.progForm = null;
+    loadPrograms(true).then(redrawProgram);
+    return true;
+  }
+
+  function saveProgram(button) {
+    var form = S.progForm;
+    var name = S.selected;
+    if (!form || !name) { return; }
+
+    var body = programBody(form);
+    body.ifRevision = form.revision;
+    if (!form.existing) { body.enabled = true; }
+
+    return guard(button, Api.post(programPath(name), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'save program' }))
+      .then(function (result) {
+        storeProgram(result);
+        S.progForm = null;
+        toast('good', 'Program saved', name + ': ' + (result.program.enabled ? 'it starts on the next pass.' : 'switched off.'));
+        redrawProgram();
+      })
+      .catch(function (error) {
+        if (programConflict(error)) { return; }
+        form.error = error;
+        redrawProgram();
+      });
+  }
+
+  function toggleProgram(input) {
+    var name = S.selected;
+    var entry = programFor(name);
+    if (!entry || !entry.program) { return; }
+
+    var enabled = input.checked;
+    input.disabled = true;
+
+    Api.post(programPath(name), { enabled: enabled, ifRevision: entry.program.revision },
+             { owner: ownerParamFor(name) }, { priority: Api.P.USER, label: 'toggle program' })
+      .then(function (result) {
+        storeProgram(result);
+        toast('good', enabled ? 'Program on' : 'Program off', name);
+        refreshProgramStatus();
+      })
+      .catch(function (error) {
+        input.checked = !enabled;
+        input.disabled = false;
+        if (programConflict(error)) { return; }
+        apiFailed(error, 'Could not switch the program');
+      });
+  }
+
+  function controlProgram(button, body) {
+    var name = S.selected;
+    return guard(button, Api.post(programPath(name, '/control'), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'move program' }))
+      .then(function (result) {
+        storeProgram(result);
+        refreshProgramStatus();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not move the program'); });
+  }
+
+  function removeProgram(button) {
+    var name = S.selected;
+    if (!name || !window.confirm('Remove the program for ' + name + '?')) { return; }
+
+    return guard(button, Api.post(programPath(name, '/delete'), {}, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'remove program' }))
+      .then(function (result) {
+        storeProgram(result);
+        S.progForm = null;
+        toast('good', 'Program removed', name);
+        redrawProgram();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove the program'); });
+  }
+
+  /* Clicks inside the program section. Returns whether it was one of its controls. */
+  function programClick(button) {
+    var form = S.progForm;
+    var act = button.dataset.progAct;
+
+    if (act === 'new') { openProgramEditor(null); return true; }
+    if (act === 'edit') { openProgramEditor(programFor(S.selected)); return true; }
+    if (act === 'cancel') { S.progForm = null; redrawProgram(); return true; }
+    if (act === 'save') { saveProgram(button); return true; }
+    if (act === 'remove') { removeProgram(button); return true; }
+    if (act === 'restart') { controlProgram(button, { action: 'restart' }); return true; }
+    if (button.dataset.progGoto) {
+      controlProgram(button, { action: 'goto', step: Number(button.dataset.progGoto) });
+      return true;
+    }
+
+    if (!form) { return false; }
+
+    if (act === 'add-step') { form.steps.push(blankStep('wait')); redrawProgram(); return true; }
+    if (button.dataset.progStepDel !== undefined) {
+      form.steps.splice(Number(button.dataset.progStepDel), 1);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progStepUp !== undefined) {
+      var i = Number(button.dataset.progStepUp);
+      form.steps.splice(i - 1, 0, form.steps.splice(i, 1)[0]);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progCondAdd !== undefined) {
+      form.steps[Number(button.dataset.progCondAdd)]['until'].conditions.push(blankCondition('cargo'));
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progCondDel !== undefined) {
+      var at = button.dataset.progCondDel.split(':');
+      form.steps[Number(at[0])]['until'].conditions.splice(Number(at[1]), 1);
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodAdd !== undefined) {
+      var adding = form.steps[Number(button.dataset.progGoodAdd)].action;
+      adding.goods = adding.goods || [];
+      adding.goods.push({ name: '' });
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodPick !== undefined) {
+      var picking = form.steps[Number(button.dataset.progGoodPick)].action;
+      var stolen = button.dataset.stolen === '1';
+      picking.goods = (picking.goods || []).filter(function (g) { return g.name; });
+      if (!picking.goods.some(function (g) { return g.name === button.dataset.good && !!g.stolen === stolen; })) {
+        picking.goods.push(stolen ? { name: button.dataset.good, stolen: true } : { name: button.dataset.good });
+      }
+      redrawProgram();
+      return true;
+    }
+    if (button.dataset.progGoodDel !== undefined) {
+      var spot = button.dataset.progGoodDel.split(':');
+      form.steps[Number(spot[0])].action.goods.splice(Number(spot[1]), 1);
+      redrawProgram();
+      return true;
+    }
+    return false;
+  }
+
+  function limitsText(rule) {
+    var limits = rule.limits || {};
+    var parts = [];
+    AUTO_LIMITS.forEach(function (spec) {
+      var value = limits[spec.key];
+      if (value == null) { return; }
+      var shown = spec.scale === 0.01 ? Math.round(value * 100) + '%'
+        : spec.scale === 3600 ? duration(value)
+        : spec.unit === '¢' ? credits(value) : num(value);
+      parts.push(spec.label + ' ' + shown);
+    });
+    return parts.length ? parts.join(' · ') : 'none &mdash; anything the game would start';
+  }
+
+  function areaText(area) {
+    if (!area || area.mode !== 'fixed') {
+      return 'follows the ship' + (area && area.size ? ', ' + area.size.x + '×' + area.size.y : '');
+    }
+    return coords(area.lower) + ' → ' + coords(area.upper);
+  }
+
+  function renderAutomationStatus() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.automations.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without mission automation.</div>';
+    }
+    if (failed && !Object.keys(S.automations.byKey).length) {
+      return errorBox('Automation unavailable', failed);
+    }
+    if (!S.automations.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var entry = automationFor(name);
+    var dry = S.autoDry && S.autoDry.ship === name ? S.autoDry : null;
+
+    if (!entry || !entry.rule) {
+      if (S.autoForm && S.autoForm.ship === name) { return ''; }
+      return '<div class="row">'
+        + '<span class="note">Not automated. A rule flies the mission, area, config, materials '
+        + 'and escorts set up in the mission planner, so start there.</span>'
+        + (S.missionForm
+          ? '<button data-auto-act="new">Automate ' + esc(S.missionForm.mission) + '…</button>'
+          : '')
+        + '<button class="ghost" data-auto-act="planner">Open the mission planner</button>'
+        + '</div>';
+    }
+
+    var rule = entry.rule;
+    var st = entry.state || {};
+    var phase = AUTO_PHASES[st.phase] || { tone: 'info', label: st.phase || 'unknown' };
+    var editing = S.autoForm && S.autoForm.ship === name;
+
+    var out = [];
+
+    out.push('<div class="row auto-head">'
+      + '<label class="check switch"><input type="checkbox" data-auto-toggle'
+      + (rule.enabled ? ' checked' : '') + '><span>send out automatically</span></label>'
+      + '<span class="badge ' + phase.tone + '">' + esc(phase.label) + '</span>'
+      + '<span class="auto-message">' + esc(st.message || '') + '</span>'
+      + (st.since != null ? '<span class="mute2">' + esc(agoText(st.since)) + '</span>' : '')
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-auto-act="check"' + (dry && dry.running ? ' disabled' : '') + '>check now</button>'
+      + (editing ? '' : '<button class="ghost small" data-auto-act="edit">edit</button>')
+      + '<button class="ghost small" data-auto-act="to-library" title="Keep a copy under a name, for programs to fly">copy to library</button>'
+      + '<button class="ghost small danger" data-auto-act="remove">remove</button>'
+      + '</div>');
+
+    var cards = [];
+    cards.push(meterCard('Rule', kv([
+      ['mission', esc(rule.mission)],
+      ['area', esc(areaText(rule.area))],
+      ['optimise for', esc((AUTO_OBJECTIVES.filter(function (o) { return o.key === rule.objective; })[0] || {}).label || rule.objective)],
+      ['collect yields', rule.collectYields ? 'yes' : 'no'],
+      ['saved by', esc((rule.updatedBy && rule.updatedBy.name) || '—') + ' <span class="mute2">rev ' + num(rule.revision) + '</span>']
+    ]) + '<div class="note" style="margin-top:6px">' + limitsText(rule) + '</div>'));
+
+    var last = st.lastDispatch;
+    cards.push(meterCard('Activity', kv([
+      ['dispatches', num(st.dispatches || 0)],
+      ['last sent', last ? esc(agoText(last.at)) : '—'],
+      ['what', last ? esc(last.summary) : '—'],
+      ['last collected', st.lastCollect ? num(st.lastCollect.collected) + ' <span class="mute2">' + esc(agoText(st.lastCollect.at)) + '</span>' : '—']
+    ])));
+
+    out.push('<div class="cards" style="margin-top:10px">' + cards.join('') + '</div>');
+
+    if (dry) {
+      out.push(renderAutoEvaluation('Check just now', dry));
+    } else if (st.lastEvaluation) {
+      out.push(renderAutoEvaluation('Last check <span class="mute2">' + esc(agoText(st.lastEvaluation.at)) + '</span>',
+                                    { evaluation: st.lastEvaluation }));
+    }
+
+    if (st.log && st.log.length) {
+      out.push('<details class="card auto-log" style="margin-top:10px"><summary>Decisions '
+        + '<span class="mute2">' + st.log.length + '</span></summary>'
+        + st.log.slice().reverse().map(function (line) {
+            var tone = (AUTO_PHASES[line.phase] || {}).tone || '';
+            return '<div class="log-line ' + (tone === 'bad' ? 'err' : tone === 'warn' ? 'warn' : '') + '">'
+              + '<span class="t">' + esc(agoText(line.at)) + '</span>'
+              + '<span class="k">' + esc(line.phase) + '</span>'
+              + '<span class="m">' + esc(line.message) + (line.detail ? ' <span class="dim">· ' + esc(line.detail) + '</span>' : '') + '</span>'
+              + '</div>';
+          }).join('')
+        + '</details>');
+    }
+
+    return out.join('');
+  }
+
+  /* One option the automation weighed, in a few words. */
+  function candidateLabel(candidate) {
+    var c = candidate.config || {};
+    if (c.goodName) {
+      return '<b>' + esc(c.goodName) + '</b>'
+        + (candidate.route ? ' <span class="mute2">' + coords(candidate.route.from) + ' → ' + coords(candidate.route.to) + '</span>' : '');
+    }
+    if (c.duration != null) { return 'duration ' + esc(String(c.duration)); }
+    return 'as configured';
+  }
+
+  function valueText(m) {
+    if (m.value == null) { return '—'; }
+    return m.valueUnit === 'credits' ? credits(m.value) : num(m.value);
+  }
+
+  function hourlyText(m) {
+    if (m.hourly == null) { return '—'; }
+    return (m.valueUnit === 'credits' ? credits(m.hourly) : num(m.hourly)) + '/h';
+  }
+
+  function renderAutoEvaluation(title, result) {
+    if (result.running) {
+      return '<div class="card" style="margin-top:10px"><h3>' + title + '</h3><div class="mute2">running the area analysis…</div></div>';
+    }
+    if (result.error) {
+      return '<div style="margin-top:10px">' + errorBox('Check failed', result.error) + '</div>';
+    }
+
+    var ev = result.evaluation;
+    if (!ev) { return ''; }
+
+    var verdict = ev.chosen
+      ? '<span class="badge good">would send it</span>'
+      : '<span class="badge warn">nothing within the limits</span>';
+
+    var rows = (ev.candidates || []).map(function (candidate, index) {
+      var m = candidate.metrics || {};
+      var chosen = candidate.passes && index === 0 && ev.chosen;
+      var patience = m.patience
+        ? ' <span class="mute2" title="chance the customer waits for the whole contract: ' + pct(m.completionChance) + '">' + esc(m.patience) + '</span>'
+        : '';
+      return '<tr' + (chosen ? ' class="best"' : '') + '>'
+        + '<td>' + candidateLabel(candidate) + '</td>'
+        + '<td class="num">' + pct(m.attackChance) + '</td>'
+        + '<td class="num">' + duration(m.duration) + '</td>'
+        + '<td class="num">' + (m.flights != null ? num(m.flights) + patience : '—') + '</td>'
+        + '<td class="num">' + (m.cost != null ? credits(m.cost) : '—') + '</td>'
+        + '<td class="num">' + valueText(m) + '</td>'
+        + '<td class="num">' + hourlyText(m) + '</td>'
+        + '<td>' + (candidate.passes
+            ? '<span class="badge good">' + (chosen ? 'chosen' : 'ok') + '</span>'
+            : '<span class="note warn">' + esc((candidate.violations || []).map(function (v) { return v.message; }).join('; ')) + '</span>')
+        + '</td></tr>';
+    }).join('');
+
+    return '<div class="card" style="margin-top:10px">'
+      + '<h3>' + title + ' ' + explain('auto-evaluation') + '</h3>'
+      + '<div class="row tight" style="margin-bottom:6px">' + verdict
+      + '<span class="mute2">' + num(ev.passing) + ' of ' + num(ev.tried) + ' options pass · area '
+      + coords(ev.area && ev.area.lower) + ' → ' + coords(ev.area && ev.area.upper) + '</span></div>'
+      + (rows
+          ? '<div class="scan-table"><table><thead><tr>'
+            + '<th>option</th><th class="num">ambush</th><th class="num">duration</th>'
+            + '<th class="num">flights</th><th class="num">deposit</th><th class="num">yield</th>'
+            + '<th class="num">per hour</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>'
+          : '<div class="note">No way to fly this mission was found in the area.</div>')
+      + (result.assessment && result.assessment.length
+          ? '<div style="margin-top:8px">' + result.assessment.map(function (line) {
+              return '<div class="note">· ' + esc(line) + '</div>';
+            }).join('') + '</div>'
+          : '')
+      + '</div>';
+  }
+
+  /* ---------------------------------- editor --------------------------------- */
+
+  /* What a rule flies, taken off the planner form: the same mission, area, config,
+     materials and escorts a start would send. A trade route and deposit are left behind -
+     choosing those is the automation's job, every time the ship is free. */
+  function plannerSource() {
+    var form = S.missionForm;
+    if (!form) { return null; }
+
+    var body = missionBody();
+    var config = {};
+    Object.keys(body.config).forEach(function (k) {
+      if (form.mission === 'trade' && (k === 'goodName' || k === 'deposit' || k === 'maxDeposit')) { return; }
+      config[k] = body.config[k];
+    });
+
+    return {
+      mission: form.mission,
+      config: config,
+      materials: body.materials || null,
+      escorts: (body.escorts || []).slice(),
+      area: { lower: body.area.lower, upper: body.area.upper },
+      size: formArea().size
+    };
+  }
+
+  function openAutoEditor(entry) {
+    var name = S.selected;
+    var rule = entry && entry.rule;
+    var source = rule
+      ? { mission: rule.mission, config: rule.config || {}, materials: rule.materials || null,
+          escorts: rule.escorts || [],
+          area: rule.area && rule.area.mode === 'fixed' ? { lower: rule.area.lower, upper: rule.area.upper } : null,
+          size: rule.area && rule.area.size }
+      : plannerSource();
+    if (!source) { return; }
+
+    var limits = {};
+    var stored = (rule && rule.limits) || {};
+    AUTO_LIMITS.forEach(function (spec) {
+      if (stored[spec.key] != null) {
+        limits[spec.key] = Math.round(stored[spec.key] / spec.scale * 100) / 100;
+      }
+    });
+    // A new trade rule starts where the captain stops warning about the customer.
+    if (!rule && source.mission === 'trade') { limits.maxFlights = 3; }
+
+    S.autoForm = {
+      ship: name,
+      source: source,
+      areaMode: rule ? (rule.area && rule.area.mode === 'fixed' ? 'fixed' : 'ship') : 'ship',
+      objective: rule ? rule.objective : 'hourly',
+      limits: limits,
+      collectYields: rule ? rule.collectYields === true : false,
+      revision: rule ? rule.revision : 0,
+      existing: !!rule,
+      dry: null
+    };
+    redrawAutomation();
+  }
+
+  function autoBody(form) {
+    var limits = {};
+    AUTO_LIMITS.forEach(function (spec) {
+      var value = form.limits[spec.key];
+      if (value === '' || value == null || isNaN(value) || !limitApplies(spec, form.source.mission)) { return; }
+      limits[spec.key] = spec.key === 'maxFlights' ? Math.round(value) : Number(value) * spec.scale;
+    });
+
+    var source = form.source;
+    var area = form.areaMode === 'fixed' && source.area
+      ? { mode: 'fixed', lower: source.area.lower, upper: source.area.upper }
+      : { mode: 'ship', size: source.size || null };
+
+    return {
+      mission: source.mission,
+      objective: form.objective,
+      area: area,
+      limits: limits,
+      config: source.config,
+      materials: source.materials,
+      escorts: source.escorts,
+      collectYields: form.collectYields
+    };
+  }
+
+  function limitApplies(spec, mission) {
+    if (spec.mission) { return spec.mission === mission; }
+    if (spec.missions) { return spec.missions.indexOf(mission) !== -1; }
+    return true;
+  }
+
+  /* One form edits both a craft's rule and a library mission, which is a rule without a
+     craft; `forLibrary` says which section is asking, and only the one the form belongs to
+     draws it. */
+  function renderAutomationEditor(forLibrary) {
+    var form = S.autoForm;
+    if (!form || form.ship !== S.selected || !!form.library !== !!forLibrary) { return ''; }
+
+    var source = form.source;
+    var library = form.library;
+    var head = '<div class="card auto-editor" style="margin-top:10px">'
+      + '<div class="row" style="justify-content:space-between"><h3 style="margin-bottom:0">'
+      + (library ? (form.existing ? 'Edit library mission' : 'New library mission')
+        : form.existing ? 'Edit rule' : 'New rule') + ' <span class="mute2">' + esc(source.mission) + '</span></h3>'
+      + '<button class="ghost small" data-auto-act="take-planner"' + (S.missionForm ? '' : ' disabled')
+      + ' title="Replace the mission, area, config, materials and escorts with what the planner holds">take planner settings</button></div>'
+      + (library
+        ? '<div class="row tight" style="margin-top:8px"><span class="mute2">name</span>'
+          + '<input type="text" data-auto-libname maxlength="48" style="width:220px" value="' + esc(library.name) + '" placeholder="e.g. Refine, safe">'
+          + (library.original && library.usedBy && library.usedBy.length
+            ? '<span class="mute2">flown by ' + esc(library.usedBy.join(', ')) + '</span>' : '')
+          + '</div>'
+        : '');
+
+    var what = [];
+    Object.keys(source.config || {}).forEach(function (k) {
+      what.push(esc(k) + ' ' + esc(typeof source.config[k] === 'object' ? JSON.stringify(source.config[k]) : String(source.config[k])));
+    });
+    if (source.materials) { what.push('materials ' + esc(source.materials.join(', ') || 'none')); }
+    if (source.escorts && source.escorts.length) { what.push('escorts ' + esc(source.escorts.join(', '))); }
+
+    var fields = AUTO_LIMITS.filter(function (spec) { return limitApplies(spec, source.mission); }).map(function (spec) {
+      var value = form.limits[spec.key];
+      return '<label class="auto-limit"><span class="mute2">' + esc(spec.label) + '</span>'
+        + '<span class="row tight"><input type="number" min="0" step="' + spec.step + '" data-auto-limit="' + spec.key + '"'
+        + ' value="' + (value == null ? '' : esc(String(value))) + '" placeholder="no limit">'
+        + (spec.unit ? '<span class="mute2">' + esc(spec.unit) + '</span>' : '') + '</span></label>';
+    }).join('');
+
+    var body = '<div class="mute2" style="margin:6px 0 10px">flies: ' + (what.join(' · ') || 'defaults') + '</div>'
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">area ' + explain('auto-area') + '</span>'
+      + '<button class="chip' + (form.areaMode === 'ship' ? ' on' : '') + '" data-auto-area="ship">follow the ship'
+      + (source.size ? ' (' + source.size.x + '×' + source.size.y + ')' : '') + '</button>'
+      + (source.area
+          ? '<button class="chip' + (form.areaMode === 'fixed' ? ' on' : '') + '" data-auto-area="fixed">fixed '
+            + coords(source.area.lower) + ' → ' + coords(source.area.upper) + '</button>'
+          : '')
+      + '</div>'
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">optimise for ' + explain('auto-objective') + '</span>'
+      + AUTO_OBJECTIVES.map(function (o) {
+          return '<button class="chip' + (form.objective === o.key ? ' on' : '') + '" data-auto-objective="' + o.key + '">' + esc(o.label) + '</button>';
+        }).join('')
+      + '</div>'
+      + '<div class="auto-limits">' + fields + '</div>'
+      + (source.mission === 'trade'
+          ? '<div class="note" style="margin-top:6px">' + explain('auto-patience') + ' Up to 3 flights the customer always waits; '
+            + 'each flight past that ends the contract early with a 35% chance.</div>'
+          : '')
+      + '<label class="check" style="display:flex;margin-top:8px"><input type="checkbox" data-auto-collect'
+      + (form.collectYields ? ' checked' : '') + '><span>collect yields before sending it out again</span></label>'
+      + '<div class="row" style="margin-top:10px">'
+      + '<button data-auto-act="test"' + (form.dry && form.dry.running ? ' disabled' : '') + '>Test limits</button>'
+      + (library
+        ? '<button class="primary" data-auto-act="save-library">Save to library</button>'
+        : '<button class="primary" data-auto-act="save">' + (form.existing ? 'Save rule' : 'Save and switch on') + '</button>')
+      + '<button class="ghost" data-auto-act="cancel">Cancel</button>'
+      + '</div>'
+      + (library ? '<div class="mute2" style="margin-top:6px">Test limits tries it on ' + esc(S.selected) + '.</div>' : '');
+
+    return head + body + '</div>'
+      + (form.dry ? renderAutoEvaluation('Test against the current area', form.dry) : '');
+  }
+
+  /* --------------------------------- actions --------------------------------- */
+
+  function autoPath(name, suffix) {
+    return '/ships/' + Api.seg(name) + '/mission/automation' + (suffix || '');
+  }
+
+  function autoConflict(error) {
+    if (error.code !== 'rule_changed') { return false; }
+    toast('warn', 'Rule changed elsewhere',
+          'Someone else saved this rule since it was loaded. It has been reloaded; apply your change again.');
+    S.autoForm = null;
+    loadAutomations(true).then(redrawAutomation);
+    return true;
+  }
+
+  function saveAutomation(button) {
+    var form = S.autoForm;
+    var name = S.selected;
+    if (!form || !name) { return; }
+
+    var body = autoBody(form);
+    body.ifRevision = form.revision;
+    if (!form.existing) { body.enabled = true; }
+
+    return guard(button, Api.post(autoPath(name), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'save automation' }))
+      .then(function (result) {
+        storeAutomation(result);
+        S.autoForm = null;
+        toast('good', 'Automation saved', name + ': ' + (result.rule.enabled ? 'the mod checks it on its next pass.' : 'switched off.'));
+        redrawAutomation();
+      })
+      .catch(function (error) {
+        if (autoConflict(error)) { return; }
+        apiFailed(error, 'Could not save the rule');
+      });
+  }
+
+  function testAutomation(button, stored) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var form = S.autoForm;
+    var body = stored ? {} : autoBody(form);
+    var holder = { ship: name, running: true };
+
+    if (stored) { S.autoDry = holder; } else { form.dry = holder; }
+    redrawAutomation();
+
+    return guard(button, Api.post(autoPath(name, '/evaluate'), body, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'test automation' }))
+      .then(function (result) {
+        holder.running = false;
+        holder.evaluation = result.evaluation;
+        holder.assessment = result.assessment;
+        if (S.selected === name) { redrawAutomation(); }
+      })
+      .catch(function (error) {
+        holder.running = false;
+        holder.error = error;
+        if (S.selected === name) { redrawAutomation(); }
+      });
+  }
+
+  function toggleAutomation(input) {
+    var name = S.selected;
+    var entry = automationFor(name);
+    if (!entry || !entry.rule) { return; }
+
+    var enabled = input.checked;
+    input.disabled = true;
+
+    Api.post(autoPath(name), { enabled: enabled, ifRevision: entry.rule.revision },
+             { owner: ownerParamFor(name) }, { priority: Api.P.USER, label: 'toggle automation' })
+      .then(function (result) {
+        storeAutomation(result);
+        toast('good', enabled ? 'Automation on' : 'Automation off', name);
+        refreshAutomationStatus();
+      })
+      .catch(function (error) {
+        input.checked = !enabled;
+        input.disabled = false;
+        if (autoConflict(error)) { return; }
+        apiFailed(error, 'Could not switch automation');
+      });
+  }
+
+  function removeAutomation(button) {
+    var name = S.selected;
+    if (!name || !window.confirm('Remove the automation rule for ' + name + '?')) { return; }
+
+    return guard(button, Api.post(autoPath(name, '/delete'), {}, { owner: ownerParamFor(name) },
+                                  { priority: Api.P.USER, label: 'remove automation' }))
+      .then(function (result) {
+        storeAutomation(result);
+        S.autoForm = null;
+        S.autoDry = null;
+        toast('good', 'Automation removed', name);
+        redrawAutomation();
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove the rule'); });
+  }
+
+  /* The editor lives on the Automation tab; the Mission tab only shows a summary line. */
+  function redrawAutomation() {
+    renderAutomationPane();
+    refreshAutomationStatus();
+  }
+
+  function automationAction(act, button) {
+    if (act === 'new') { openAutoEditor(null); showView('automation'); }
+    else if (act === 'open') { showView('automation'); }
+    else if (act === 'planner') { showView('fleet'); showSub('mission'); }
+    else if (act === 'edit') { openAutoEditor(automationFor(S.selected)); }
+    else if (act === 'cancel') { S.autoForm = null; redrawAutomation(); }
+    else if (act === 'save') { saveAutomation(button); }
+    else if (act === 'test') { testAutomation(button, false); }
+    else if (act === 'check') { testAutomation(button, true); }
+    else if (act === 'remove') { removeAutomation(button); }
+    else if (act === 'to-library') { openLibraryEditor(null, automationFor(S.selected)); }
+    else if (act === 'library-new') { openLibraryEditor(null, null); }
+    else if (act === 'save-library') { saveLibrary(button); }
+    else if (act === 'take-planner') {
+      var source = plannerSource();
+      if (!source || !S.autoForm) { return; }
+      if (source.mission === 'trade' && S.autoForm.limits.maxFlights == null) { S.autoForm.limits.maxFlights = 3; }
+      S.autoForm.source = source;
+      S.autoForm.dry = null;
+      redrawAutomation();
+    }
+  }
+
+  /* ============================= MISSION LIBRARY =============================
+   *
+   * Named mission rules a faction keeps for its programs: a rule without a craft. A
+   * program's mission step names one and the mod loads it when the step starts, so an
+   * edit here applies to every program flying it. Player craft fly the player's library,
+   * alliance craft the alliance's.
+   */
+
+  function ownerKindOf(name) {
+    var ship = S.byName[name];
+    return ship && ship.owner && ship.owner.kind === 'alliance' ? 'alliance' : 'player';
+  }
+
+  function libraryFor(name) {
+    return S.library.byKind[ownerKindOf(name)] || [];
+  }
+
+  function loadLibrary(userInitiated) {
+    return Api.get('/automation/missions/library', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'mission library' })
+      .then(function (body) {
+        var byKind = { player: [], alliance: [] };
+        (body.missions || []).forEach(function (mission) {
+          byKind[mission.owner && mission.owner.kind === 'alliance' ? 'alliance' : 'player'].push(mission);
+        });
+        S.library = { byKind: byKind, loaded: true, error: null };
+        refreshLibrary();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.library.error = error;
+        S.library.loaded = true;
+        refreshLibrary();
+      });
+  }
+
+  function renderLibrary() {
+    return '<div class="section auto-section"><h2>Mission library ' + explain('mission-library') + '</h2>'
+      + '<div data-library-list>' + renderLibraryList() + '</div>'
+      + '<div data-library-editor>' + renderAutomationEditor(true) + '</div>'
+      + '</div>';
+  }
+
+  function renderLibraryList() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.library.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without a mission library.</div>';
+    }
+    if (failed) { return errorBox('Library unavailable', failed); }
+    if (!S.library.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var kind = ownerKindOf(name);
+    var missions = libraryFor(name);
+    var editingName = S.autoForm && S.autoForm.library && S.autoForm.library.original;
+
+    var rows = missions.map(function (mission) {
+      var rule = mission.rule || {};
+      return '<div class="order-row library-row">'
+        + '<div class="program-step-body"><div><b>' + esc(mission.name) + '</b> '
+        + '<span class="badge">' + esc(rule.mission) + '</span></div>'
+        + '<div class="mute2">' + esc(areaText(rule.area)) + ' · ' + limitsText(rule) + '</div>'
+        + '<div class="mute2">' + (mission.usedBy && mission.usedBy.length
+          ? 'flown by ' + esc(mission.usedBy.join(', ')) : 'no program flies it') + '</div></div>'
+        + '<span class="spacer"></span>'
+        + (editingName === mission.name ? ''
+          : '<button class="ghost small" data-lib-edit="' + esc(mission.name) + '">edit</button>')
+        + '<button class="ghost small danger" data-lib-del="' + esc(mission.name) + '"'
+        + (mission.usedBy && mission.usedBy.length ? ' disabled title="A program still flies it"' : '') + '>delete</button>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="row"><span class="note">' + (kind === 'alliance'
+        ? 'The alliance&rsquo;s missions, shared by every member, for alliance craft to fly.'
+        : 'Your missions, for any of your craft&rsquo;s programs to fly.') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-auto-act="library-new"' + (S.missionForm ? '' : ' disabled title="Set a mission up in the planner first"')
+      + '>New from planner…</button></div>'
+      + (rows || '<div class="mute2" style="margin-top:6px">Empty. Copy a craft&rsquo;s rule to the library, or make one from the mission planner.</div>');
+  }
+
+  function refreshLibrary() {
+    var list = $('#automation-pane [data-library-list]');
+    if (list && S.selected) { list.innerHTML = renderLibraryList(); }
+  }
+
+  function redrawLibrary() {
+    var editor = $('#automation-pane [data-library-editor]');
+    if (editor) { editor.innerHTML = renderAutomationEditor(true); }
+    refreshLibrary();
+    redrawProgram();
+  }
+
+  /* Opens the rule form on a library mission: an existing one, a copy of a craft's rule,
+     or what the planner holds. */
+  function openLibraryEditor(mission, fromEntry) {
+    var source = mission ? { rule: mission.rule } : fromEntry && fromEntry.rule ? { rule: fromEntry.rule } : null;
+    openAutoEditor(source);
+    if (!S.autoForm) { return; }
+
+    S.autoForm.existing = !!mission;
+    S.autoForm.revision = mission ? mission.revision : 0;
+    S.autoForm.library = {
+      original: mission ? mission.name : null,
+      name: mission ? mission.name : '',
+      usedBy: mission ? mission.usedBy || [] : []
+    };
+    redrawAutomation();
+  }
+
+  function libraryPath(name, suffix) {
+    return '/automation/missions/library/' + Api.seg(name) + (suffix || '');
+  }
+
+  function saveLibrary(button) {
+    var form = S.autoForm;
+    var name = S.selected;
+    if (!form || !form.library || !name) { return; }
+
+    var wanted = (form.library.name || '').trim();
+    if (!wanted) {
+      toast('warn', 'Name it first', 'A library mission is picked by its name.');
+      return;
+    }
+
+    var body = autoBody(form);
+    body.ifRevision = form.revision;
+    var original = form.library.original;
+    if (original && original !== wanted) { body.rename = wanted; }
+
+    return guard(button, Api.post(libraryPath(original || wanted), body, { owner: ownerKindOf(name) },
+                                  { priority: Api.P.USER, label: 'save library mission' }))
+      .then(function (result) {
+        S.autoForm = null;
+        toast('good', 'Library mission saved', result.name + (result.usedBy && result.usedBy.length
+          ? ': programs fly it this way from their next start.' : ''));
+        return Promise.all([loadLibrary(true), original && original !== wanted ? loadPrograms(true) : null]);
+      })
+      .then(redrawAutomation)
+      .catch(function (error) {
+        if (error.code === 'library_changed') {
+          toast('warn', 'Library mission changed elsewhere',
+                'Someone else saved it since it was loaded. It has been reloaded; apply your change again.');
+          S.autoForm = null;
+          loadLibrary(true).then(redrawAutomation);
+          return;
+        }
+        apiFailed(error, 'Could not save the library mission');
+      });
+  }
+
+  function deleteLibrary(button, missionName) {
+    var name = S.selected;
+    if (!name || !window.confirm('Delete "' + missionName + '" from the mission library?')) { return; }
+
+    return guard(button, Api.post(libraryPath(missionName, '/delete'), {}, { owner: ownerKindOf(name) },
+                                  { priority: Api.P.USER, label: 'delete library mission' }))
+      .then(function () {
+        toast('good', 'Library mission deleted', missionName);
+        return loadLibrary(true);
+      })
+      .then(redrawLibrary)
+      .catch(function (error) { apiFailed(error, 'Could not delete the library mission'); });
+  }
+
+  /* Clicks on the library list. Returns whether it was one of its controls. */
+  function libraryClick(button) {
+    if (button.dataset.libEdit !== undefined) {
+      var mission = libraryFor(S.selected).filter(function (m) { return m.name === button.dataset.libEdit; })[0];
+      if (mission) { openLibraryEditor(mission, null); }
+      return true;
+    }
+    if (button.dataset.libDel !== undefined) {
+      deleteLibrary(button, button.dataset.libDel);
+      return true;
+    }
+    return false;
   }
 
   /* ================================= ORDERS ================================ */
@@ -2133,7 +4837,186 @@
 
     out.push('<div id="order-result"></div>');
 
+    out.push('<div id="transfer-section"></div>');
+
+    out.push('<div id="standing-orders" data-standing-orders></div>');
+
     $('#sv-orders').innerHTML = out.join('');
+    renderTransfer();
+    renderStanding();
+  }
+
+  /* ---------------------------- standing orders ---------------------------- */
+
+  /* Settings on the ship rather than orders on its chain, so each change is saved the
+     moment it is made. The section redraws on its own: the chain rows above it may be
+     half edited when the ship reports in. */
+
+  var STANDING = [
+    { key: 'enemies', label: 'Fight enemies', text: 'turn aggressive when enemies are sighted in the sector' },
+    { key: 'loot', label: 'Collect loot', text: 'send the fighters for loot in the sector, when there are fighters aboard' }
+  ];
+
+  var STANDING_MODES = [
+    ['idle', 'only when idle'],
+    ['interrupt', 'interrupt, then resume']
+  ];
+
+  var REACTION_PHASES = {
+    fighting: ['bad', 'fighting'],
+    looting: ['info', 'fighters collecting loot'],
+    returning: ['info', 'waiting for fighters to land']
+  };
+
+  var REACTION_ENDS = {
+    done: 'done',
+    replaced: 'other orders took over',
+    switched_off: 'switched off',
+    stopped: 'stopped'
+  };
+
+  function paintStanding(nodes, html) {
+    nodes.forEach(function (node) { node.innerHTML = html; });
+  }
+
+  function renderStanding() {
+    var nodes = $$('[data-standing-orders]');
+    if (!nodes.length || !S.selected) { return; }
+
+    var nav = S.nav;
+    var head = '<div class="section"><h2>Standing orders ' + explain('standing-orders') + '</h2>';
+
+    if (nav.automationError) {
+      paintStanding(nodes, head + errorBox('Could not read the standing orders', nav.automationError) + '</div>');
+      return;
+    }
+    if (!nav.automation) { paintStanding(nodes, head + '<p class="muted">loading…</p></div>'); return; }
+
+    var a = nav.automation.automation || {};
+    if (!nav.automation.reported || !a.standing) {
+      paintStanding(nodes, head + '<div class="note">'
+        + (nav.automation.reported
+          ? 'This ship runs a mod version without standing orders.'
+          : 'This ship has not reported its settings yet. It does once its sector is loaded '
+            + 'with this version of the mod.')
+        + '</div></div>');
+      return;
+    }
+
+    var saving = S.standingSaving === S.selected;
+    var off = saving ? ' disabled' : '';
+
+    var rows = STANDING.map(function (spec) {
+      var order = a.standing[spec.key] || {};
+      return '<div class="order-row standing-row">'
+        + '<label class="check switch"><input type="checkbox" data-standing-on="' + spec.key + '"'
+        + (order.enabled ? ' checked' : '') + off + '><span><b>' + esc(spec.label) + '</b></span></label>'
+        + '<span class="mute2">' + esc(spec.text) + '</span>'
+        + '<span class="spacer"></span>'
+        + '<div class="chips">' + STANDING_MODES.map(function (mode) {
+            return '<button class="chip' + (order.mode === mode[0] ? ' on' : '') + '"'
+              + ' data-standing-mode="' + mode[0] + '" data-standing-key="' + spec.key + '"' + off + '>'
+              + esc(mode[1]) + '</button>';
+          }).join('') + '</div>'
+        + '</div>';
+    }).join('');
+
+    var civilians = '<div class="row" style="margin-top:4px">'
+      + '<label class="check"><input type="checkbox" data-standing-civ'
+      + (a.attackCivilians ? ' checked' : '') + off + '><span>civilian ships count as enemies</span></label>'
+      + (saving ? '<span class="mute2">saving…</span>' : '')
+      + '</div>';
+
+    var badges = [];
+    var reaction = a.reaction;
+    if (reaction) {
+      var phase = REACTION_PHASES[reaction.phase] || ['info', reaction.phase];
+      badges.push('<span class="badge ' + phase[0] + '">' + esc(phase[1]) + '</span>');
+      badges.push('<span class="mute2">' + (reaction.resumes ? 'the order chain comes back afterwards' : 'was idle') + '</span>');
+    } else if (a.plan) {
+      badges.push('<span class="mute2">flying a ' + esc(a.plan.kind) + ' plan, which handles enemies itself</span>');
+    }
+    if (a.enemies) { badges.push('<span class="badge bad">enemies in sector</span>'); }
+
+    var stats = [];
+    if (a.defenceFights) { stats.push(num(a.defenceFights) + ' fights'); }
+    if (a.lootRuns) { stats.push(num(a.lootRuns) + ' loot runs'); }
+    var last = a.lastReaction;
+    if (last) {
+      stats.push('last: ' + esc(last.kind) + ' · ' + esc(REACTION_ENDS[last.outcome] || last.outcome)
+        + (last.lootResult ? ' · ' + esc(LOOT_RESULTS[last.lootResult] || last.lootResult) : '')
+        + (last.resumed ? ' · chain resumed' : ''));
+    }
+
+    paintStanding(nodes, head + rows + civilians
+      + (badges.length || stats.length
+        ? '<div class="row" style="margin-top:8px">' + badges.join('')
+          + '<span class="spacer"></span>'
+          + (reaction ? '<button class="ghost small" data-act="standing-stop" title="End it and clear the chain; the standing orders stay on">stop</button>' : '')
+          + '</div>'
+          + (stats.length ? '<div class="mute2" style="margin-top:4px">' + stats.join(' · ') + '</div>' : '')
+        : '')
+      + '</div>');
+  }
+
+  function saveStanding(body, label) {
+    var name = S.selected;
+    if (!name || S.standingSaving === name) { return; }
+
+    S.standingSaving = name;
+    renderStanding();
+
+    Api.post('/ships/' + Api.seg(name) + '/automation', body,
+             { owner: ownerParamFor(name) },
+             { priority: Api.P.USER, label: 'standing orders' })
+      .then(function (result) {
+        S.standingSaving = null;
+        toast(result.confirmed ? 'good' : 'warn', label,
+              result.confirmed ? name + ' confirmed it.' : 'Sent, but the ship did not confirm it.');
+        tookAutomation(name, result);
+        renderStanding();
+      })
+      .catch(function (error) {
+        S.standingSaving = null;
+        renderStanding();
+        apiFailed(error, 'Standing orders refused');
+      });
+  }
+
+  function standingLabel(key) {
+    return (STANDING.filter(function (spec) { return spec.key === key; })[0] || {}).label || key;
+  }
+
+  /* The section is drawn on the Orders tab and the Automation tab alike, so both hand their
+     clicks and changes here first. Each answers whether it was a standing-order control. */
+  function standingClick(button) {
+    if (button.dataset.standingMode) {
+      if (!button.classList.contains('on')) {
+        var key = button.dataset.standingKey;
+        var patch = {};
+        patch[key] = { mode: button.dataset.standingMode };
+        saveStanding({ standing: patch }, standingLabel(key) + ': '
+          + (button.dataset.standingMode === 'interrupt' ? 'interrupts' : 'only when idle'));
+      }
+      return true;
+    }
+    if (button.dataset.act === 'standing-stop') { stopAutomation(button); return true; }
+    return false;
+  }
+
+  function standingChange(node) {
+    if (node.dataset.standingOn !== undefined) {
+      var patch = {};
+      patch[node.dataset.standingOn] = { enabled: node.checked };
+      saveStanding({ standing: patch }, standingLabel(node.dataset.standingOn) + (node.checked ? ' on' : ' off'));
+      return true;
+    }
+    if (node.dataset.standingCiv !== undefined) {
+      saveStanding({ attackCivilians: node.checked },
+                   node.checked ? 'Civilians count as enemies' : 'Civilians left alone');
+      return true;
+    }
+    return false;
   }
 
   function dispatchOrders(button) {
@@ -2180,7 +5063,8 @@
   function chainHtml(chain, activeIndex) {
     if (!chain || !chain.length) { return '<span class="mute2">empty</span>'; }
     return chain.map(function (link, i) {
-      return '<span class="' + (i === activeIndex ? 'active' : 'dim') + '">'
+      // activeIndex is the engine's 1-based currentIndex.
+      return '<span class="' + (i + 1 === activeIndex ? 'active' : 'dim') + '">'
         + pathLabel(link.name || link.action) + '</span>';
     }).join(' <span class="dim">→</span> ');
   }
@@ -2203,7 +5087,642 @@
     sweepEvents();
   }
 
+  /* ---------------------------- cargo transfer ----------------------------- */
+
+  var TRANSFER_PHASES = {
+    docking: 'docking to get in reach',
+    approaching: 'flying alongside to get in reach'
+  };
+
+  var TRANSFER_OUTCOMES = {
+    done: ['good', 'moved'],
+    partial: ['warn', 'partly moved'],
+    nothing_moved: ['warn', 'nothing moved'],
+    refused: ['bad', 'refused'],
+    replaced: ['warn', 'replaced'],
+    stopped: ['warn', 'stopped']
+  };
+
+  var TRANSFER_REASONS = {
+    not_held: 'not in the hold',
+    no_space: 'no room left',
+    not_enough: 'less there than asked',
+    target_not_here: 'the other craft is not in the sector',
+    target_gone: 'the other craft left',
+    out_of_range: 'out of reach',
+    needs_captain: 'no captain to fly there',
+    piloted: 'someone is at the controls',
+    not_permitted: 'not allowed',
+    timeout: 'never got in reach',
+    empty_hold: 'the hold was empty'
+  };
+
+  function transferTargets(name) {
+    var slot = S.transferData[name];
+    return slot && slot.body ? slot.body.targets || [] : [];
+  }
+
+  function findTransferTarget(name, target, ownerKind) {
+    return transferTargets(name).filter(function (t) {
+      return t.name === target && (!ownerKind || t.owner.kind === ownerKind);
+    })[0] || null;
+  }
+
+  /* The craft goods come out of: the ship when it gives, the other craft when it takes. */
+  function transferSource(name, target, ownerKind, direction) {
+    var slot = S.transferData[name];
+    if (!slot || !slot.body) { return null; }
+    if (direction !== 'take') { return slot.body.ship; }
+    return findTransferTarget(name, target, ownerKind);
+  }
+
+  function transferText(transfer, plain) {
+    var goods = transfer.all ? 'everything' : (transfer.goods || []).map(function (g) {
+      return (g.amount ? numText(g.amount) + ' ' : 'all ') + g.name + (g.stolen ? ' (stolen)' : '');
+    }).join(', ');
+    var target = transfer.target || '?';
+    var text = transfer.direction === 'take' ? 'take ' + goods + ' from ' : 'give ' + goods + ' to ';
+    if (plain) { return text + target; }
+    return esc(text) + '<b>' + esc(target) + '</b>'
+      + (transfer.approach === false ? ' <span class="mute2">only if in reach</span>' : '');
+  }
+
+  function movedText(list) {
+    return (list || []).map(function (g) {
+      return numText(g.amount) + ' ' + g.name + (g.stolen ? ' (stolen)' : '');
+    }).join(', ');
+  }
+
+  function shortText(list) {
+    return (list || []).map(function (g) {
+      var reason = TRANSFER_REASONS[g.reason] || g.reason;
+      return g.name ? g.name + ': ' + reason + (g.moved ? ' (' + numText(g.moved) + ' moved)' : '') : reason;
+    }).join('; ');
+  }
+
+  function lastTransferHtml(last) {
+    var tone = TRANSFER_OUTCOMES[last.outcome] || ['info', last.outcome];
+    return '<span class="badge ' + tone[0] + '">' + esc(tone[1]) + '</span> '
+      + esc((last.direction === 'take' ? 'from ' : 'to ') + (last.target || '?'))
+      + (last.moved ? ' · ' + esc(movedText(last.moved)) : '')
+      + (last.short ? ' <span class="mute2">' + esc(shortText(last.short)) + '</span>' : '')
+      + (last.reason ? ' <span class="mute2">' + esc(TRANSFER_REASONS[last.reason] || last.reason) + '</span>' : '');
+  }
+
+  function loadTransfer(name, userInitiated) {
+    if (!name) { return Promise.resolve(); }
+
+    var slot = S.transferData[name] || { body: null };
+    slot.loading = true;
+    S.transferData[name] = slot;
+
+    return Api.get('/ships/' + Api.seg(name) + '/transfer', { owner: ownerParamFor(name) },
+                   { priority: userInitiated ? Api.P.USER : Api.P.DETAIL, label: 'transfer holds' })
+      .then(function (body) {
+        S.transferData[name] = { body: body, error: null, loading: false };
+        if (S.selected !== name) { return; }
+        renderTransfer();
+        if (S.progForm && S.progForm.ship === name) { redrawProgram(); }
+      })
+      .catch(function (error) {
+        slot.loading = false;
+        if (error.code === 'cancelled') { return; }
+        slot.error = error;
+        if (S.selected === name) { renderTransfer(); }
+      });
+  }
+
+  function transferForm() {
+    if (S.transfer.ship !== S.selected) {
+      S.transfer = { ship: S.selected, target: '', direction: 'give', all: false, picks: {}, approach: true,
+                     sending: false, result: null };
+    }
+    return S.transfer;
+  }
+
+  function goodKey(good) { return good.name + (good.stolen ? '|stolen' : ''); }
+
+  function holdCard(craft, role) {
+    var cargo = craft.cargo || {};
+    return '<div class="card"><h3>' + esc(role) + ' <span class="mute2">' + esc(craft.name)
+      + (craft.type ? ' · ' + esc(craft.type.toLowerCase()) : '')
+      + (craft.owner && craft.owner.kind === 'alliance' ? ' · alliance' : '') + '</span></h3>'
+      + '<div class="mute2">' + num(cargo.used) + ' of ' + num(cargo.capacity) + ' used &middot; '
+      + num(cargo.free) + ' free</div>'
+      + cargoBar({ used: cargo.used || 0, capacity: cargo.capacity || 0, free: cargo.free })
+      + '<div class="mute2" style="margin-top:4px">' + ((cargo.goods || []).length
+        ? esc((cargo.goods || []).map(function (g) {
+            return g.name + (g.stolen ? ' (stolen)' : '') + ' ' + numText(g.amount);
+          }).join(', '))
+        : 'empty') + '</div></div>';
+  }
+
+  function renderTransfer() {
+    var node = $('#transfer-section');
+    if (!node || !S.selected) { return; }
+
+    var name = S.selected;
+    var form = transferForm();
+    var slot = S.transferData[name];
+    var head = '<div class="section"><h2>Cargo transfer ' + explain('cargo-transfer')
+      + ' <button class="ghost small" data-act="transfer-refresh">refresh</button></h2>';
+
+    if (!slot || (!slot.body && !slot.error)) {
+      node.innerHTML = head + '<p class="muted">loading…</p></div>';
+      return;
+    }
+    if (!slot.body) {
+      node.innerHTML = head + (slot.error.status === 404 && slot.error.code === 'not_found'
+        ? '<div class="note warn">This server runs a mod version without cargo transfers.</div>'
+        : errorBox('Could not read the holds', slot.error)) + '</div>';
+      return;
+    }
+
+    var ship = slot.body.ship;
+    var fromStation = isStation(ship);
+    var here = (slot.body.targets || []).filter(function (t) {
+      return t.sameSector && !(fromStation && isStation(t));
+    });
+
+    if (ship.availability === 'InBackground') {
+      node.innerHTML = head + '<div class="note warn">Out on a captain mission &mdash; its hold is with it.</div></div>';
+      return;
+    }
+    if (!here.length) {
+      node.innerHTML = head + '<div class="note">No other craft of yours or your alliance\'s '
+        + (fromStation ? 'that could fly a transfer ' : '') + 'is in ' + esc(coords(ship.sector || ship.position))
+        + '. A program can fly the ship to one and transfer there &mdash; see the Automation tab.</div>'
+        + '<div id="transfer-state"></div></div>';
+      renderTransferState();
+      return;
+    }
+
+    var target = here.filter(function (t) { return t.owner.kind + ':' + t.name === form.target; })[0];
+    if (!target) {
+      target = here[0];
+      form.target = target.owner.kind + ':' + target.name;
+      form.picks = {};
+    }
+
+    var giving = form.direction !== 'take';
+    var sender = giving ? ship : target;
+    var receiver = giving ? target : ship;
+    var goods = (sender.cargo && sender.cargo.goods) || [];
+    var off = form.sending ? ' disabled' : '';
+
+    var out = [head];
+
+    out.push('<div class="row" style="margin-bottom:10px">'
+      + '<span class="mute2">with</span>'
+      + '<select data-transfer-target' + off + '>' + here.map(function (t) {
+          var value = t.owner.kind + ':' + t.name;
+          return '<option value="' + esc(value) + '"' + (value === form.target ? ' selected' : '') + '>'
+            + esc(t.name) + (t.type ? ' · ' + esc(t.type.toLowerCase()) : '')
+            + (t.owner.kind === 'alliance' ? ' (alliance)' : '') + '</option>';
+        }).join('') + '</select>'
+      + '<div class="chips">'
+      + '<button class="chip' + (giving ? ' on' : '') + '" data-transfer-dir="give"' + off + '>give &rarr; to it</button>'
+      + '<button class="chip' + (giving ? '' : ' on') + '" data-transfer-dir="take"' + off + '>take &larr; from it</button>'
+      + '</div>'
+      + '<label class="check" title="Dock at a station, or fly alongside a ship, when it is out of reach">'
+      + '<input type="checkbox" data-transfer-approach' + (form.approach ? ' checked' : '') + off
+      + '><span>approach if out of reach</span></label>'
+      + '</div>');
+
+    out.push('<div class="cards" style="margin-bottom:10px">'
+      + holdCard(sender, 'from') + holdCard(receiver, 'into') + '</div>');
+
+    if (!goods.length) {
+      out.push('<div class="note">' + esc(sender.name) + '\'s hold is empty.</div>');
+    } else {
+      out.push('<div class="scroll-x"><table class="transfer-goods"><thead><tr>'
+        + '<th><label class="check"><input type="checkbox" data-transfer-all' + (form.all ? ' checked' : '') + off
+        + ' title="the whole hold, whatever is in it when the ship gets there"><span>all</span></label></th>'
+        + '<th>Good</th><th class="num">In hold</th><th class="num">Move</th><th class="num">Volume</th>'
+        + '</tr></thead><tbody>'
+        + goods.map(function (g) {
+            var key = goodKey(g);
+            var picked = form.all || form.picks[key] != null;
+            var amount = form.all ? g.amount : form.picks[key];
+            return '<tr>'
+              + '<td><input type="checkbox" data-transfer-pick="' + esc(key) + '"' + (picked ? ' checked' : '')
+              + (form.all ? ' disabled' : off) + '></td>'
+              + '<td>' + esc(g.name) + (g.stolen ? ' <span class="badge warn">stolen</span>' : '')
+              + (g.illegal ? ' <span class="badge warn">illegal</span>' : '') + '</td>'
+              + '<td class="num">' + num(g.amount) + '</td>'
+              + '<td class="num"><input type="number" min="1" step="1" style="width:96px" data-transfer-amount="' + esc(key) + '"'
+              + ' value="' + (picked && amount != null ? amount : '') + '" placeholder="' + num(g.amount) + '"'
+              + (form.all ? ' disabled' : off) + '>'
+              + ' <button class="ghost small" data-transfer-max="' + esc(key) + '"' + (form.all ? ' disabled' : off) + '>all</button></td>'
+              + '<td class="num mute2">' + (g.size != null ? num(g.size * (picked && amount != null ? amount : 0), 1) : '—') + '</td>'
+              + '</tr>';
+          }).join('')
+        + '</tbody></table></div>');
+    }
+
+    out.push('<div class="row" style="margin-top:9px">'
+      + '<span data-transfer-summary>' + transferSummaryHtml(form, goods, receiver) + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="primary" data-act="transfer-send"' + (form.sending || !goods.length ? ' disabled' : '') + '>'
+      + (form.sending ? 'Transferring…' : 'Transfer') + '</button>'
+      + '</div>');
+
+    out.push('<div id="transfer-result">' + transferResultHtml(form.result) + '</div>');
+    out.push('<div id="transfer-state"></div>');
+    out.push('</div>');
+
+    node.innerHTML = out.join('');
+    renderTransferState();
+  }
+
+  /* What is picked and whether it fits, patched in place while amounts are typed. */
+  function transferSummaryHtml(form, goods, receiver) {
+    var units = 0;
+    var volume = 0;
+    goods.forEach(function (g) {
+      var amount = form.all ? g.amount : form.picks[goodKey(g)];
+      if (amount == null) { return; }
+      amount = Math.min(amount, g.amount);
+      units += amount;
+      volume += amount * (g.size || 0);
+    });
+
+    var free = (receiver.cargo && receiver.cargo.free) || 0;
+    if (!units) { return '<span class="mute2">pick goods to move, or all</span>'; }
+
+    return num(units) + ' units, ' + num(volume, 1) + ' volume'
+      + (volume > free
+        ? ' <span class="badge warn" title="What does not fit stays where it is.">only ' + num(free, 1) + ' free in ' + esc(receiver.name) + '</span>'
+        : ' <span class="mute2">of ' + num(free, 1) + ' free</span>');
+  }
+
+  function refreshTransferSummary() {
+    var node = $('#sv-orders [data-transfer-summary]');
+    var slot = S.transferData[S.selected];
+    if (!node || !slot || !slot.body) { return; }
+
+    var form = transferForm();
+    var ship = slot.body.ship;
+    var target = findTransferTarget(S.selected, form.target.split(':').slice(1).join(':'), form.target.split(':')[0]);
+    if (!target) { return; }
+
+    var giving = form.direction !== 'take';
+    var sender = giving ? ship : target;
+    node.innerHTML = transferSummaryHtml(form, (sender.cargo && sender.cargo.goods) || [], giving ? target : ship);
+  }
+
+  function transferResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.error) { return errorBox('Transfer refused', result.error); }
+
+    var body = result.body;
+    var outcome = body.result;
+    var by = body.carriedOutBy && body.carriedOutBy.name !== body.ship
+      ? ' <span class="mute2">carried out by ' + esc(body.carriedOutBy.name) + '</span>' : '';
+
+    if (outcome) {
+      var tone = TRANSFER_OUTCOMES[outcome.outcome] || ['info', outcome.outcome];
+      return '<div class="' + (tone[0] === 'good' ? 'okbox' : 'errbox') + '">'
+        + '<b>' + esc(tone[1].charAt(0).toUpperCase() + tone[1].slice(1)) + '</b>' + by
+        + (outcome.moved ? '<div>' + esc(movedText(outcome.moved)) + '</div>' : '')
+        + (outcome.short ? '<div class="mute2">' + esc(shortText(outcome.short)) + '</div>' : '')
+        + '</div>';
+    }
+    if (body.done === false) {
+      return '<div class="okbox"><b>On its way</b>' + by + '<div>' + esc(body.summary || '') + ' &mdash; '
+        + esc(TRANSFER_PHASES[body.phase] || body.phase || 'getting in reach')
+        + '; the cargo moves once the craft are close.</div></div>';
+    }
+    return '<div class="errbox"><b>Dispatched, not confirmed</b><div>' + esc(body.summary || '') + '</div>'
+      + '<div class="mute2">unconfirmed ' + explain('orders-unconfirmed') + '</div></div>';
+  }
+
+  /* The ship's own report of a transfer on its way, and of the last one. Redrawn on its own,
+     since the ship reports in while amounts above it may be half typed. */
+  function renderTransferState() {
+    var node = $('#transfer-state');
+    if (!node) { return; }
+
+    var a = S.nav.automation && S.nav.automation.ship === S.selected && S.nav.automation.automation;
+    if (!a || !(a.transfer || a.lastTransfer)) { node.innerHTML = ''; return; }
+
+    var rows = [];
+    if (a.transfer) {
+      rows.push('<div class="row" style="margin-top:8px"><span class="badge info">transfer · '
+        + esc(a.transfer.phase || 'moving') + '</span><span>' + transferText(a.transfer) + '</span>'
+        + '<span class="mute2">' + esc(TRANSFER_PHASES[a.transfer.phase] || '') + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-act="transfer-stop" title="Give up on it; nothing has moved yet">stop</button></div>');
+    }
+    if (a.lastTransfer) {
+      rows.push('<div class="mute2" style="margin-top:6px">last transfer: ' + lastTransferHtml(a.lastTransfer) + '</div>');
+    }
+    node.innerHTML = rows.join('');
+  }
+
+  function transferBody(form) {
+    var slot = S.transferData[S.selected];
+    var kind = form.target.split(':')[0];
+    var targetName = form.target.split(':').slice(1).join(':');
+    var body = { target: targetName, targetOwner: kind, direction: form.direction, approach: form.approach };
+
+    if (form.all) {
+      body.all = true;
+      return body;
+    }
+
+    var target = findTransferTarget(S.selected, targetName, kind);
+    var sender = form.direction === 'take' ? target : slot.body.ship;
+    var goods = (sender && sender.cargo && sender.cargo.goods) || [];
+
+    body.goods = goods.filter(function (g) { return form.picks[goodKey(g)] != null; }).map(function (g) {
+      var amount = form.picks[goodKey(g)];
+      var good = { name: g.name, stolen: !!g.stolen };
+      // all of it when all of it is asked for: the hold may have grown since it was read
+      if (amount < g.amount) { good.amount = amount; }
+      return good;
+    });
+
+    return body;
+  }
+
+  function sendTransfer(button) {
+    var name = S.selected;
+    var form = transferForm();
+    if (!name || form.sending) { return; }
+
+    var body = transferBody(form);
+    if (!body.all && !body.goods.length) {
+      toast('warn', 'Nothing to transfer', 'Pick at least one good, or all.');
+      return;
+    }
+
+    form.sending = true;
+    form.result = null;
+    renderTransfer();
+
+    Api.post('/ships/' + Api.seg(name) + '/transfer', body, { owner: ownerParamFor(name) },
+             { priority: Api.P.USER, label: 'transfer' })
+      .then(function (result) {
+        form.sending = false;
+        form.result = { body: result };
+        form.picks = {};
+
+        var outcome = result.result;
+        if (outcome) {
+          var tone = TRANSFER_OUTCOMES[outcome.outcome] || ['info', outcome.outcome];
+          toast(tone[0] === 'bad' ? 'bad' : tone[0], 'Cargo ' + tone[1], name + ': ' + (movedText(outcome.moved) || shortText(outcome.short) || result.summary));
+        } else if (result.done === false) {
+          toast('info', 'Transfer on its way', name + ': ' + (TRANSFER_PHASES[result.phase] || result.phase || 'getting in reach') + '.');
+        } else {
+          toast('warn', 'Transfer sent', name + ' did not confirm it.');
+        }
+
+        if (!result.carriedOutBy || result.carriedOutBy.name === name) { tookAutomation(name, result); }
+        else { refreshFleet(true); sweepEvents(); }
+
+        renderTransfer();
+        // the database mirrors a loaded craft's hold a moment behind
+        loadTransfer(name);
+        setTimeout(function () { if (S.selected === name) { loadTransfer(name); loadDetail(true); } }, 2500);
+      })
+      .catch(function (error) {
+        form.sending = false;
+        form.result = { error: error };
+        renderTransfer();
+        apiFailed(error, 'Transfer refused');
+      });
+  }
+
+  /* Clicks and changes on the transfer section. Each answers whether it was one of its own. */
+  function transferClick(button) {
+    var form = transferForm();
+
+    if (button.dataset.act === 'transfer-send') { sendTransfer(button); return true; }
+    if (button.dataset.act === 'transfer-refresh') { loadTransfer(S.selected, true); loadAutomation(); return true; }
+    if (button.dataset.act === 'transfer-stop') { stopAutomation(button); return true; }
+    if (button.dataset.transferDir) {
+      if (form.direction !== button.dataset.transferDir) {
+        form.direction = button.dataset.transferDir;
+        form.picks = {};
+        form.all = false;
+        renderTransfer();
+      }
+      return true;
+    }
+    if (button.dataset.transferMax !== undefined) {
+      var good = transferSenderGoods().filter(function (g) { return goodKey(g) === button.dataset.transferMax; })[0];
+      if (good) { form.picks[goodKey(good)] = good.amount; renderTransfer(); }
+      return true;
+    }
+    return false;
+  }
+
+  function transferSenderGoods() {
+    var form = transferForm();
+    var slot = S.transferData[S.selected];
+    if (!slot || !slot.body) { return []; }
+    var kind = form.target.split(':')[0];
+    var sender = form.direction === 'take'
+      ? findTransferTarget(S.selected, form.target.split(':').slice(1).join(':'), kind)
+      : slot.body.ship;
+    return (sender && sender.cargo && sender.cargo.goods) || [];
+  }
+
+  function transferChange(node) {
+    var form = transferForm();
+
+    if (node.dataset.transferTarget !== undefined) {
+      form.target = node.value;
+      form.picks = {};
+      renderTransfer();
+      return true;
+    }
+    if (node.dataset.transferAll !== undefined) { form.all = node.checked; renderTransfer(); return true; }
+    if (node.dataset.transferApproach !== undefined) { form.approach = node.checked; return true; }
+    if (node.dataset.transferPick !== undefined) {
+      var key = node.dataset.transferPick;
+      if (node.checked) {
+        var good = transferSenderGoods().filter(function (g) { return goodKey(g) === key; })[0];
+        form.picks[key] = good ? good.amount : 1;
+      } else {
+        delete form.picks[key];
+      }
+      renderTransfer();
+      return true;
+    }
+    // Redrawing here would replace the Transfer button between the press and the click that
+    // blurred this field, and the click would be lost; `input` has kept the form already.
+    if (node.dataset.transferAmount !== undefined) { transferInput(node); return true; }
+    return false;
+  }
+
+  /* Typing an amount picks the good, and is kept without a redraw so the field keeps focus. */
+  function transferInput(node) {
+    if (node.dataset.transferAmount === undefined) { return false; }
+
+    var form = transferForm();
+    var key = node.dataset.transferAmount;
+    var good = transferSenderGoods().filter(function (g) { return goodKey(g) === key; })[0];
+    var value = Math.round(Number(node.value));
+
+    if (node.value === '' || !isFinite(value) || value < 1) { delete form.picks[key]; }
+    else { form.picks[key] = good ? Math.min(value, good.amount) : value; }
+
+    var box = $('#sv-orders [data-transfer-pick="' + key.replace(/"/g, '\\"') + '"]');
+    if (box) { box.checked = form.picks[key] != null; }
+    refreshTransferSummary();
+    return true;
+  }
+
   /* ================================= TRAVEL ================================ */
+
+  /* Travel is order chains the ship flies itself: a route planned with preferences, a
+     boss-farming loop, and the idle defence setting, all carried out by the mod's
+     orderchain.lua extension on the ship. Captain travel missions are a mission like any
+     other and live on the Mission tab; the two used to be one start under two names. */
+
+  var ON_ENEMIES = [
+    ['fight', 'fight, then resume'],
+    ['hold', 'hold & stay aggressive'],
+    ['continue', 'ignore & keep going']
+  ];
+
+  var BOSSES = [
+    ['auto', 'nearest ring'],
+    ['ai', 'The AI · 240–340'],
+    ['swoks', 'Swoks · 350–430']
+  ];
+
+  var PHASE_TONE = { running: 'good', fighting: 'bad', holding: 'warn', looting: 'info',
+                     returning: 'info', cooldown: 'warn' };
+
+  var BOSS_NAMES = { swoks: 'Swoks', ai: 'The AI' };
+
+  var LOOT_RESULTS = {
+    collected: 'everything the fighters could take was collected',
+    collected_recalled: 'collected; fighters that did not make it back were pulled in',
+    stalled: 'nothing was picked up for 45 seconds',
+    stalled_recalled: 'stalled; fighters that did not make it back were pulled in',
+    timeout: 'stopped after five minutes',
+    timeout_recalled: 'stopped after five minutes; stragglers were pulled in',
+    no_launch: 'no fighter left the hangar (pilots?)',
+    no_launch_recalled: 'no fighter left the hangar (pilots?)',
+    no_fighters: 'the ship has no fighters to send'
+  };
+
+  var PLAN_ENDS = {
+    pilot_left: ['warn', 'Farming stopped'],
+    resume_failed: ['bad', 'Plan could not resume'],
+    replaced: ['warn', 'Plan replaced'],
+    stopped: ['warn', 'Plan stopped'],
+    refused: ['bad', 'Plan refused']
+  };
+
+  function bossLabel(boss) {
+    if (!boss) { return 'the boss'; }
+    return boss.title || BOSS_NAMES[boss.name] || boss.name || 'the boss';
+  }
+
+  /* What is worth telling the player about, read off two consecutive automation states of
+     one ship. Events arrive in order, so each state is compared with the one before it. */
+  function automationChanged(name, before, after) {
+    var was = before && before.plan;
+    var now = after && after.plan;
+    var same = !!(was && now && was.id === now.id);
+
+    if (now && now.kind === 'farm') {
+      if (now.bossPresent && !(same && was.bossPresent)) {
+        notify('bad', 'Boss spawned', name + ': ' + bossLabel(now.bossPresent) + ' is in '
+               + coords(after.sector) + '.', name);
+      }
+
+      if (same && (now.bossKills || 0) > (was.bossKills || 0)) {
+        notify('good', 'Boss killed', name + ': ' + bossLabel(now.lastKill) + ' is down.'
+               + (now.cooldown ? ' Jumping pauses for ' + duration(now.cooldown.left) + '.' : ''),
+               name);
+      }
+
+      if (same && was.phase === 'looting' && now.phase !== 'looting' && now.lootResult) {
+        toast('info', 'Looting done', name + ': ' + (LOOT_RESULTS[now.lootResult] || now.lootResult) + '.');
+      }
+
+      if (same && was.phase === 'cooldown' && now.phase === 'running') {
+        notify('good', 'Boss cooldown over', name + ' is jumping again; the next boss can spawn.', name);
+      }
+    }
+
+    if (was && !same) {
+      var last = after && after.last;
+      if (S.expectEnd[name]) {
+        // stopped from this page, which already said so
+        delete S.expectEnd[name];
+      } else if (last && last.id === was.id && !now) {
+        if (last.outcome === 'arrived') {
+          notify('good', 'Route arrived', name + ' reached ' + coords(last.sector) + '.', name);
+        } else {
+          var end = PLAN_ENDS[last.outcome] || ['warn', 'Plan ended'];
+          notify(end[0], end[1], name + ': ' + (last.reason || last.outcome), name);
+        }
+      }
+    }
+  }
+
+  /* Countdowns tick in place between polls, off the moment the state was published. */
+  function countdownHtml(endsAt) {
+    return '<span data-countdown="' + Math.round(endsAt) + '">'
+      + esc(duration(Math.max(0, (endsAt - Date.now()) / 1000))) + '</span>';
+  }
+
+  function tickCountdowns() {
+    $$('[data-countdown]').forEach(function (node) {
+      var left = Math.max(0, (Number(node.dataset.countdown) - Date.now()) / 1000);
+      node.textContent = left > 0 ? duration(left) : 'any moment';
+    });
+  }
+
+  function farmRows(plan, received) {
+    var rows = [];
+
+    rows.push(['boss', plan.bossPresent
+      ? '<span class="badge bad">' + esc(bossLabel(plan.bossPresent)) + ' in sector</span>'
+      : '<span class="mute2">none in sector</span>']);
+
+    rows.push(['bosses killed', num(plan.bossKills || 0)
+      + (plan.lastKill ? ' <span class="mute2">last: ' + esc(bossLabel(plan.lastKill))
+        + ' in ' + esc(coords(plan.lastKill.sector)) + '</span>' : '')]);
+
+    if (plan.cooldown) {
+      rows.push(['boss cooldown', countdownHtml(received + plan.cooldown.left * 1000)
+        + ' <span class="mute2">left of ' + esc(duration(plan.cooldown.total))
+        + (plan.phase === 'cooldown' ? ', not jumping' : '') + '</span>']);
+    }
+
+    var loot = plan.loot;
+    var lootText = plan.collectLoot ? 'fighters collect it' : '<span class="mute2">off</span>';
+    if (loot) {
+      lootText += ' · ' + num(loot.instant) + ' drops';
+      if (loot.cargo) {
+        lootText += ', ' + num(loot.cargo) + ' cargo'
+          + (loot.cargoPickup ? '' : ' <span class="mute2">(fighters need a transporter block and transporter software, rare or better, for cargo)</span>');
+      }
+      if (plan.phase === 'looting' || plan.phase === 'returning') {
+        lootText += ' · ' + num(loot.deployed) + ' of ' + num(loot.fighters) + ' fighters out';
+      }
+    }
+    rows.push(['loot', lootText]);
+
+    if (plan.lootResult) {
+      rows.push(['last looting', esc(LOOT_RESULTS[plan.lootResult] || plan.lootResult)]);
+    }
+
+    return rows;
+  }
+
+  function piloted(name) {
+    var ship = S.byName[name] || {};
+    return /\[PLAYER\]/.test(ship.status || '');
+  }
 
   function renderTravel() {
     if (!S.selected) { return; }
@@ -2212,9 +5731,20 @@
     var target = S.travelTarget || { x: position.x, y: position.y };
     S.travelTarget = target;
 
+    var nav = S.nav;
+    var riftCapable = !!(S.detail && S.detail.hyperspace && S.detail.hyperspace.canPassRifts);
     var out = [];
 
-    out.push('<div class="section"><h2>Travel ' + explain('travel') + '</h2>');
+    if (ship.availability === 'InBackground') {
+      out.push('<div class="note warn" style="margin-bottom:12px">'
+        + 'Out on a captain mission &mdash; no order chain '
+        + explain('orders-background', 'warn') + '</div>');
+    }
+
+    out.push(automationHtml());
+
+    /* --- route --- */
+    out.push('<div class="section"><h2>Planned route ' + explain('nav-route') + '</h2>');
 
     out.push('<div class="row" style="margin-bottom:10px">'
       + '<span class="mute2">from</span><b>' + coords(position) + '</b>'
@@ -2225,66 +5755,204 @@
       + '<button class="ghost small" data-act="travel-map">pick on map</button>'
       + '</div>');
 
-    out.push('<div class="row" style="margin-bottom:10px">'
-      + '<span class="mute2">swiftness</span>'
-      + [0, 1, 2, 3].map(function (v) {
-          var names = ['careful', 'steady', 'normal', 'reckless'];
-          return '<button class="chip' + ((S.swiftness === undefined ? 2 : S.swiftness) === v ? ' on' : '')
-            + '" data-swiftness="' + v + '">' + v + ' ' + names[v] + '</button>';
-        }).join('')
+    out.push('<div class="chips" style="margin-bottom:10px">'
+      + prefChip('preferGates', 'prefer gates')
+      + prefChip('avoidRifts', riftCapable ? 'avoid rifts' : 'avoid rifts (always, no rift drive)')
+      + prefChip('preferUncontrolled', 'prefer no man\'s space')
       + '</div>');
 
     out.push('<div class="row" style="margin-bottom:12px">'
-      + '<button class="ghost" data-act="route">Check route</button>'
-      + '<button class="primary" data-act="travel">Send</button>'
-      + '<span class="mute2">route calculation is limited to one every two seconds</span>'
+      + '<button class="ghost" data-act="route">Plan route</button>'
+      + '<button class="primary" data-act="fly">Fly route</button>'
+      + '<span class="mute2">planning is limited to one every two seconds</span>'
       + '</div>');
 
-    out.push('<div id="travel-result">' + (S.lastRoute ? routeHtml(S.lastRoute) : '') + '</div>');
+    out.push('<div id="travel-result">' + navResultHtml(nav.result) + '</div>');
     out.push('</div>');
+
+    /* --- enemies --- */
+    out.push('<div class="section"><h2>When enemies appear ' + explain('nav-enemies') + '</h2>'
+      + '<div class="row">'
+      + '<div class="chips">' + ON_ENEMIES.map(function (option) {
+          return '<button class="chip' + (nav.onEnemies === option[0] ? ' on' : '')
+            + '" data-on-enemies="' + option[0] + '">' + option[1] + '</button>';
+        }).join('') + '</div>'
+      + '<label class="check"><input type="checkbox" id="nav-civilians"'
+      + (nav.attackCivilians ? ' checked' : '') + '><span>attack civilians</span></label>'
+      + '</div>'
+      + '<div class="mute2" style="margin-top:6px">applies to planned routes and boss farming</div>'
+      + '</div>');
+
+    /* --- boss farming --- */
+    var aboard = piloted(S.selected);
+    out.push('<div class="section"><h2>Boss farming ' + explain('nav-farm') + '</h2>'
+      + '<div class="row" style="margin-bottom:10px">'
+      + '<div class="chips">' + BOSSES.map(function (option) {
+          return '<button class="chip' + (nav.boss === option[0] ? ' on' : '')
+            + '" data-boss="' + option[0] + '">' + option[1] + '</button>';
+        }).join('') + '</div>'
+      + (aboard
+        ? '<span class="badge good">you are at the controls</span>'
+        : '<span class="badge warn" title="Spawns count the jumps of the player aboard.">'
+          + 'nobody at the controls</span>')
+      + '</div>'
+      + '<div class="row" style="margin-bottom:10px">'
+      + '<label class="check"><input type="checkbox" id="nav-collect-loot"'
+      + (nav.collectLoot ? ' checked' : '') + '><span>send fighters for the loot</span></label>'
+      + explain('nav-loot')
+      + '<label class="check">pause after a kill for <input type="number" id="nav-cooldown" min="0" max="240" step="1" value="'
+      + esc(nav.cooldownMinutes) + '" style="width:64px"> min</label>'
+      + '</div>'
+      + '<div class="row" style="margin-bottom:10px">'
+      + '<button class="ghost" data-act="farm-preview">Preview loop</button>'
+      + '<button class="primary" data-act="farm"' + (aboard ? '' : ' disabled') + '>Start farming</button>'
+      + '</div>'
+      + '<div id="farm-result">' + farmResultHtml(nav.farm) + '</div>'
+      + '</div>');
+
+    out.push('<div class="note">Fighting enemies and collecting loot while the ship is not '
+      + 'flying a plan are standing orders, on the <a href="#" data-act="to-orders">Orders tab</a>. '
+      + 'Captain travel missions, which work in unloaded sectors and while you are logged out, '
+      + 'are on the <a href="#" data-act="to-missions">Mission tab</a>.</div>');
 
     $('#sv-travel').innerHTML = out.join('');
   }
 
-  function routeHtml(route) {
-    if (route.__error) { return errorBox('Route failed', route.__error); }
-
-    var head = route.reachable
-      ? '<div class="okbox"><b>' + num(route.jumps) + ' jumps</b>, '
-        + num(route.distance, 1) + ' sectors flown</div>'
-      : '<div class="errbox"><h3>Unreachable</h3><div>The pathfinder stopped short of '
-        + coords(route.to) + '.</div></div>';
-
-    var path = (route.route || []).map(function (p) { return p.x + ':' + p.y; }).join(' → ');
-
-    return head
-      + kv([
-        ['from', coords(route.from)],
-        ['to', coords(route.to)],
-        ['jump range', num(route.jumpRange, 2)],
-        ['rifts', route.canPassRifts ? 'can pass' : 'no']
-      ])
-      + '<div class="mute2" style="margin-top:8px;overflow-wrap:anywhere">' + esc(path) + '</div>';
+  function prefChip(key, label) {
+    return '<button class="chip' + (S.nav[key] ? ' on' : '') + '" data-pref="' + key + '">'
+      + esc(label) + '</button>';
   }
 
-  function checkRoute(button) {
-    var name = S.selected;
-    if (!name) { return; }
+  function automationHtml() {
+    var nav = S.nav;
+    var head = '<div class="section"><h2>Automation ' + explain('nav-state')
+      + ' <button class="ghost small" data-act="automation-refresh">refresh</button></h2>';
 
-    var to = readTravelTarget();
-    guard(button, Api.get('/galaxy/route',
-      { ship: name, toX: to.x, toY: to.y, owner: ownerParamFor(name) },
-      { priority: Api.P.USER, label: 'route' }))
-      .then(function (route) {
-        S.lastRoute = route;
-        GalaxyMap.setRoute(route);
-        $('#travel-result').innerHTML = routeHtml(route);
-      })
-      .catch(function (error) {
-        S.lastRoute = { __error: error };
-        $('#travel-result').innerHTML = errorBox(
-          error.code === 'route_busy' ? 'Rate limited' : 'Route failed', error);
+    if (nav.automationError) {
+      return head + errorBox('Could not read the automation state', nav.automationError) + '</div>';
+    }
+    if (!nav.automation) { return head + '<p class="muted">loading…</p></div>'; }
+    if (!nav.automation.reported) {
+      return head + '<div class="note">This ship has not reported any automation state yet. '
+        + 'It does once its sector is loaded with this version of the mod.</div></div>';
+    }
+
+    var a = nav.automation.automation || {};
+    var plan = a.plan;
+    var rows = [];
+    var badges = [];
+
+    if (plan) {
+      badges.push('<span class="badge ' + (PHASE_TONE[plan.phase] || 'info') + '">'
+        + esc(plan.kind) + ' · ' + esc(plan.phase) + '</span>');
+      rows.push(['hop', num(plan.hop) + ' of ' + num(plan.hops)
+        + (plan.loopFrom ? ' · loops from ' + num(plan.loopFrom) : '')]);
+      if (plan.target && !plan.loopFrom) { rows.push(['heading for', esc(coords(plan.target))]); }
+      if (plan.boss) { rows.push(['boss ring', esc(BOSS_NAMES[plan.boss] || plan.boss)]); }
+      rows.push(['jumps flown', num(plan.jumps)]);
+      rows.push(['fights', num(plan.fights)]);
+      rows.push(['on enemies', esc(plan.onEnemies)]);
+      if (plan.kind === 'farm') {
+        rows = rows.concat(farmRows(plan, nav.automation.receivedAt || Date.now()));
+      }
+    } else {
+      badges.push('<span class="badge">no plan</span>');
+    }
+
+    if (a.reaction) {
+      badges.push('<span class="badge ' + ((REACTION_PHASES[a.reaction.phase] || [])[0] || 'info') + '">standing order · '
+        + esc(a.reaction.phase) + '</span>');
+    }
+    if (a.enemies) { badges.push('<span class="badge bad">enemies in sector</span>'); }
+    if (a.standing) {
+      STANDING.forEach(function (spec) {
+        var order = a.standing[spec.key] || {};
+        badges.push('<span class="badge ' + (order.enabled ? 'good' : '') + '" title="standing order, set on the Orders tab">'
+          + esc(spec.label.toLowerCase()) + ' ' + (order.enabled ? (order.mode === 'interrupt' ? 'always' : 'when idle') : 'off') + '</span>');
       });
+    } else {
+      badges.push('<span class="badge ' + (a.autoAggressive ? 'good' : '') + '">idle defence '
+        + (a.autoAggressive ? 'on' : 'off') + '</span>');
+    }
+
+    if (a.transfer) {
+      badges.push('<span class="badge info">transfer · ' + esc(a.transfer.phase || 'moving') + '</span>');
+      rows.push(['cargo transfer', transferText(a.transfer) + ' <span class="mute2">'
+        + esc(TRANSFER_PHASES[a.transfer.phase] || a.transfer.phase || '') + '</span>']);
+    }
+    if (a.lastTransfer) {
+      rows.push(['last transfer', lastTransferHtml(a.lastTransfer)]);
+    }
+    if (a.last) {
+      rows.push(['last plan', esc(a.last.kind + ' · ' + a.last.outcome)
+        + (a.last.reason ? ' <span class="mute2">' + esc(a.last.reason) + '</span>' : '')]);
+    }
+    if (a.defenceFights) { rows.push(['standing fights', num(a.defenceFights)]); }
+    if (a.lootRuns) { rows.push(['standing loot runs', num(a.lootRuns)]); }
+    rows.push(['source', esc(nav.automation.source)
+      + (nav.automation.source === 'database' ? ' <span class="mute2">as of the last save</span>' : '')]);
+
+    return head
+      + '<div class="row" style="margin-bottom:8px"><div class="badges">' + badges.join('') + '</div>'
+      + '<span class="spacer"></span>'
+      + (plan || a.reaction || a.transfer ? '<button class="ghost small" data-act="automation-stop">Stop</button>' : '')
+      + '</div>'
+      + kv(rows)
+      + '</div>';
+  }
+
+  function hopsHtml(hops) {
+    return (hops || []).map(function (hop) {
+      var tag = hop.kind && hop.kind !== 'jump' ? ' <span class="mute2">' + esc(hop.kind) + '</span>' : '';
+      var cls = hop.controlled ? 'dim' : 'active';
+      return '<span class="' + cls + '" title="' + (hop.controlled ? 'faction space' : 'no man\'s space')
+        + '">' + esc(hop.x + ':' + hop.y) + tag + '</span>';
+    }).join(' <span class="dim">→</span> ');
+  }
+
+  function navResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.__error) { return errorBox(result.__title || 'Route failed', result.__error); }
+
+    if (!result.reachable) {
+      return '<div class="errbox"><h3>Unreachable</h3><div>'
+        + esc(result.reason || 'The pathfinder stopped short of ' + coords(result.to) + '.')
+        + '</div></div>';
+    }
+
+    var head = result.planner === 'engine'
+      ? num(result.jumps) + ' jumps (game pathfinder)'
+      : num(result.jumps) + ' hops'
+        + (result.gates ? ' · ' + num(result.gates) + ' through gates' : '')
+        + ' · ' + num(result.controlledSectors || 0) + ' in faction space';
+
+    var sent = result.planId
+      ? '<div class="mute2">' + (result.confirmed ? 'the ship took the plan up' : 'dispatched, not confirmed '
+        + explain('orders-unconfirmed')) + '</div>'
+      : '';
+
+    return '<div class="' + (result.planId && !result.confirmed ? 'errbox' : 'okbox') + '">'
+      + '<b>' + head + '</b>, ' + num(result.distance, 1) + ' sectors flown'
+      + sent + '</div>'
+      + '<div class="hops">' + hopsHtml(result.hops) + '</div>';
+  }
+
+  function farmResultHtml(result) {
+    if (!result) { return ''; }
+    if (result.__error) { return errorBox(result.__title || 'Farming refused', result.__error); }
+
+    var loop = result.loop || [];
+    return '<div class="' + (result.planId && !result.confirmed ? 'errbox' : 'okbox') + '">'
+      + '<b>' + esc(result.boss === 'swoks' ? 'Swoks' : 'The AI') + '</b> ring, looping '
+      + esc(loop.map(coords).join(' ⇄ '))
+      + (result.approach && result.approach.length
+        ? ' after ' + num(result.approach.length) + ' hops to get there' : '')
+      + '<div class="mute2">' + (result.collectLoot === false ? 'leaves the loot' : 'fighters collect the loot')
+        + ' · ' + (result.bossCooldown ? 'pauses ' + esc(duration(result.bossCooldown)) + ' after a kill'
+          : 'keeps jumping after a kill') + '</div>'
+      + (result.planId ? '<div class="mute2">' + (result.confirmed ? 'farming' : 'dispatched, not confirmed')
+        + '</div>' : '')
+      + '</div>';
   }
 
   function readTravelTarget() {
@@ -2294,31 +5962,166 @@
     return S.travelTarget;
   }
 
-  function sendTravel(button) {
+  function navOptions() {
+    return {
+      preferGates: S.nav.preferGates,
+      avoidRifts: S.nav.avoidRifts,
+      preferUncontrolled: S.nav.preferUncontrolled
+    };
+  }
+
+  function planRoute(button) {
     var name = S.selected;
     if (!name) { return; }
 
     var to = readTravelTarget();
-    var body = { to: to, swiftness: S.swiftness === undefined ? 2 : S.swiftness };
+    var query = Object.assign({ ship: name, toX: to.x, toY: to.y, owner: ownerParamFor(name) },
+                              navOptions());
 
-    $('#travel-result').innerHTML = '<p class="muted">running the area analysis…</p>';
+    $('#travel-result').innerHTML = '<p class="muted">planning…</p>';
 
-    guard(button, Api.post('/ships/' + Api.seg(name) + '/travel', body,
-                           { owner: ownerParamFor(name) },
-                           { priority: Api.P.USER, label: 'travel' }))
-      .then(function (result) {
-        toast('good', 'Travelling', name + ' is on its way to ' + coords(to) + '.');
-        $('#travel-result').innerHTML = renderPreview(result);
-        refreshFleet(true);
-        loadMission();
+    guard(button, Api.get('/galaxy/route', query, { priority: Api.P.USER, label: 'route' }))
+      .then(function (route) {
+        if (S.selected !== name) { return; }
+        S.nav.result = route;
+        GalaxyMap.setRoute(route);
+        $('#travel-result').innerHTML = navResultHtml(route);
       })
       .catch(function (error) {
-        if (error.status === 422 && error.body && error.body.errors) {
-          $('#travel-result').innerHTML = renderPreview(error.body);
-        } else {
-          $('#travel-result').innerHTML = errorBox('Travel refused', error);
+        S.nav.result = { __error: error,
+                         __title: error.code === 'route_busy' ? 'Rate limited' : 'Route failed' };
+        $('#travel-result').innerHTML = navResultHtml(S.nav.result);
+      });
+  }
+
+  function flyRoute(button) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var to = readTravelTarget();
+    var body = Object.assign({
+      to: to,
+      onEnemies: S.nav.onEnemies,
+      attackCivilians: S.nav.attackCivilians
+    }, navOptions());
+
+    $('#travel-result').innerHTML = '<p class="muted">planning, then waiting for the ship to '
+      + 'take the plan up…</p>';
+
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/route', body,
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: 'fly route' }))
+      .then(function (result) {
+        if (S.selected !== name) { return; }
+        S.nav.result = result;
+        GalaxyMap.setRoute(result);
+        $('#travel-result').innerHTML = navResultHtml(result);
+        tookAutomation(name, result);
+        toast(result.confirmed ? 'good' : 'warn', result.confirmed ? 'Route flying' : 'Route dispatched',
+              name + ' → ' + coords(to) + ', ' + result.jumps + ' hops.');
+      })
+      .catch(function (error) {
+        S.nav.result = error.body && error.body.hops && error.body.reachable === false
+          ? error.body
+          : { __error: error, __title: 'Route refused' };
+        $('#travel-result').innerHTML = navResultHtml(S.nav.result);
+        apiFailed(error, 'Route refused');
+      });
+  }
+
+  function farm(button, dryRun) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    var body = {
+      boss: S.nav.boss,
+      onEnemies: S.nav.onEnemies,
+      attackCivilians: S.nav.attackCivilians,
+      collectLoot: S.nav.collectLoot,
+      bossCooldown: Math.round(S.nav.cooldownMinutes * 60),
+      dryRun: !!dryRun
+    };
+
+    // a farm is the thing worth hearing about with the page in the background
+    if (!dryRun) { requestNotify(); }
+
+    $('#farm-result').innerHTML = '<p class="muted">' + (dryRun ? 'finding a loop…'
+      : 'finding a loop, then waiting for the ship…') + '</p>';
+
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/farm', body,
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: dryRun ? 'farm preview' : 'farm' }))
+      .then(function (result) {
+        if (S.selected !== name) { return; }
+        S.nav.farm = result;
+        GalaxyMap.setRoute(result);
+        $('#farm-result').innerHTML = farmResultHtml(result);
+        if (!dryRun) {
+          tookAutomation(name, result);
+          toast('good', 'Farming', name + ' is looping in the ' + result.boss + ' ring.');
         }
-        apiFailed(error, 'Travel refused');
+      })
+      .catch(function (error) {
+        S.nav.farm = { __error: error };
+        $('#farm-result').innerHTML = farmResultHtml(S.nav.farm);
+        if (!dryRun) { apiFailed(error, 'Farming refused'); }
+      });
+  }
+
+  /* A confirmed dispatch carries the state the ship published, which is newer than the
+     last read - so it is shown straight away rather than after another round trip. */
+  function tookAutomation(name, body) {
+    if (body && body.automation && S.selected === name) {
+      S.nav.automation = { ship: name, source: 'live', reported: true, automation: body.automation,
+                           receivedAt: Date.now() };
+      S.nav.automationError = null;
+      renderTravel();
+      renderStanding();
+      renderTransferState();
+    }
+    refreshFleet(true);
+    sweepEvents();
+  }
+
+  function loadAutomation(background) {
+    var name = S.selected;
+    if (!name || isStation(S.byName[name])) { return Promise.resolve(); }
+
+    return Api.get('/ships/' + Api.seg(name) + '/automation', { owner: ownerParamFor(name) },
+                   { priority: background ? Api.P.POLL : Api.P.DETAIL, label: 'automation' })
+      .then(function (body) {
+        if (S.selected !== name) { return; }
+        body.receivedAt = Date.now();
+        S.nav.automation = body;
+        S.nav.automationError = null;
+        if (S.sub === 'travel') { renderTravel(); }
+        renderStanding();
+        renderTransferState();
+        renderAutomationList();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled' || S.selected !== name) { return; }
+        S.nav.automationError = error;
+        if (S.sub === 'travel') { renderTravel(); }
+        renderStanding();
+      });
+  }
+
+  function stopAutomation(button) {
+    var name = S.selected;
+    if (!name) { return; }
+
+    S.expectEnd[name] = true;
+    guard(button, Api.post('/ships/' + Api.seg(name) + '/automation/stop', {},
+                           { owner: ownerParamFor(name) },
+                           { priority: Api.P.USER, label: 'stop automation' }))
+      .then(function (result) {
+        toast('good', 'Stopped', name + ' has no plan or standing order at work any more.');
+        tookAutomation(name, result);
+      })
+      .catch(function (error) {
+        delete S.expectEnd[name];
+        apiFailed(error, 'Stop refused');
       });
   }
 
@@ -2342,6 +6145,8 @@
     return Promise.all(work).then(function () {
       renderRecordingNote();
       renderFleet();
+      // every craft's automation state rides on its events, so the list follows the sweep
+      renderAutomationList();
       if (S.sub === 'log') { renderShipLog(); }
     });
   }
@@ -2351,6 +6156,11 @@
 
     var events = body.events || [];
     var added = false;
+
+    // The first sweep for a ship replays its buffer, which is history rather than news:
+    // it sets the baseline for notifications without raising any.
+    var baseline = !S.swept[name];
+    S.swept[name] = true;
 
     /* When each event happened, rather than when this poll collected it.
        A first sweep pulls the whole buffer at once, and stamping all of it with Date.now()
@@ -2377,6 +6187,18 @@
       event.recvAt = arrived - offset * 1000;
       S.events.push(event);
       added = true;
+
+      if (event.automation) {
+        if (!baseline) { automationChanged(name, S.autoSeen[name], event.automation); }
+        S.autoSeen[name] = event.automation;
+      }
+
+      if (event.automation && name === S.selected) {
+        S.nav.automation = { ship: name, source: 'live', reported: true,
+                             automation: event.automation, receivedAt: arrived - offset * 1000 };
+        if (S.sub === 'travel') { renderTravel(); }
+        renderStanding();
+      }
 
       if (event.seq > (S.cursors[name] || -1)) { S.cursors[name] = event.seq; }
     }
@@ -4546,7 +8368,18 @@
           : 'number of visits, up to ' + num(heat.maxVisits))
         + '.</div>'
       + '<div class="mute2">' + (heat.ships || []).length + ' craft &middot; '
-        + span + ' of recorded travel ' + explain('history-observed') + '</div>';
+        + span + ' of recorded travel ' + explain('history-observed') + '</div>'
+      + sharedNote();
+  }
+
+  /* Whose travel the map is drawing. The bridge keeps an alliance's history once for all
+     its members, so a heatmap can hold craft this key never polled. */
+  function sharedNote() {
+    var alliance = S.ping && S.ping.player && S.ping.player.alliance;
+    if (!alliance) { return ''; }
+
+    return '<div class="mute2">Includes <b>' + esc(alliance.name || 'your alliance')
+      + '</b>&rsquo;s craft ' + explain('history-shared') + '</div>';
   }
 
   function setHistoryWindow(seconds) {
@@ -4853,6 +8686,10 @@
 
     $('#poll-toggle').addEventListener('click', function () { setPaused(!S.paused); });
 
+    $('#notify-toggle').addEventListener('click', toggleNotify);
+    renderNotifyToggle();
+    setInterval(tickCountdowns, 1000);
+
     $('#tabs').addEventListener('click', function (e) {
       var tab = e.target.closest('.tab');
       if (tab) { showView(tab.dataset.view); }
@@ -4971,6 +8808,8 @@
       var button = e.target.closest('button');
       if (!button) { return; }
 
+      if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
+
       if (button.dataset.mission) { pickMission(button.dataset.mission); return; }
       if (button.dataset.size) { S.missionForm.sizeIndex = Number(button.dataset.size); renderMission(); return; }
 
@@ -4992,8 +8831,37 @@
         return;
       }
 
+      if (button.dataset.route) { useRoute(button.dataset.route); return; }
+      if (button.dataset.areaMap) {
+        var b = button.dataset.areaMap.split(',').map(Number);
+        showAreaOnMap({ lower: { x: b[0], y: b[1] }, upper: { x: b[2], y: b[3] } });
+        return;
+      }
+      if (button.dataset.scanUse) { useScanRow(Number(button.dataset.scanUse)); return; }
+      if (button.dataset.scanRank) {
+        S.missionForm.scan.rank = button.dataset.scanRank;
+        renderMission();
+        return;
+      }
+
       var act = button.dataset.act;
-      if (act === 'preview') { runPreview(button); }
+      if (act === 'escorts-near') {
+        var picked = S.missionForm.escorts;
+        escortCandidates().forEach(function (c) {
+          if (c.near && picked.indexOf(c.ship.name) === -1) { picked.push(c.ship.name); }
+        });
+        renderMission();
+      }
+      else if (act === 'scan') { runScan(); }
+      else if (act === 'scan-stop') { stopScan(); }
+      else if (act === 'scan-open' || act === 'scan-close') {
+        S.missionForm.scan.collapsed = act === 'scan-close';
+        renderMission();
+      } else if (act === 'routes-open' || act === 'routes-close') {
+        S.missionForm.routesOpen = act === 'routes-open';
+        renderMission();
+      } else if (act === 'area-map-form') { showAreaOnMap(formArea()); }
+      else if (act === 'preview') { runPreview(button); }
       else if (act === 'start') { runStart(button); }
       else if (act === 'collect' || act === 'recall' || act === 'recall-force') {
         missionAction(act, button);
@@ -5010,10 +8878,79 @@
       }
     });
 
+    /* --- automation tab ----------------------------------------------- */
+    bindSeg('#automation-filter', function (value) { S.autoFilter = value; renderAutomationList(); });
+
+    $('#automation-refresh').addEventListener('click', function () {
+      loadAutomations(true);
+      loadPrograms(true);
+      loadLibrary(true);
+      refreshFleet(true);
+      if (S.selected) { loadAutomation(); }
+    });
+
+    $('#automation-rows').addEventListener('click', function (e) {
+      var row = e.target.closest('[data-auto-ship]');
+      if (row) { select(row.dataset.autoShip); }
+    });
+
+    $('#automation-pane').addEventListener('click', function (e) {
+      var button = e.target.closest('button');
+      if (!button) { return; }
+
+      if (standingClick(button)) { return; }
+      if (programClick(button)) { return; }
+      if (libraryClick(button)) { return; }
+      if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
+      if (button.dataset.autoArea && S.autoForm) {
+        S.autoForm.areaMode = button.dataset.autoArea;
+        S.autoForm.dry = null;
+        redrawAutomation();
+        return;
+      }
+      if (button.dataset.autoObjective && S.autoForm) {
+        S.autoForm.objective = button.dataset.autoObjective;
+        S.autoForm.dry = null;
+        redrawAutomation();
+        return;
+      }
+      if (button.dataset.act === 'open-fleet') { showView('fleet'); }
+    });
+
+    $('#automation-pane').addEventListener('change', function (e) {
+      var node = e.target;
+      if (standingChange(node)) { return; }
+      if (node.dataset.progToggle !== undefined) { toggleProgram(node); return; }
+      if (node.closest('.program-editor')) {
+        if (programField(node)) { redrawProgram(); }
+        return;
+      }
+      if (node.dataset.autoToggle !== undefined) { toggleAutomation(node); }
+      else if (node.dataset.autoCollect !== undefined && S.autoForm) {
+        S.autoForm.collectYields = node.checked;
+      }
+    });
+
+    $('#automation-pane').addEventListener('input', function (e) {
+      var node = e.target;
+
+      // Kept on the form as typed and never redrawn from here, so the field keeps focus.
+      if (node.dataset.autoLimit && S.autoForm) {
+        S.autoForm.limits[node.dataset.autoLimit] = node.value === '' ? null : Number(node.value);
+      }
+      if (node.dataset.autoLibname !== undefined && S.autoForm && S.autoForm.library) {
+        S.autoForm.library.name = node.value;
+      }
+      if (node.tagName === 'INPUT' && node.type !== 'checkbox' && node.closest('.program-editor')) {
+        programField(node);
+      }
+    });
+
     $('#sv-mission').addEventListener('input', function (e) {
+      var node = e.target;
+
       var form = S.missionForm;
       if (!form) { return; }
-      var node = e.target;
 
       if (node.dataset.form === 'cx') { form.center.x = Math.round(Number(node.value)) || 0; syncArea(); }
       else if (node.dataset.form === 'cy') { form.center.y = Math.round(Number(node.value)) || 0; syncArea(); }
@@ -5022,6 +8959,17 @@
           ? node.checked : Number(node.value);
         var slider = $('[data-config-range="' + node.dataset.config + '"]', $('#sv-mission'));
         if (slider && node.type !== 'range') { slider.value = node.value; }
+      } else if (node.dataset.capitalRange !== undefined) {
+        var route = chosenRoute(form);
+        if (!route) { return; }
+        var range = depositRange(route);
+        var units = Number(node.value);
+        form.config.deposit = units * range.unitPrice;
+        form.config.maxDeposit = range.max * range.unitPrice;
+        var label = $('#sv-mission [data-capital]');
+        if (label) { label.innerHTML = capitalText(units, range); }
+        var stale = $('#sv-mission [data-capital-stale]');
+        if (stale) { stale.hidden = !capitalStale(form); }
       } else if (node.dataset.configRange) {
         form.config[node.dataset.configRange] = Number(node.value);
         var box = $('[data-config="' + node.dataset.configRange + '"]', $('#sv-mission'));
@@ -5050,6 +8998,9 @@
         return;
       }
 
+      if (standingClick(button)) { return; }
+      if (transferClick(button)) { return; }
+
       var act = button.dataset.act;
       var i = Number(button.dataset.i);
 
@@ -5066,6 +9017,9 @@
       var node = e.target;
       var i;
 
+      if (standingChange(node)) { return; }
+      if (transferChange(node)) { return; }
+
       if (node.dataset.rowType !== undefined) {
         i = Number(node.dataset.rowType);
         S.orderRows[i] = { type: node.value, x: 0, y: 0 };
@@ -5081,24 +9035,61 @@
       }
     });
 
+    $('#sv-orders').addEventListener('input', function (e) { transferInput(e.target); });
+
     /* --- travel tab --------------------------------------------------- */
     $('#sv-travel').addEventListener('click', function (e) {
+      var link = e.target.closest('a[data-act="to-missions"], a[data-act="to-orders"]');
+      if (link) {
+        e.preventDefault();
+        showSub(link.dataset.act === 'to-orders' ? 'orders' : 'mission');
+        return;
+      }
+
       var button = e.target.closest('button');
       if (!button) { return; }
 
-      if (button.dataset.swiftness !== undefined) {
-        S.swiftness = Number(button.dataset.swiftness);
+      if (button.dataset.pref) {
+        readTravelTarget();
+        S.nav[button.dataset.pref] = !S.nav[button.dataset.pref];
+        renderTravel();
+        return;
+      }
+      if (button.dataset.onEnemies) {
+        readTravelTarget();
+        S.nav.onEnemies = button.dataset.onEnemies;
+        renderTravel();
+        return;
+      }
+      if (button.dataset.boss) {
+        readTravelTarget();
+        S.nav.boss = button.dataset.boss;
         renderTravel();
         return;
       }
 
       var act = button.dataset.act;
-      if (act === 'route') { readTravelTarget(); checkRoute(button); }
-      else if (act === 'travel') { sendTravel(button); }
+      if (act === 'route') { planRoute(button); }
+      else if (act === 'fly') { flyRoute(button); }
+      else if (act === 'farm-preview') { farm(button, true); }
+      else if (act === 'farm') { farm(button, false); }
+      else if (act === 'automation-refresh') { loadAutomation(); }
+      else if (act === 'automation-stop') { stopAutomation(button); }
       else if (act === 'travel-map') {
         S.pickTarget = 'travel';
         showView('map');
-        toast('info', 'Click a sector', 'It becomes the travel destination.');
+        toast('info', 'Click a sector', 'It becomes the route destination.');
+      }
+    });
+
+    $('#sv-travel').addEventListener('change', function (e) {
+      var node = e.target;
+      if (node.id === 'nav-civilians') { S.nav.attackCivilians = node.checked; }
+      else if (node.id === 'nav-collect-loot') { S.nav.collectLoot = node.checked; }
+      else if (node.id === 'nav-cooldown') {
+        var minutes = Math.round(Number(node.value));
+        S.nav.cooldownMinutes = isFinite(minutes) ? Math.min(240, Math.max(0, minutes)) : 30;
+        node.value = S.nav.cooldownMinutes;
       }
     });
 

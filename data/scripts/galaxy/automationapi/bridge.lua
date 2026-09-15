@@ -19,7 +19,12 @@ local Serialize = include("automationapi/serialize")
 local MetaHandler = include("automationapi/handlers/meta")
 local ShipsHandler = include("automationapi/handlers/ships")
 local MissionsHandler = include("automationapi/handlers/missions")
+local MissionAutomation = include("automationapi/handlers/missionautomation")
+local MissionLibrary = include("automationapi/handlers/missionlibrary")
+local Programs = include("automationapi/handlers/programs")
 local MovementHandler = include("automationapi/handlers/movement")
+local NavigationHandler = include("automationapi/handlers/navigation")
+local TransferHandler = include("automationapi/handlers/transfer")
 local ShipEvents = include("automationapi/shipevents")
 local StationEvents = include("automationapi/stationevents")
 local MapHandler = include("automationapi/handlers/map")
@@ -498,7 +503,12 @@ function AutomationApiBridge.initialize()
     MetaHandler.register(router)
     ShipsHandler.register(router)
     MissionsHandler.register(router)
+    MissionAutomation.register(router)
+    MissionLibrary.register(router)
+    Programs.register(router)
     MovementHandler.register(router)
+    NavigationHandler.register(router)
+    TransferHandler.register(router)
     MapHandler.register(router)
     EconomyHandler.register(router)
 
@@ -575,6 +585,19 @@ function AutomationApiBridge.takeJobs(playerIndex)
     return payload
 end
 
+-- The same, for the agent attached to an alliance: an alliance's Simulation can only be
+-- reached from the alliance's own script thread. See Missions.takeAllianceJobs.
+function AutomationApiBridge.takeAllianceJobs(allianceIndex)
+    local ok, payload = pcall(MissionsHandler.takeAllianceJobs, allianceIndex)
+
+    if not ok then
+        logError("takeAllianceJobs failed for %s: %s", tostring(allianceIndex), tostring(payload))
+        return ""
+    end
+
+    return payload
+end
+
 function AutomationApiBridge.reportJobs(payload)
     local ok, err = pcall(MissionsHandler.report, payload)
 
@@ -645,7 +668,10 @@ function AutomationApiBridge.update(timeStep)
         poll()
         Analysis.tick()
         MissionsHandler.tick(elapsed)
+        MissionAutomation.tick(elapsed)
+        Programs.tick(elapsed)
         MovementHandler.tick(elapsed)
+        NavigationHandler.tick()
         MapHandler.tick()
         expirePending(now)
         expireResponses(now)

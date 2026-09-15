@@ -33,6 +33,7 @@
   </div>
 
   <div class="topbar-right">
+    <button id="notify-toggle" class="ghost" title="Allow notifications for bosses, cooldowns and ended plans">&#128277;</button>
     <button id="poll-toggle" class="ghost" title="Pause or resume every background poll">&#10073;&#10073; pause</button>
     <span id="queue-meter" class="meter" title="In-flight / queued API calls">0/0</span>
   </div>
@@ -42,6 +43,7 @@
 
 <nav id="tabs">
   <button class="tab active" data-view="fleet">Fleet</button>
+  <button class="tab" data-view="automation">Automation</button>
   <button class="tab" data-view="industry">Industry</button>
   <button class="tab" data-view="map">Map</button>
   <button class="tab" data-view="galaxy">Galaxy</button>
@@ -63,7 +65,7 @@
           <button data-v="alliance">Alliance</button>
           <button data-v="all">Both</button>
         </div>
-        <input id="fleet-search" type="search" placeholder="filter by name, status, sector, cargo">
+        <input id="fleet-search" type="search" placeholder="filter by name, status, sector, cargo, captain">
         <div class="pane-head-row">
           <span id="fleet-count" class="muted">&mdash;</span>
           <button id="fleet-refresh" class="ghost small">refresh</button>
@@ -112,6 +114,25 @@
         <div class="subview" data-sub="raw"><pre id="sv-raw" class="json"></pre></div>
       </div>
     </section>
+  </section>
+
+  <!-- ============================ AUTOMATION =========================== -->
+  <section id="view-automation" class="view">
+    <aside id="automation-list">
+      <div class="pane-head">
+        <div class="seg" id="automation-filter" data-value="automated">
+          <button data-v="automated" class="on">Automated</button>
+          <button data-v="all">All ships</button>
+        </div>
+        <div class="pane-head-row">
+          <span id="automation-count" class="muted">&mdash;</span>
+          <button id="automation-refresh" class="ghost small">refresh</button>
+        </div>
+      </div>
+      <div id="automation-rows" class="rows"></div>
+    </aside>
+
+    <section id="automation-pane"></section>
   </section>
 
   <!-- ============================= INDUSTRY ============================ -->

@@ -86,7 +86,17 @@ function M.install()
 
     function server:setValue(key, value) serverValues[key] = value end
     function server:getValue(key) return serverValues[key] end
-    function server:isOnline(index) return players[index] ~= nil and players[index].online end
+    function server:isOnline(index)
+        if players[index] then return players[index].online end
+
+        -- an alliance counts as online while any member is
+        local alliance = M.alliances[index]
+        for _, member in ipairs(alliance and {alliance:getMembers()} or {}) do
+            if players[member] and players[member].online then return true end
+        end
+
+        return false
+    end
 
     _G.Server = function() return server end
 
@@ -99,6 +109,11 @@ function M.install()
 
         return p
     end
+
+    _G.Alliance = function()
+        return M.inAllianceAgent and M.alliances[M.inAllianceAgent] or nil
+    end
+    _G.isAllianceScript = function() return M.inAllianceAgent ~= nil end
 
     _G.GameVersion = function() return "2.5.13" end
 
@@ -215,7 +230,16 @@ function M.install()
                 return M.loadedSectors[keyOf(x, y)] == true
             end,
             sectorExists = function() return true end,
-            jumpRouteUnobstructed = function() return M.jumpUnobstructed ~= false end,
+            jumpRouteUnobstructed = function(_, ax, ay, bx, by)
+                if M.jumpUnobstructed == false then return false end
+                if M.obstruction then return not M.obstruction(ax, ay, bx, by) end
+                return true
+            end,
+            -- a faction handle or nil, as the engine answers; nil is no man's space
+            getControllingFaction = function(_, x, y)
+                local index = M.controlledSectors[keyOf(x, y)]
+                return index and {index = index} or nil
+            end,
             keepSector = function() return true end,
             -- The agent -> bridge direction, proven safe in game.
             invokeFunction = function(_, script, functionName, ...)
@@ -313,6 +337,99 @@ function M.install()
         onUserRefineOresOrder = function() return {{name = "Refine Ores", action = 14}} end,
     }
 
+    -- This mod's orderchain.lua extension, reduced to what the bridge can observe of it:
+    -- the chain it builds and the automation state it publishes. The extension's own
+    -- behaviour is exercised for real in tests/test_orderchain.lua.
+    local Json = require("automationapi.json")
+
+    local automationEffects =
+    {
+        automationApiRunPlan = function(ship, payload)
+            local plan = Json.decode(payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.receivedPlans = ship.receivedPlans or {}
+            ship.receivedPlans[#ship.receivedPlans + 1] = plan
+
+            if M.refusePlan then
+                ship.automation.last = {id = plan.id, kind = plan.kind, outcome = "refused",
+                                        reason = M.refusePlan}
+                return
+            end
+
+            local chain = {}
+            for _, hop in ipairs(plan.hops) do
+                if hop.kind == "jump" then
+                    chain[#chain + 1] = {name = "Jump", action = 1}
+                else
+                    chain[#chain + 1] = {name = "Fly Through Wormhole", action = 11}
+                end
+            end
+            if plan.loopFrom then chain[#chain + 1] = {name = "Loop", action = 4} end
+
+            ship.chain = chain
+            ship.chainIndex = 1
+            ship.automation.plan = {id = plan.id, kind = plan.kind, phase = "running",
+                                    hops = #plan.hops, loopFrom = plan.loopFrom or 0}
+        end,
+        automationApiConfigure = function(ship, payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            local automation = ship.automation
+            automation.standing = automation.standing
+                or {enemies = {enabled = false, mode = "idle"}, loot = {enabled = false, mode = "idle"}}
+
+            local spec = Json.decode(payload)
+            if spec.attackCivilians ~= nil then automation.attackCivilians = spec.attackCivilians end
+            if spec.autoAggressive ~= nil then automation.standing.enemies.enabled = spec.autoAggressive end
+
+            -- merged part by part, as the ship merges them
+            for name, order in pairs(spec.standing or {}) do
+                for key, value in pairs(order) do automation.standing[name][key] = value end
+            end
+
+            automation.autoAggressive = automation.standing.enemies.enabled
+        end,
+        automationApiStop = function(ship)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.automation.plan = nil
+            ship.automation.reaction = nil
+            ship.automation.transfer = nil
+            ship.chain = {}
+            ship.chainIndex = 0
+        end,
+        -- A target in reach is served at once and reported in lastTransfer; with
+        -- `transferApproach` set the target is out of reach and the ship docks first. The
+        -- goods are not moved: what the ship does with a hold is test_orderchain.lua's.
+        automationApiTransfer = function(ship, payload)
+            local spec = Json.decode(payload)
+            ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
+            ship.receivedTransfers = ship.receivedTransfers or {}
+            ship.receivedTransfers[#ship.receivedTransfers + 1] = spec
+
+            if M.refuseTransfer then
+                ship.automation.lastTransfer = {id = spec.id, target = spec.target.name,
+                                                outcome = "refused", reason = M.refuseTransfer, total = 0}
+                return
+            end
+
+            if M.transferApproach then
+                ship.chain = {{name = "Dock", action = 19}}
+                ship.chainIndex = 1
+                ship.automation.transfer = {id = spec.id, target = spec.target.name,
+                                            direction = spec.direction, phase = "docking"}
+                return
+            end
+
+            local moved, total = {}, 0
+            for _, good in ipairs(spec.goods or {}) do
+                moved[#moved + 1] = {name = good.name, amount = good.amount or 10}
+                total = total + (good.amount or 10)
+            end
+            ship.automation.lastTransfer = {id = spec.id, target = spec.target.name,
+                                            direction = spec.direction, outcome = "done",
+                                            moved = moved, total = total}
+        end,
+    }
+
     _G.invokeEntityFunction = function(x, y, printErrors, target, script, functionName, ...)
         M.entityCalls[#M.entityCalls + 1] =
         {
@@ -326,9 +443,13 @@ function M.install()
         if ship and not M.orderChainFrozen then
             ship.chain = ship.chain or {}
             local effect = chainEffects[functionName]
+            local automationEffect = not M.noOrderChainExtension
+                                     and automationEffects[functionName]
             if effect then
                 ship.chain = effect(ship.chain)
                 ship.chainIndex = 0
+            elseif automationEffect then
+                automationEffect(ship, ...)
             elseif functionName == "runOrders" then
                 ship.chainIndex = math.min(1, #ship.chain)
             end
@@ -336,7 +457,7 @@ function M.install()
             -- The engine raises onShipOrderInfoUpdated on the owning faction whenever the
             -- chain changes; the player agent forwards it to the bridge. Tests install the
             -- forwarding end as `shipEventSink`, standing in for the agent.
-            if M.shipEventSink and (effect or functionName == "runOrders") then
+            if M.shipEventSink and (effect or automationEffect or functionName == "runOrders") then
                 local chain = {}
                 for index, order in ipairs(ship.chain) do
                     chain[index] = {name = order.name, action = order.action}
@@ -344,7 +465,9 @@ function M.install()
 
                 M.shipEventSink(target.faction, target.name, "order",
                                 {chain = chain, activeIndex = ship.chainIndex or 0,
-                                 finished = false, x = x, y = y})
+                                 finished = false, x = x, y = y,
+                                 automation = ship.automation and Json.encode(ship.automation)
+                                              or nil})
             end
         end
 
@@ -422,6 +545,12 @@ function M.install()
                         return spec.regular == true, spec.offgrid == true, spec.dustyness or 0
                     end,
                 }
+
+                function instance:determineContent(x, y, seed)
+                    local spec = M.predicted[keyOf(x, y)] or {}
+                    return spec.regular == true, spec.offgrid == true, spec.blocked == true,
+                           spec.home == true
+                end
 
                 function instance:initialize(x, y, seed)
                     local spec = M.predicted[keyOf(x, y)] or {}
@@ -546,6 +675,14 @@ M.orderChainFrozen = false
 M.shipEventSink = nil
 M.riftSectors = {}
 M.loadedSectors = nil
+-- "x:y" -> controlling faction index; anything absent is no man's space
+M.controlledSectors = {}
+-- function(ax, ay, bx, by) -> true when a rift blocks that jump
+M.obstruction = nil
+-- a reason string makes the orderchain extension refuse every plan with it
+M.refusePlan = nil
+-- models a server where another mod replaced orderchain.lua outright
+M.noOrderChainExtension = false
 M.jumpUnobstructed = true
 M.routeResult = nil
 
@@ -577,11 +714,14 @@ function M.makeCommand(missionType, shipName, area, config)
     end
     function c:getPredictableValues() return {yields = {}, attackChance = {value = 0}} end
     function c:getErrors() return M.commandError, M.commandErrorArgs end
-    function c:calculatePrediction()
+    function c:calculatePrediction(ownerIndex, shipName, predictedArea, predictedConfig)
         -- Vanilla prediction code indexes things it assumes are there - the captain,
         -- most often - and raises outright when they are not. That is a different
         -- failure from returning an error, and the mod has to survive both.
         if M.predictionRaises then error(M.predictionRaises, 0) end
+
+        -- trade predictions depend on the route and deposit in the config
+        if M.predictionFor then return M.predictionFor(predictedConfig or {}) end
 
         return {attackChance = {value = 0.12}, yields = {{from = 100, to = 200}},
                 error = M.predictionError}
@@ -777,50 +917,7 @@ function M.addPlayer(index, name)
                   .. "not from the galaxy bridge (" .. functionName .. ")", 0)
         end
 
-        local args = {...}
-        M.simulationCalls[#M.simulationCalls + 1] = {fn = functionName, args = args}
-
-        -- The game insists on a two-step handshake: startCommand refuses unless the
-        -- simulation is already holding an analysis it ran itself for that exact
-        -- mission type, and it announces the refusal only by chat message. The delay
-        -- is what forces the agent to retry rather than start in one pass.
-        if functionName == "startAreaAnalysis" then
-            local ship = M.getShip(self.index, args[1])
-            if ship then
-                ship.analyzedType = nil
-                ship.analysisReadyAt = clock + M.analysisDelay
-                ship.analysisPendingType = args[2]
-            end
-
-        elseif functionName == "startCommand" then
-            local ship = M.getShip(self.index, args[1])
-
-            if ship and ship.analysisReadyAt and clock >= ship.analysisReadyAt then
-                ship.analyzedType = ship.analysisPendingType
-                ship.analysisReadyAt = nil
-            end
-
-            if ship and not ship.refuseStart and ship.analyzedType == args[2] then
-                ship.availability = ShipAvailability.InBackground
-            end
-
-        elseif functionName == "recall" or functionName == "forceRecall" then
-            local ship = M.getShip(self.index, args[1])
-            if ship and (functionName == "forceRecall" or not ship.refuseRecall) then
-                ship.availability = ShipAvailability.Available
-            end
-
-        elseif functionName == "takeYield" then
-            local ship = M.getShip(self.index, args[1])
-            if ship then ship.yields = 0 end
-        end
-
-        if functionName == "getNumYields" then
-            local ship = M.getShip(self.index, args[1])
-            return 0, (ship and ship.yields) or 0
-        end
-
-        return M.invokeResult or 0, M.invokeReturns and M.invokeReturns[functionName] or nil
+        return M.simulate(self, functionName, ...)
     end
 
     -- Where the player is standing. canReceivePlayerOrder() lets a captainless craft take
@@ -834,6 +931,54 @@ function M.addPlayer(index, name)
     players[index] = p
 
     return p
+end
+
+-- The Simulation script on a player or alliance, reached through invokeFunction.
+function M.simulate(self, functionName, ...)
+    local args = {...}
+    M.simulationCalls[#M.simulationCalls + 1] = {fn = functionName, args = args}
+
+    -- The game insists on a two-step handshake: startCommand refuses unless the
+    -- simulation is already holding an analysis it ran itself for that exact
+    -- mission type, and it announces the refusal only by chat message. The delay
+    -- is what forces the agent to retry rather than start in one pass.
+    if functionName == "startAreaAnalysis" then
+        local ship = M.getShip(self.index, args[1])
+        if ship then
+            ship.analyzedType = nil
+            ship.analysisReadyAt = clock + M.analysisDelay
+            ship.analysisPendingType = args[2]
+        end
+
+    elseif functionName == "startCommand" then
+        local ship = M.getShip(self.index, args[1])
+
+        if ship and ship.analysisReadyAt and clock >= ship.analysisReadyAt then
+            ship.analyzedType = ship.analysisPendingType
+            ship.analysisReadyAt = nil
+        end
+
+        if ship and not ship.refuseStart and ship.analyzedType == args[2] then
+            ship.availability = ShipAvailability.InBackground
+        end
+
+    elseif functionName == "recall" or functionName == "forceRecall" then
+        local ship = M.getShip(self.index, args[1])
+        if ship and (functionName == "forceRecall" or not ship.refuseRecall) then
+            ship.availability = ShipAvailability.Available
+        end
+
+    elseif functionName == "takeYield" then
+        local ship = M.getShip(self.index, args[1])
+        if ship then ship.yields = 0 end
+    end
+
+    if functionName == "getNumYields" then
+        local ship = M.getShip(self.index, args[1])
+        return 0, (ship and ship.yields) or 0
+    end
+
+    return M.invokeResult or 0, M.invokeReturns and M.invokeReturns[functionName] or nil
 end
 
 -- `members` is every player index in the alliance; `memberIndex` is the one whose
@@ -851,6 +996,14 @@ function M.addAlliance(index, name, memberIndex, privileges, members)
 
     function a:getMembers()
         return table.unpack(roster)
+    end
+
+    -- An alliance's scripts run on the alliance's own thread. From anywhere else - a
+    -- player script included - the real engine refuses the call with result code 7.
+    function a:invokeFunction(script, functionName, ...)
+        if M.inAllianceAgent ~= self.index then return 7 end
+
+        return M.simulate(self, functionName, ...)
     end
 
     addCraftApi(a)
@@ -880,6 +1033,15 @@ function M.asPlayerAgent(index, fn)
     if not ok then error(err, 0) end
 end
 
+-- Runs fn in the context of the agent attached to an alliance: that alliance's Simulation
+-- is reachable, Alliance() resolves to it and Player() to nobody.
+function M.asAllianceAgent(index, fn)
+    M.inAllianceAgent = index
+    local ok, err = pcall(fn)
+    M.inAllianceAgent = nil
+    if not ok then error(err, 0) end
+end
+
 function M.setOffline(index) if players[index] then players[index].online = false end end
 function M.setOnline(index) if players[index] then players[index].online = true end end
 
@@ -896,6 +1058,7 @@ function M.reset()
     players = {}
     ships = {}
     M.alliances = {}
+    M.inAllianceAgent = nil
     M.asyncQueue = {}
     M.simulationCalls = {}
     M.known = {}
@@ -905,6 +1068,12 @@ function M.reset()
     M.entityCalls = {}
     M.riftSectors = {}
     M.loadedSectors = nil
+    M.controlledSectors = {}
+    M.obstruction = nil
+    M.refusePlan = nil
+    M.refuseTransfer = nil
+    M.transferApproach = nil
+    M.noOrderChainExtension = false
     M.jumpUnobstructed = true
     M.routeResult = nil
     M.commandError = nil

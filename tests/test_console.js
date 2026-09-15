@@ -140,7 +140,18 @@ const hound = {
     position: { x: 1, y: 2 }, usable: { ok: true }, availability: 'Available',
     cargo: { capacity: 100, free: 100, used: 0, goods: [] },
     durability: { max: 1, percentage: 1 }, shields: {}, energy: {}, turrets: [], systems: [],
-    hangar: { squads: [], fighters: 0 }, crew: { size: 0, maxSize: 0, byProfession: [], ideal: [] }
+    hangar: { squads: [], fighters: 0 }, crew: { size: 0, maxSize: 0, byProfession: [], ideal: [] },
+    // The engine's raw chain state rides along on orderInfo; the console reads `orders`.
+    orderInfo: '{"chain":[{"action":1.0,"name":"Jump"}],"currentIndex":2.0}',
+    orders: {
+        chain: [
+            { name: 'Jump', action: 1, sector: { x: -313, y: 259 } },
+            { name: 'Fly Through', action: 11, gate: true, sector: { x: -308, y: 249 } },
+            { name: 'Jump', action: 1, sector: { x: -312, y: 245 } }
+        ],
+        activeIndex: 2, finished: false, sector: { x: -313, y: 259 },
+        defense: 'Enemy ships seen: attack combat ships', autoAI: { hullRatio: 0.8 }
+    }
 };
 
 /*
@@ -167,10 +178,253 @@ const storedEvents = {
     ]
 };
 
+/* Escort candidates: one shares Ore Hound's sector, one is far off. */
+function escortShip(name, x, y) {
+    return Object.assign({}, hound, { name: name, position: { x: x, y: y } });
+}
+
+const wingman = escortShip('Wingman', 1, 2);
+const farScout = escortShip('Far Scout', 40, 40);
+
+// Only Ore Hound carries anyone, so a search for her finds exactly one craft.
+hound.passengers = [{ name: 'Oren', displayName: 'Oren Dask', level: 4,
+                      classes: [{ value: 3, name: 'Merchant' }], perks: [] }];
+
+/*
+ * A trade preview whose routes depend on the area, the way the game's do. Ore Hound sits
+ * at 1:2. Oil sells at 15:2 - inside any area reaching 15 to the east. Gold sells at
+ * -20:2, reachable only by the wide 29x11 shape with the ship on its eastern edge; it has
+ * the better margin and the smaller contract.
+ */
+const tradeCatalog = {
+    ship: 'Ore Hound', usable: { ok: true },
+    missions: [{
+        mission: 'trade', areaFixed: false, shipRequiredInArea: true, configurable: {},
+        areaSizes: [{ x: 17, y: 17 }, { x: 29, y: 11 }, { x: 11, y: 29 }]
+    }]
+};
+
+function tradeRoute(good, margin, contract, sellX) {
+    return {
+        good: good, margin: margin, lowest: -0.1, highest: margin - 0.1, profitPerUnit: 50,
+        from: { x: 1, y: 2 }, to: { x: sellX, y: 2 }, deposit: 40000, maxAvailable: 800,
+        perFlight: 100, flights: { from: 3, to: 8 }, flightTime: 1500, attackChance: 0.1,
+        profitPerFlight: { from: 9000, to: 10000 },
+        contractProfit: { from: Math.ceil(contract * 0.9), to: contract }
+    };
+}
+
+function tradePreview(body) {
+    const area = body.area;
+    const holds = (x, y) => x >= area.lower.x && x <= area.upper.x
+                            && y >= area.lower.y && y <= area.upper.y;
+    const found = [];
+    if (holds(15, 2)) { found.push(tradeRoute('Oil', 0.25, 80000, 15)); }
+    if (holds(-20, 2)) { found.push(tradeRoute('Gold', 0.4, 30000, -20)); }
+
+    return {
+        mission: 'trade', ship: 'Ore Hound', canStart: !!body.config.goodName,
+        area: { lower: area.lower, upper: area.upper }, config: body.config,
+        prediction: {}, assessment: [], errors: {}, routes: found
+    };
+}
+
+const posts = [];
+
+/* What the ship's orderchain extension last reported, and what it reports once a route is
+   taken up. The Travel tab is order chains now: it must never start a travel mission. */
+const houndAutomation = {
+    ship: 'Ore Hound', source: 'live', reported: true,
+    automation: {
+        autoAggressive: true, attackCivilians: false, enemies: true, defenceFights: 2,
+        standing: { enemies: { enabled: true, mode: 'idle' }, loot: { enabled: false, mode: 'idle' } },
+        lootRuns: 0,
+        lastReaction: { kind: 'enemies', outcome: 'done', resumed: true, sector: { x: 1, y: 2 } },
+        plan: { id: 'p1', kind: 'route', phase: 'fighting', hops: 4, hop: 2, loopFrom: 0,
+                jumps: 1, fights: 1, onEnemies: 'fight', target: { x: 20, y: 0 } }
+    }
+};
+
+/* The ship merges standing orders part by part and confirms what it now holds. */
+function saveStanding(sent) {
+    const automation = houndAutomation.automation;
+    Object.keys(sent.standing || {}).forEach((key) => {
+        Object.assign(automation.standing[key], sent.standing[key]);
+    });
+    if (sent.attackCivilians !== undefined) { automation.attackCivilians = sent.attackCivilians; }
+    return { ship: 'Ore Hound', confirmed: true, requested: sent, automation: automation };
+}
+
+const flownRoute = (sent) => ({
+    ship: 'Ore Hound', confirmed: true, planId: 'p2', reachable: true, planner: 'automation',
+    jumps: 2, gates: 1, controlledSectors: 0, distance: 30.4,
+    from: { x: 3, y: 0 }, to: sent.to,
+    hops: [{ x: 5, y: 0, kind: 'jump', controlled: false },
+           { x: sent.to.x, y: sent.to.y, kind: 'gate', controlled: false }],
+    route: [{ x: 3, y: 0 }, { x: 5, y: 0 }, sent.to],
+    automation: {
+        autoAggressive: true, attackCivilians: false, enemies: false,
+        standing: houndAutomation.automation.standing,
+        plan: { id: 'p2', kind: 'route', phase: 'running', hops: 2, hop: 1, loopFrom: 0,
+                jumps: 0, fights: 0, onEnemies: sent.onEnemies, target: sent.to }
+    }
+});
+
+/*
+ * Mission automation as the mod reports it. Wingman already has a rule, held back by its
+ * ambush limit; Ore Hound has none until the test saves one. The store below plays the
+ * mod's part: it keeps what was saved and hands out revisions, which is what the console's
+ * conflict handling keys off.
+ */
+const automationStore = {
+    'player/Wingman': {
+        ship: 'Wingman', owner: { kind: 'player', index: 1, name: 'Rusty' },
+        rule: { mission: 'mine', enabled: true, objective: 'hourly', area: { mode: 'ship' },
+                limits: { maxAttackChance: 0.1 }, config: {}, escorts: [], collectYields: false,
+                revision: 4, updatedBy: { index: 1, name: 'Rusty' } },
+        state: { phase: 'blocked', message: 'Nothing within the limits: ambush chance 12% is above 10%',
+                 since: 3500, dispatches: 2, log: [] }
+    }
+};
+
+function automationList() {
+    return { serverTime: 3600, automations: Object.values(automationStore),
+             supported: ['mine', 'trade'], limits: [] };
+}
+
+function saveAutomation(sent) {
+    const key = 'player/Ore Hound';
+    const previous = automationStore[key];
+    const current = previous ? previous.rule.revision : 0;
+    if (sent.ifRevision !== undefined && sent.ifRevision !== current) {
+        return { status: 409, body: { error: { code: 'rule_changed', message: 'changed' } } };
+    }
+
+    const rule = Object.assign({}, previous ? previous.rule : { enabled: true }, sent);
+    delete rule.ifRevision;
+    rule.revision = current + 1;
+    rule.updatedBy = { index: 1, name: 'Rusty' };
+
+    automationStore[key] = {
+        ship: 'Ore Hound', owner: { kind: 'player', index: 1, name: 'Rusty' }, rule: rule,
+        state: { phase: rule.enabled ? 'waiting' : 'disabled', message: 'Saved.', since: 3600,
+                 dispatches: 0, log: [] },
+        serverTime: 3600
+    };
+    return automationStore[key];
+}
+
+const tradeEvaluation = () => ({
+    ship: 'Ore Hound', wouldStart: true, assessment: ['That is only a few flights.'],
+    evaluation: {
+        at: 3600, objective: 'hourly', tried: 6, passing: 1,
+        area: { lower: { x: -7, y: -6 }, upper: { x: 9, y: 10 } },
+        chosen: { passes: true },
+        candidates: [
+            { passes: true, config: { goodName: 'Oil', deposit: 34304 },
+              route: { good: 'Oil', from: { x: 1, y: 2 }, to: { x: 15, y: 2 } },
+              metrics: { attackChance: 0.07, duration: 3600, flights: 3, patience: 'safe',
+                         completionChance: 1, cost: 34304, value: 60000, valueUnit: 'credits',
+                         hourly: 60000 },
+              violations: [] },
+            { passes: false, config: { goodName: 'Oil', deposit: 51200 },
+              route: { good: 'Oil', from: { x: 1, y: 2 }, to: { x: 15, y: 2 } },
+              metrics: { attackChance: 0.09, duration: 2400, flights: 2, cost: 51200 },
+              violations: [{ limit: 'maxAttackChance', message: 'ambush chance 9% is above 8%' }] }
+        ]
+    }
+});
+
+/* Order programs as the mod stores them: saving bumps the revision and starts at step 1. */
+const programStore = {};
+
+function saveProgram(sent) {
+    const key = 'player/Ore Hound';
+    const previous = programStore[key];
+    if (previous && sent.ifRevision !== undefined && sent.ifRevision !== previous.program.revision) {
+        return { status: 409, body: { error: { code: 'program_changed', message: 'changed' } } };
+    }
+    const program = Object.assign({}, previous ? previous.program : {}, sent);
+    delete program.ifRevision;
+    program.revision = (previous ? previous.program.revision : 0) + 1;
+    program.updatedBy = { index: 1, name: 'Rusty' };
+    programStore[key] = {
+        ship: 'Ore Hound', owner: { kind: 'player', index: 1, name: 'Rusty' }, program: program,
+        state: { status: 'running', message: 'Farming bosses.', step: 1, stepSince: 3590,
+                 conditions: [{ text: 'cargo >= 90%', met: false }], log: [] }
+    };
+    return Object.assign({ serverTime: 3600 }, programStore[key]);
+}
+
+function controlProgram(sent) {
+    const entry = programStore['player/Ore Hound'];
+    entry.state.step = sent.action === 'restart' ? 1 : sent.step;
+    return Object.assign({ serverTime: 3600 }, entry);
+}
+
+/* The mission library, as the mod keeps it: saving bumps the revision. */
+const libraryStore = {};
+
+function saveLibraryMission(name) {
+    return function (sent) {
+        const previous = libraryStore[name];
+        const rule = Object.assign({}, previous ? previous.rule : {}, sent);
+        delete rule.ifRevision;
+        libraryStore[name] = {
+            name: name, owner: { kind: 'player', index: 1, name: 'Rusty' }, rule: rule,
+            revision: (previous ? previous.revision : 0) + 1, usedBy: []
+        };
+        return libraryStore[name];
+    };
+}
+
+/* Ore Hound's hold and the craft it could transfer with: the refinery shares its sector,
+   Far Scout does not. The mod answers a transfer in reach with what it moved. */
+const transferHolds = {
+    ship: { name: 'Ore Hound', type: 'Ship', owner: { kind: 'player', index: 1, name: 'Rusty' },
+            position: { x: 1, y: 2 }, sector: { x: 1, y: 2 }, availability: 'Available', captain: true,
+            cargo: { capacity: 500, free: 180, used: 320, goods: [
+                { name: 'Iron', amount: 300, size: 1, price: 10 },
+                { name: 'Iron', amount: 20, size: 1, price: 10, stolen: true }
+            ] } },
+    targets: [
+        { name: 'Rusty Refinery', type: 'Station', owner: { kind: 'player', index: 1, name: 'Rusty' },
+          position: { x: 1, y: 2 }, availability: 'Available', sameSector: true,
+          cargo: { capacity: 12000, free: 5000, used: 7000, goods: [{ name: 'Oil', amount: 900, size: 2 }] } },
+        { name: 'Far Scout', type: 'Ship', owner: { kind: 'player', index: 1, name: 'Rusty' },
+          position: { x: 40, y: 40 }, availability: 'Available', sameSector: false,
+          cargo: { capacity: 50, free: 50, used: 0, goods: [] } }
+    ],
+    count: 2
+};
+
+function sendTransfer(sent) {
+    const moved = sent.all ? [{ name: 'Oil', amount: 900 }]
+        : sent.goods.map((g) => ({ name: g.name, amount: g.amount || 300 }));
+    return {
+        ship: 'Ore Hound', transferId: 't1', summary: 'a transfer', confirmed: true, done: true,
+        carriedOutBy: { name: 'Ore Hound', owner: { kind: 'player' } },
+        result: { id: 't1', outcome: 'done', moved: moved, total: 1, target: sent.target, direction: sent.direction }
+    };
+}
+
+const dynamic = {
+    '/ships/Ore%20Hound/transfer': sendTransfer,
+    '/automation/missions/library/Trade%20run': saveLibraryMission('Trade run'),
+    '/ships/Ore%20Hound/program': saveProgram,
+    '/ships/Ore%20Hound/program/control': controlProgram,
+    '/ships/Ore%20Hound/mission/automation': saveAutomation,
+    '/ships/Ore%20Hound/mission/automation/evaluate': tradeEvaluation,
+    '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
+    '/ships/Ore%20Hound/route': flownRoute,
+    '/ships/Ore%20Hound/automation': saveStanding
+};
+
 const routes = {
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
-    '/ships': { ships: [refinery, hound], count: 2 },
+    '/ships': { ships: [refinery, hound, wingman, farScout], count: 4 },
+    '/ships/Ore%20Hound/missions': tradeCatalog,
     '/ships/Rusty%20Refinery': refinery,
     '/ships/Ore%20Hound': hound,
     '/ships/Ore%20Hound/events': liveEvents,
@@ -179,7 +433,26 @@ const routes = {
         cursor: 0, dropped: 0, recording: true, watchers: 1
     },
     '/ships/Ore%20Hound/mission': { active: null },
+    '/ships/Ore%20Hound/automation': houndAutomation,
+    '/ships/Ore%20Hound/transfer': transferHolds,
+    get '/automation/missions'() { return automationList(); },
+    get '/automation/missions/library'() { return { missions: Object.values(libraryStore), maxName: 48 }; },
+    get '/automation/programs'() {
+        return { serverTime: 3600, programs: Object.values(programStore),
+                 actions: ['farm', 'mission', 'orders', 'route', 'standing', 'wait'], conditions: [] };
+    },
     '/history/events': storedEvents,
+    // What the bridge kept of holds read earlier, by this console or anyone else's. Far
+    // Scout's is fresh; Wingman's is an hour old, and neither has a live detail route here,
+    // so a live re-read of either answers 404 - which is how the test tells them apart.
+    '/history/manifests': {
+        manifests: [
+            { ship: 'Far Scout', owner: 'player', at: now - 30,
+              cargo: { goods: [{ name: 'Xanion Ore', amount: 70 }] }, passengers: [] },
+            { ship: 'Wingman', owner: 'player', at: now - 3600,
+              cargo: { goods: [{ name: 'Xanion Ore', amount: 10 }] }, passengers: [] }
+        ]
+    },
     '/stations': stationListing,
     '/stations/Rusty%20Refinery': refinery,
     '/history/economy/summary': {
@@ -269,19 +542,43 @@ window.HTMLCanvasElement.prototype.getContext = () => new Proxy({}, {
 window.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 
 // api.js reads response.text() and parses it itself, so json() is never called.
-window.fetch = function (url) {
+window.fetch = function (url, init) {
     const parsed = new window.URL(url, 'http://api.test');
-    const body = routes[parsed.pathname];
+    let body = routes[parsed.pathname];
+
+    if (init && init.method === 'POST') {
+        const sent = JSON.parse(init.body || '{}');
+        posts.push({ path: parsed.pathname, body: sent });
+        if (dynamic[parsed.pathname]) { body = dynamic[parsed.pathname](sent); }
+    }
+
+    let status = body !== undefined ? 200 : 404;
+    if (body && typeof body.status === 'number' && body.body) {
+        status = body.status;
+        body = body.body;
+    }
+
     const payload = body !== undefined
         ? body
         : { error: { code: 'no_such_route', message: parsed.pathname } };
 
     return Promise.resolve({
-        ok: body !== undefined,
-        status: body !== undefined ? 200 : 404,
+        ok: status < 400,
+        status: status,
         text: () => Promise.resolve(JSON.stringify(payload))
     });
 };
+
+/* System notifications, recorded. The page is made to look unfocused, which is when the
+   console adds a system notification to its toast. */
+const notifications = [];
+window.Notification = function (title, options) {
+    notifications.push({ title: title, body: (options && options.body) || '' });
+    this.close = () => {};
+};
+window.Notification.permission = 'granted';
+window.Notification.requestPermission = () => Promise.resolve('granted');
+window.document.hasFocus = () => false;
 
 for (const file of ['api.js', 'map.js', 'app.js']) {
     window.eval(fs.readFileSync(path.join(web, file), 'utf8'));
@@ -310,7 +607,7 @@ const ready = window.document.readyState === 'loading'
     // does not exist until it has run.
     await settle(4800);
 
-    check($$('#fleet-rows [data-ship]').length === 2, 'the fleet lists both craft');
+    check($$('#fleet-rows [data-ship]').length === 4, 'the fleet lists every craft');
 
     console.log('\nsubtabs for a ship');
 
@@ -321,6 +618,195 @@ const ready = window.document.readyState === 'loading'
     check(!tab('travel').hidden, 'and its Travel tab');
     check(tab('economy').hidden, 'and is offered no Economy tab');
     check(tab('production').hidden, 'nor a Production tab');
+
+    console.log('\npassengers');
+
+    check(/Passengers \(1\)/.test($('#sv-overview').textContent), 'the overview lists passengers');
+    check(/Oren Dask/.test($('#sv-overview').textContent), 'by name');
+
+    console.log('\norders');
+
+    const overview = $('#sv-overview');
+    check(!/currentIndex|"chain"/.test(overview.textContent), 'raw order JSON is never printed');
+    const links = overview.querySelectorAll('.order-list li');
+    check(links.length === 3, 'every chain link is listed');
+    check(links[1].classList.contains('running') && links[0].classList.contains('done'),
+          'the 1-based active index marks the second link as running');
+    check(/order 2 of 3/.test(overview.textContent), 'with its place in the chain');
+    check(/attack combat ships/.test(overview.textContent) && /80%/.test(overview.textContent),
+          'and the defensive AI settings');
+
+    console.log('\nthe travel tab');
+
+    tab('travel').click();
+    await settle(600);
+
+    const travel = () => $('#sv-travel');
+    check(/fighting/.test(travel().textContent), 'the automation state the ship reported is shown');
+    check(/enemies in sector/.test(travel().textContent), 'including enemies in its sector');
+    check(!/swiftness/.test(travel().textContent), 'and no travel mission is started from here');
+
+    travel().querySelector('[data-pref="preferUncontrolled"]').click();
+    await settle(50);
+    travel().querySelector('[data-on-enemies="hold"]').click();
+    await settle(50);
+    $('#travel-x').value = '9';
+    $('#travel-y').value = '30';
+    travel().querySelector('[data-act="fly"]').click();
+    await settle(700);
+
+    const flown = posts.filter((p) => p.path === '/ships/Ore%20Hound/route').pop();
+    check(flown && flown.body.preferUncontrolled === true && flown.body.onEnemies === 'hold'
+          && flown.body.to.x === 9 && flown.body.to.y === 30,
+          'flying a route sends the destination, preferences and enemy handling chosen');
+    check(!posts.some((p) => /\/travel$|missions\/travel/.test(p.path)),
+          'and never a travel mission');
+    check(/through gates/.test(travel().textContent), 'the flown route is summarised');
+    check(/route · running/.test(travel().textContent),
+          'and the state the ship confirmed replaces the older read');
+    check(travel().querySelector('[data-act="farm"]').disabled,
+          'boss farming cannot be started for a ship nobody is flying');
+    check(!travel().querySelector('#nav-auto-aggressive'),
+          'idle defence is no longer set here');
+    check(/fight enemies when idle/.test(travel().textContent),
+          'but the standing orders are shown with the automation state');
+
+    console.log('\nstanding orders');
+
+    tab('orders').click();
+    await settle(600);
+
+    const standing = () => $('#standing-orders');
+    check(/Standing orders/.test(standing().textContent), 'the Orders tab has a standing orders section');
+    const enemiesOn = standing().querySelector('[data-standing-on="enemies"]');
+    const lootOn = standing().querySelector('[data-standing-on="loot"]');
+    check(enemiesOn && enemiesOn.checked && lootOn && !lootOn.checked,
+          'showing which standing orders the ship reported on');
+    check(standing().querySelector('[data-standing-key="enemies"][data-standing-mode="idle"]').classList.contains('on'),
+          'and in which mode');
+    check(/chain resumed/.test(standing().textContent), 'with how the last one ended');
+
+    lootOn.checked = true;
+    lootOn.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+
+    let sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding && sentStanding.body.standing && sentStanding.body.standing.loot.enabled === true
+          && Object.keys(sentStanding.body.standing).length === 1 && sentStanding.body.standing.loot.mode === undefined,
+          'switching one on saves just that, at once');
+    check(standing().querySelector('[data-standing-on="loot"]').checked, 'and the confirmed state is shown');
+
+    standing().querySelector('[data-standing-key="loot"][data-standing-mode="interrupt"]').click();
+    await settle(400);
+
+    sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding.body.standing.loot.mode === 'interrupt' && sentStanding.body.standing.loot.enabled === undefined,
+          'choosing a mode saves only the mode');
+    check(standing().querySelector('[data-standing-key="loot"][data-standing-mode="interrupt"]').classList.contains('on'),
+          'which then shows as chosen');
+
+    const civ = standing().querySelector('[data-standing-civ]');
+    civ.checked = true;
+    civ.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+    sentStanding = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation').pop();
+    check(sentStanding.body.attackCivilians === true && sentStanding.body.standing === undefined,
+          'and civilians are one setting for both');
+
+    console.log('\ncargo transfer');
+
+    const transfer = () => $('#transfer-section');
+    const targetPick = transfer().querySelector('[data-transfer-target]');
+    check(targetPick && Array.from(targetPick.options).map((o) => o.value).join('|') === 'player:Rusty Refinery',
+          'only craft in the same sector are offered to transfer with');
+    check(/Rusty Refinery/.test(transfer().textContent) && /Oil 900/.test(transfer().textContent),
+          'and the other hold is shown with what is in it');
+    check(transfer().querySelectorAll('[data-transfer-pick]').length === 2,
+          'giving lists the ship\'s goods, stolen ones apart');
+
+    const ironAmount = transfer().querySelector('[data-transfer-amount="Iron"]');
+    ironAmount.value = '120';
+    ironAmount.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(20);
+    check(transfer().querySelector('[data-transfer-pick="Iron"]').checked
+          && /120 units/.test(transfer().querySelector('[data-transfer-summary]').textContent),
+          'typing an amount picks the good and counts it');
+    ironAmount.dispatchEvent(new window.Event('change', { bubbles: true }));
+    const sendButton = transfer().querySelector('[data-act="transfer-send"]');
+    check(sendButton && sendButton.isConnected, 'without redrawing the button away from under the click');
+
+    posts.length = 0;
+    sendButton.click();
+    await settle(500);
+    let sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.target === 'Rusty Refinery' && sentTransfer.body.targetOwner === 'player'
+          && sentTransfer.body.direction === 'give' && sentTransfer.body.approach === true
+          && sentTransfer.body.goods.length === 1 && sentTransfer.body.goods[0].name === 'Iron'
+          && sentTransfer.body.goods[0].amount === 120 && sentTransfer.body.goods[0].stolen === false,
+          'the transfer names the target, the good, the amount and that it is not the stolen kind');
+    check(/Moved/.test($('#transfer-result').textContent) && /120 Iron/.test($('#transfer-result').textContent),
+          'and what the ship moved is shown');
+
+    transfer().querySelector('[data-transfer-max="Iron|stolen"]').click();
+    await settle(20);
+    posts.length = 0;
+    transfer().querySelector('[data-act="transfer-send"]').click();
+    await settle(500);
+    sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.goods[0].stolen === true && sentTransfer.body.goods[0].amount === undefined,
+          'all of a good is sent as all of it, not as the amount last read');
+
+    transfer().querySelector('[data-transfer-dir="take"]').click();
+    await settle(20);
+    check(transfer().querySelectorAll('[data-transfer-pick]').length === 1
+          && /Oil/.test(transfer().querySelector('.transfer-goods').textContent),
+          'taking lists the other hold\'s goods');
+    const takeAll = transfer().querySelector('[data-transfer-all]');
+    takeAll.checked = true;
+    takeAll.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(20);
+    posts.length = 0;
+    transfer().querySelector('[data-act="transfer-send"]').click();
+    await settle(500);
+    sentTransfer = posts.filter((p) => p.path === '/ships/Ore%20Hound/transfer').pop();
+    check(sentTransfer && sentTransfer.body.direction === 'take' && sentTransfer.body.all === true
+          && sentTransfer.body.goods === undefined,
+          'and all takes the whole hold');
+
+
+    tab('overview').click();
+    await settle(50);
+
+    const search = $('#fleet-search');
+    search.value = 'oren';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(1200);
+
+    const found = $$('#fleet-rows [data-ship]');
+    check(found.length === 1 && found[0].dataset.ship === 'Ore Hound',
+          'searching a passenger finds the craft carrying them');
+    check(/passenger Oren Dask/.test(found[0] ? found[0].textContent : ''),
+          'and says who matched');
+
+    search.value = '';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(100);
+
+    console.log('\nstored manifests');
+
+    search.value = 'xanion';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(1200);
+
+    const carrying = $$('#fleet-rows [data-ship]').map((row) => row.dataset.ship);
+    check(carrying.includes('Far Scout'),
+          'a hold the bridge read recently is searched without reading it again');
+    check(!carrying.includes('Wingman'),
+          'and a stale one is re-read live, which wins over what was stored');
+
+    search.value = '';
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await settle(100);
 
     console.log('\nsubtabs for a station');
 
@@ -522,6 +1008,345 @@ const ready = window.document.readyState === 'loading'
     $('[data-ship="Ore Hound"]').click();
     await settle(400);
 
+    console.log('\nthe mission planner');
+
+    tab('mission').click();
+    await settle(600);
+
+    const planner = $('#sv-mission');
+    const escortChips = $$('#sv-mission [data-escort]');
+
+    check(escortChips.length === 2, 'every other available ship is offered as an escort');
+    check(escortChips[0].dataset.escort === 'Wingman' && escortChips[0].classList.contains('near'),
+          'one in the same sector comes first, marked');
+    check(!escortChips[1].classList.contains('near'), 'one elsewhere is not marked');
+
+    click(planner.querySelector('[data-act="escorts-near"]'));
+    await settle(50);
+    check($('#sv-mission [data-escort="Wingman"]').classList.contains('on'),
+          'the same-sector shortcut selects it');
+    check(!$('#sv-mission [data-escort="Far Scout"]').classList.contains('on'),
+          'and leaves the far one alone');
+
+    console.log('\nthe trade placement scan');
+
+    posts.length = 0;
+    click(planner.querySelector('[data-act="scan"]'));
+    await settle(4000);
+
+    const scanned = posts.filter((p) => /trade\/preview$/.test(p.path));
+    check(scanned.length === 27, 'every shape is previewed at nine placements (got ' + scanned.length + ')');
+
+    const areas = scanned.map((p) => p.body.area);
+    check(areas.every((a) => a.lower.x <= 1 && a.upper.x >= 1 && a.lower.y <= 2 && a.upper.y >= 2),
+          'every placement keeps the ship inside the area');
+    check(areas[0].lower.x === 1 && areas[0].upper.y === 2 && areas[0].upper.x === 17,
+          'the first puts the ship in the top-left corner of the square');
+    check(areas.some((a) => a.lower.x === -27 && a.upper.x === 1 && a.upper.y - a.lower.y === 10),
+          'the wide shape is tried with the ship on its eastern edge');
+    check(scanned.every((p) => p.body.escorts.indexOf('Wingman') !== -1),
+          'the chosen escorts go with every preview');
+
+    let rows = $$('#sv-mission .scan-table tbody tr');
+    check(rows.length === 2, 'a route found in several placements is listed once');
+    check(/Gold/.test(rows[0].textContent) && /\+40%/.test(rows[0].textContent),
+          'ranked by margin, the best margin comes first');
+
+    click(planner.querySelector('[data-scan-rank="contract"]'));
+    await settle(50);
+    rows = $$('#sv-mission .scan-table tbody tr');
+    check(/Oil/.test(rows[0].textContent), 'ranked by total profit, the bigger contract does');
+
+    posts.length = 0;
+    click(rows[0].querySelector('[data-scan-use]'));
+    await settle(400);
+
+    const used = posts.filter((p) => /trade\/preview$/.test(p.path)).pop();
+    check(used && used.body.config.goodName === 'Oil' && used.body.config.deposit === 40000,
+          'using a row previews that route at its deposit');
+    check(used && used.body.area.lower.x === 1 && used.body.area.upper.y === 2
+          && used.body.area.upper.x === 17,
+          'in the placement that found it');
+    check(/Trade routes/.test(planner.textContent)
+          && planner.querySelector('tr.sel') && /Oil/.test(planner.querySelector('tr.sel').textContent),
+          'and the preview marks it as the chosen route');
+
+    console.log('\nmission automation');
+
+    check(/auto · blocked/.test($('[data-ship="Wingman"]').textContent),
+          'a craft with a rule is badged in the fleet list with what the loop is doing');
+
+    const summary = () => $('#sv-mission [data-auto-summary]');
+    check(/Not automated/.test(summary().textContent), 'Ore Hound starts with no rule');
+    check(!$('#sv-mission .auto-editor') && !$('#sv-mission [data-auto-status]'),
+          'the Mission tab keeps only a summary line of automation');
+
+    click(planner.querySelector('[data-auto-act="new"]'));
+    await settle(300);
+
+    const autoPane = $('#automation-pane');
+    const autoStatus = () => $('#automation-pane [data-auto-status]');
+    check($('#view-automation').classList.contains('active'),
+          'automating the planned mission opens the Automation tab');
+    check(autoPane.querySelector('.auto-editor') && /Ore Hound/.test(autoPane.querySelector('h1').textContent),
+          'with the new rule\'s editor for the selected craft');
+    check(autoPane.querySelector('[data-standing-orders]')
+          && /Standing orders/.test(autoPane.textContent),
+          'and its standing orders beside it');
+
+    const flightsField = autoPane.querySelector('[data-auto-limit="maxFlights"]');
+    check(flightsField && flightsField.value === '3',
+          'a new trade rule starts at the three flights a customer always waits for');
+
+    const ambush = autoPane.querySelector('[data-auto-limit="maxAttackChance"]');
+    ambush.value = '8';
+    ambush.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    posts.length = 0;
+    click(autoPane.querySelector('[data-auto-act="test"]'));
+    await settle(400);
+
+    const tested = posts.filter((p) => /automation\/evaluate$/.test(p.path)).pop();
+    check(tested && tested.body.limits.maxAttackChance === 0.08 && tested.body.limits.maxFlights === 3,
+          'testing sends the limits in the API\'s units');
+    const testRows = $$('#automation-pane .auto-editor ~ .card tbody tr');
+    check(testRows.length === 2 && /chosen/.test(testRows[0].textContent)
+          && /ambush chance 9% is above 8%/.test(testRows[1].textContent),
+          'and shows each option with why it would or would not go');
+
+    posts.length = 0;
+    click(autoPane.querySelector('[data-auto-act="save"]'));
+    await settle(400);
+
+    const saved = posts.filter((p) => p.path === '/ships/Ore%20Hound/mission/automation').pop();
+    check(saved && saved.body.mission === 'trade' && saved.body.enabled === true
+          && saved.body.ifRevision === 0,
+          'saving a new rule switches it on, guarded by revision');
+    check(saved && saved.body.config.goodName === undefined && saved.body.config.deposit === undefined,
+          'without the planner\'s route and deposit, which the automation picks each time');
+    check(saved && saved.body.escorts.indexOf('Wingman') !== -1 && saved.body.area.mode === 'ship',
+          'with the planner\'s escorts, following the ship');
+    check(!autoPane.querySelector('.auto-editor'), 'the editor closes');
+    check(/send out automatically/.test(autoStatus().textContent)
+          && autoPane.querySelector('[data-auto-toggle]').checked,
+          'and the rule shows with its switch on');
+    check(/trade · waiting/.test(summary().textContent),
+          'the Mission tab\'s summary line follows it');
+
+    const autoRows = () => $$('#automation-rows [data-auto-ship]').map((row) => row.dataset.autoShip);
+    check(autoRows().includes('Ore Hound') && autoRows().includes('Wingman'),
+          'the Automation tab lists every craft with a rule');
+    check(!autoRows().includes('Far Scout') && !autoRows().includes('Rusty Refinery'),
+          'and leaves out ships with nothing automated, and stations');
+    check($('#automation-rows [data-auto-ship="Ore Hound"]').classList.contains('sel'),
+          'marking the selected one');
+    check(/standing · fight enemies, collect loot/.test($('#automation-rows [data-auto-ship="Ore Hound"]').textContent),
+          'with its standing orders');
+
+    click($('#automation-filter [data-v="all"]'));
+    await settle(50);
+    check(autoRows().includes('Far Scout') && !autoRows().includes('Rusty Refinery'),
+          'All ships lists the rest too, stations still aside');
+    click($('#automation-filter [data-v="automated"]'));
+    await settle(50);
+    check(/auto · waiting/.test($('[data-ship="Ore Hound"]').textContent),
+          'the fleet list picks it up at once');
+
+    // Another member saves in the meantime: the switch must not overwrite their change.
+    automationStore['player/Ore Hound'].rule.revision = 7;
+
+    posts.length = 0;
+    const toggle = autoPane.querySelector('[data-auto-toggle]');
+    toggle.checked = false;
+    toggle.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await settle(400);
+
+    const toggled = posts.filter((p) => p.path === '/ships/Ore%20Hound/mission/automation').pop();
+    check(toggled && toggled.body.enabled === false && toggled.body.ifRevision === 1,
+          'switching off sends only the switch and the revision it last saw');
+    check(automationStore['player/Ore Hound'].rule.enabled === true,
+          'a rule changed elsewhere is not overwritten');
+
+    await settle(300);
+    check(autoPane.querySelector('[data-auto-toggle]').checked === true,
+          'and the console reloads it rather than showing the switch it failed to flip');
+
+    click($('#automation-rows [data-auto-ship="Wingman"]'));
+    await settle(400);
+    check(/Wingman/.test(autoPane.querySelector('h1').textContent) && autoStatus()
+          && /blocked/.test(autoStatus().textContent),
+          'picking another craft in the list shows its rule');
+    check($('#ship-name').textContent === 'Wingman', 'and selects it on the Fleet tab too');
+
+    console.log('\nthe mission library');
+
+    click($('#automation-rows [data-auto-ship="Ore Hound"]'));
+    await settle(400);
+
+    const libraryList = () => $('#automation-pane [data-library-list]');
+    check(libraryList() && /Empty/.test(libraryList().textContent), 'the library starts empty');
+
+    click($('#automation-pane [data-auto-act="to-library"]'));
+    await settle(50);
+    const libEditor = () => $('#automation-pane [data-library-editor] .auto-editor');
+    check(libEditor() && /New library mission/.test(libEditor().textContent)
+          && !$('#automation-pane [data-auto-editor] .auto-editor'),
+          'copying the rule opens the editor in the library, not over the rule');
+
+    const libName = libEditor().querySelector('[data-auto-libname]');
+    libName.value = 'Trade run';
+    libName.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    posts.length = 0;
+    click(libEditor().querySelector('[data-auto-act="save-library"]'));
+    await settle(400);
+    const savedLibrary = posts.filter((p) => p.path === '/automation/missions/library/Trade%20run').pop();
+    check(savedLibrary && savedLibrary.body.mission === 'trade' && savedLibrary.body.ifRevision === 0
+          && savedLibrary.body.limits.maxAttackChance === 0.08 && savedLibrary.body.enabled === undefined,
+          'saving sends the rule under its name, limits in API units, with no switch');
+    check(!libEditor() && /Trade run/.test(libraryList().textContent), 'and it is listed');
+
+    console.log('\norder programs');
+
+    const progStatus = () => $('#automation-pane [data-program-status]');
+    check(/No program/.test(progStatus().textContent), 'a craft without a program offers to make one');
+
+    click(progStatus().querySelector('[data-prog-act="new"]'));
+    await settle(50);
+
+    const editor = () => $('#automation-pane .program-editor');
+    check(editor() && editor().querySelectorAll('.program-edit-step').length === 1,
+          'the editor opens with one step');
+
+    const change = (node, value) => {
+        if (value !== undefined) { node.value = value; }
+        node.dispatchEvent(new window.Event('change', { bubbles: true }));
+    };
+    const typed = (node, value) => {
+        node.value = value;
+        node.dispatchEvent(new window.Event('input', { bubbles: true }));
+    };
+
+    change(editor().querySelector('[data-pf="steps.0.action.type"]'), 'farm');
+    await settle(50);
+    const percent = editor().querySelector('[data-pf="steps.0.until.conditions.0.percent"]');
+    check(percent && percent.value === '80', 'a farm step comes with a cargo condition, since it never ends by itself');
+    typed(percent, '90');
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.1.action.type"]'), 'route');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.1.action.to.x"]'), '14');
+    change(editor().querySelector('[data-pf="steps.1.then"]'), 'start');
+    await settle(50);
+    check(!editor().querySelector('[data-pf="steps.1.goto"]'), 'go to start needs no step number');
+    change(editor().querySelector('[data-pf="steps.1.then"]'), 'goto');
+    await settle(50);
+    // Left at the shown default of 1: that has to be what gets saved.
+    check(editor().querySelector('[data-pf="steps.1.goto"]').value === '1', 'go to step shows step 1 by default');
+
+    click(editor().querySelector('[data-prog-cond-add="1"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.1.until.conditions.0.type"]'), 'elapsed');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.1.until.conditions.0.seconds"]'), '15');
+
+    posts.length = 0;
+    click(editor().querySelector('[data-prog-act="save"]'));
+    await settle(400);
+
+    const savedProgram = posts.filter((p) => p.path === '/ships/Ore%20Hound/program').pop();
+    const steps = savedProgram && savedProgram.body.steps;
+    check(steps && steps.length === 2 && steps[0].action.type === 'farm'
+          && steps[0].until.conditions[0].type === 'cargo' && steps[0].until.conditions[0].percent === 90,
+          'saving sends the farm step with its condition as typed');
+    check(steps && steps[1].action.type === 'route' && steps[1].action.to.x === 14
+          && steps[1].then === 'goto' && steps[1].goto === 1,
+          'and the route that loops back to step 1');
+    check(steps && steps[1].until.conditions[0].seconds === 900,
+          'minutes typed are sent as seconds');
+    check(savedProgram && savedProgram.body.enabled === true && savedProgram.body.ifRevision === 0,
+          'a new program is switched on, guarded by revision');
+
+    check(!editor(), 'the editor closes');
+    const stepRows = $$('#automation-pane .program-step');
+    check(stepRows.length === 2 && stepRows[0].classList.contains('current')
+          && /cargo >= 90%/.test(stepRows[0].textContent),
+          'the steps are listed, the current one with its conditions');
+    check(/then step 1/.test(stepRows[1].textContent), 'and where each leads');
+    check(/program · step 1/.test($('#automation-rows [data-auto-ship="Ore Hound"]').textContent),
+          'the list shows the program at work');
+
+    posts.length = 0;
+    click(stepRows[1].querySelector('[data-prog-goto="2"]'));
+    await settle(400);
+    const moved = posts.filter((p) => p.path === '/ships/Ore%20Hound/program/control').pop();
+    check(moved && moved.body.action === 'goto' && moved.body.step === 2, 'go here moves the program');
+    check($$('#automation-pane .program-step')[1].classList.contains('current'), 'and the list follows');
+
+    click(progStatus().querySelector('[data-prog-act="edit"]'));
+    await settle(50);
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.2.action.type"]'), 'mission');
+    await settle(50);
+    const libraryPick = editor().querySelector('[data-pf="steps.2.action.library"]');
+    check(libraryPick && Array.from(libraryPick.options).map((o) => o.value).join('|') === '|Trade run',
+          'a mission step offers the craft\'s rule and every library mission');
+    change(libraryPick, 'Trade run');
+    await settle(50);
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.3.action.type"]'), 'travel');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.3.action.to.x"]'), '-300');
+    change(editor().querySelector('[data-pf="steps.3.action.swiftness"]'), '0');
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.4.action.type"]'), 'transfer');
+    await settle(300);
+    const transferTarget = editor().querySelector('[data-pf="steps.4.action.target"]');
+    check(transferTarget && Array.from(transferTarget.options).some((o) => o.value === 'Far Scout'),
+          'a transfer step offers every craft, since the program can fly there first');
+    change(transferTarget, 'Rusty Refinery');
+    await settle(50);
+    const everything = editor().querySelector('[data-pf="steps.4.action.all"]');
+    everything.checked = false;
+    change(everything);
+    await settle(50);
+    const pickIron = editor().querySelector('[data-prog-good-pick="4"][data-good="Iron"]:not([data-stolen])');
+    check(pickIron && /300/.test(pickIron.textContent), 'the goods in the hold they come out of are offered');
+    click(pickIron);
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.4.action.goods.0.amount"]'), '50');
+
+    posts.length = 0;
+    click(editor().querySelector('[data-prog-act="save"]'));
+    await settle(400);
+    const libSteps = (posts.filter((p) => p.path === '/ships/Ore%20Hound/program').pop() || { body: {} }).body.steps;
+    check(libSteps && libSteps[2].action.type === 'mission' && libSteps[2].action.library === 'Trade run',
+          'the mission step is saved naming the library mission');
+    check(libSteps && libSteps[3].action.type === 'travel' && libSteps[3].action.to.x === -300
+          && libSteps[3].action.swiftness === 0, 'and the travel step with its destination and swiftness');
+    const transferStep = libSteps && libSteps[4] && libSteps[4].action;
+    check(transferStep && transferStep.type === 'transfer' && transferStep.target === 'Rusty Refinery'
+          && transferStep.targetOwner === 'player' && transferStep.direction === 'give' && transferStep.all === undefined
+          && transferStep.goods.length === 1 && transferStep.goods[0].name === 'Iron' && transferStep.goods[0].amount === 50,
+          'and the transfer step with its target and the goods picked');
+    const listedSteps = $$('#automation-pane .program-step');
+    check(/Trade run/.test(listedSteps[2].textContent) && /travel to -300/.test(listedSteps[3].textContent),
+          'both read back in the step list');
+    check(listedSteps[4] && /give 50 Iron to Rusty Refinery/.test(listedSteps[4].textContent),
+          'as does the transfer');
+
+    $('[data-view="fleet"]').click();
+    await settle(50);
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
+
     console.log('\nexplanations behind a mark');
 
     tab('overview').click();
@@ -550,14 +1375,62 @@ const ready = window.document.readyState === 'loading'
      * the key itself - a slug where a sentence should be. So open every mark currently
      * rendered and insist none of them answers with its own key back.
      */
+    // Only slugs count: a mark carrying a sentence of its own answers with that sentence by
+    // design, as the mission area's rules do.
     const unresolved = $$('.explain').filter((mark) => {
         mark.click();
-        return popover.textContent.trim() === mark.dataset.explain;
+        return /^[a-z0-9-]+$/.test(mark.dataset.explain)
+            && popover.textContent.trim() === mark.dataset.explain;
     }).map((mark) => mark.dataset.explain);
 
     check(unresolved.length === 0,
           'every mark resolves to an explanation' + (unresolved.length
               ? ' - ' + unresolved.join(', ') + ' did not' : ''));
+
+    console.log('\nboss farming, as the ship reports it');
+
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
+    tab('travel').click();
+    await settle(600);
+
+    const farmEvent = (seq, plan) => ({
+        seq: seq, at: 3600 + seq, kind: 'order', chain: [], activeIndex: 0, idle: false,
+        automation: {
+            autoAggressive: false, attackCivilians: false, enemies: false, sector: { x: 293, y: 2 },
+            plan: Object.assign({ id: 'f1', kind: 'farm', boss: 'swoks', hops: 2, hop: 2,
+                                  loopFrom: 1, jumps: 12, fights: 0, onEnemies: 'fight',
+                                  collectLoot: true, bossKills: 0 }, plan)
+        }
+    });
+
+    const swoks = { name: 'swoks', title: 'Boss Swoks III' };
+    liveEvents.events.push(
+        farmEvent(5, { phase: 'running' }),
+        farmEvent(6, { phase: 'fighting', fights: 1, bossPresent: swoks }),
+        farmEvent(7, { phase: 'cooldown', fights: 1, bossKills: 1, lastKill: swoks,
+                       lootResult: 'collected', cooldown: { left: 1790, total: 1800 },
+                       loot: { instant: 0, cargo: 2, cargoPickup: false, fighters: 6, deployed: 0 } })
+    );
+    notifications.length = 0;
+    await settle(4500);
+
+    check(notifications.some((n) => n.title === 'Boss spawned' && /Boss Swoks III/.test(n.body)),
+          'a boss turning up is a system notification while the page is unfocused');
+    check(notifications.some((n) => n.title === 'Boss killed' && /pauses for 29m/.test(n.body)),
+          'and so is its death, with the pause it starts');
+    check(/boss cooldown/.test(travel().textContent) && /not jumping/.test(travel().textContent),
+          'the travel tab counts the cooldown down');
+    check(/2 cargo/.test(travel().textContent) && /transporter block/.test(travel().textContent),
+          'and says why cargo was left behind');
+
+    liveEvents.events.push(farmEvent(8, { phase: 'running', fights: 1, bossKills: 1, lastKill: swoks }));
+    await settle(4500);
+
+    check(notifications.some((n) => n.title === 'Boss cooldown over'),
+          'the end of the cooldown is notified');
+    check(notifications.filter((n) => n.title === 'Boss spawned').length === 1,
+          'and nothing seen before is notified twice');
 
     console.log('');
     if (failures === 0) {

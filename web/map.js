@@ -17,6 +17,7 @@
     ships: [],         // GET /ships
     route: null,       // GET /galaxy/route
     hits: [],          // GET /map/search
+    area: null,        // {lower, upper, label}: a mission area, inclusive
     heat: null,        // GET /history/heatmap
     tracks: [],        // GET /history/visits, grouped per craft
     selected: null,    // {x, y}
@@ -26,6 +27,12 @@
     scale: 1,
     originX: 0,
     originY: 0,
+
+    /* Screen position of the pointer over the canvas, or null. Names are only drawn
+       near it: a whole galaxy of labels at once is unreadable. */
+    cursor: null,
+    labelRadius: 160,
+    pendingFrame: false,
 
     onPick: null,      // (x, y, sector|null) -> void
     onShipPick: null,  // (name) -> void
@@ -62,14 +69,25 @@
           Map2.originX += e.clientX - lastX;
           Map2.originY += e.clientY - lastY;
           lastX = e.clientX; lastY = e.clientY;
+          Map2.cursor = pointer(e);
           Map2.draw();
           return;
         }
-        if (e.target !== canvas) { Map2.hideTip(); return; }
-        Map2.hover(pointer(e), e);
+        if (e.target !== canvas) {
+          Map2.hideTip();
+          if (Map2.cursor) { Map2.cursor = null; Map2.drawSoon(); }
+          return;
+        }
+        Map2.cursor = pointer(e);
+        Map2.drawSoon();
+        Map2.hover(Map2.cursor, e);
       });
 
-      canvas.addEventListener('mouseleave', function () { Map2.hideTip(); });
+      canvas.addEventListener('mouseleave', function () {
+        Map2.hideTip();
+        Map2.cursor = null;
+        Map2.drawSoon();
+      });
 
       canvas.addEventListener('wheel', function (e) {
         e.preventDefault();
@@ -79,7 +97,7 @@
         Map2.scale = clamp(Map2.scale * factor, 0.12, 40);
         var after = Map2.toWorld(p);
         Map2.originX += (after.x - before.x) * Map2.scale;
-        Map2.originY += (after.y - before.y) * Map2.scale;
+        Map2.originY -= (after.y - before.y) * Map2.scale;
         Map2.draw();
       }, { passive: false });
 
@@ -127,11 +145,13 @@
       return { w: Map2.canvas.clientWidth, h: Map2.canvas.clientHeight };
     },
 
+    /* Sector y grows upwards, as on the in-game galaxy map; screen y grows downwards.
+       originX/originY stay in screen pixels so panning needs no flip. */
     toScreen: function (x, y) {
       var s = Map2.size();
       return {
         x: s.w / 2 + Map2.originX + x * Map2.scale,
-        y: s.h / 2 + Map2.originY + y * Map2.scale
+        y: s.h / 2 + Map2.originY - y * Map2.scale
       };
     },
 
@@ -139,7 +159,7 @@
       var s = Map2.size();
       return {
         x: (p.x - s.w / 2 - Map2.originX) / Map2.scale,
-        y: (p.y - s.h / 2 - Map2.originY) / Map2.scale
+        y: (s.h / 2 + Map2.originY - p.y) / Map2.scale
       };
     },
 
@@ -149,8 +169,8 @@
       var a = Map2.toWorld({ x: 0, y: 0 });
       var b = Map2.toWorld({ x: s.w, y: s.h });
       return {
-        minX: Math.floor(a.x), minY: Math.floor(a.y),
-        maxX: Math.ceil(b.x), maxY: Math.ceil(b.y)
+        minX: Math.floor(a.x), minY: Math.floor(b.y),
+        maxX: Math.ceil(b.x), maxY: Math.ceil(a.y)
       };
     },
 
@@ -169,6 +189,18 @@
     setShips: function (list) { Map2.ships = list || []; Map2.draw(); },
     setRoute: function (route) { Map2.route = route; Map2.draw(); },
     setHits: function (list) { Map2.hits = list || []; Map2.draw(); },
+    setArea: function (area) { Map2.area = area || null; Map2.draw(); },
+
+    /* Frames an inclusive sector rectangle with room around it to see what borders it. */
+    fitArea: function (area) {
+      var sz = Map2.size();
+      if (!sz.w || !sz.h) { return; }
+      var w = area.upper.x - area.lower.x + 1, h = area.upper.y - area.lower.y + 1;
+      Map2.scale = clamp(Math.min(sz.w / (w * 2.2), sz.h / (h * 2.2)), 0.12, 40);
+      Map2.originX = -((area.lower.x + area.upper.x) / 2) * Map2.scale;
+      Map2.originY = ((area.lower.y + area.upper.y) / 2) * Map2.scale;
+      Map2.draw();
+    },
 
     setHeat: function (heat) {
       Map2.heat = heat || null;
@@ -217,7 +249,7 @@
     focus: function (x, y, scale) {
       if (scale) { Map2.scale = scale; }
       Map2.originX = -x * Map2.scale;
-      Map2.originY = -y * Map2.scale;
+      Map2.originY = y * Map2.scale;
       Map2.draw();
     },
 
@@ -249,7 +281,7 @@
       var w = Math.max(8, maxX - minX), h = Math.max(8, maxY - minY);
       Map2.scale = clamp(Math.min(sz.w / (w * 1.2), sz.h / (h * 1.2)), 0.12, 40);
       Map2.originX = -((minX + maxX) / 2) * Map2.scale;
-      Map2.originY = -((minY + maxY) / 2) * Map2.scale;
+      Map2.originY = ((minY + maxY) / 2) * Map2.scale;
       Map2.draw();
     },
 
@@ -309,6 +341,14 @@
       if (Map2.tip) { Map2.tip.classList.add('hidden'); }
     },
 
+    /* Pointer moves arrive faster than frames; coalesce them into one redraw. */
+    drawSoon: function () {
+      if (Map2.pendingFrame) { return; }
+      if (typeof requestAnimationFrame !== 'function') { Map2.draw(); return; }
+      Map2.pendingFrame = true;
+      requestAnimationFrame(function () { Map2.pendingFrame = false; Map2.draw(); });
+    },
+
     draw: function () {
       var ctx = Map2.ctx;
       if (!ctx) { return; }
@@ -320,6 +360,7 @@
 
       drawRings(ctx);
       if (Map2.show.heat) { drawHeat(ctx); }
+      drawArea(ctx);
       drawSectors(ctx);
       if (Map2.show.tracks) { drawTracks(ctx); }
       drawHits(ctx);
@@ -393,7 +434,8 @@
 
   function drawSectors(ctx) {
     var size = clamp(Map2.scale * 0.55, 1, 6);
-    var labels = Map2.scale > 5;
+    // Close enough in that names fit beside their dots; still only near the pointer.
+    var labels = Map2.scale > 2;
     // A full galaxy is a few hundred sectors redrawn on every pan frame, so the viewport
     // is measured once rather than per sector.
     var view = Map2.size();
@@ -423,8 +465,9 @@
         ctx.stroke();
       }
 
-      if (labels && sec.name) {
-        ctx.fillStyle = 'rgba(125,140,163,.8)';
+      var near = labels && sec.name ? labelAlpha(p) : 0;
+      if (near) {
+        ctx.fillStyle = 'rgba(125,140,163,' + (0.85 * near).toFixed(3) + ')';
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(sec.name, p.x + r + 3, p.y + 3);
       }
@@ -509,8 +552,9 @@
       ctx.arc(last.x, last.y, 5, 0, Math.PI * 2);
       ctx.stroke();
 
-      if (labels) {
-        ctx.fillStyle = color.replace('ALPHA', '0.85');
+      var nearTrack = labels ? labelAlpha(last) : 0;
+      if (nearTrack) {
+        ctx.fillStyle = color.replace('ALPHA', (0.85 * nearTrack).toFixed(3));
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(track.ship, last.x + 7, last.y - 5);
       }
@@ -526,6 +570,30 @@
       ctx.beginPath();
       ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
       ctx.stroke();
+    }
+  }
+
+  /* Sectors are points, so the rectangle runs half a sector outside the outermost ones
+     rather than straight through them. */
+  function drawArea(ctx) {
+    var area = Map2.area;
+    if (!area) { return; }
+
+    var a = Map2.toScreen(area.lower.x - 0.5, area.upper.y + 0.5);
+    var b = Map2.toScreen(area.upper.x + 0.5, area.lower.y - 0.5);
+
+    ctx.fillStyle = 'rgba(169,124,240,.10)';
+    ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.strokeStyle = 'rgba(169,124,240,.9)';
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.setLineDash([]);
+
+    if (area.label) {
+      ctx.fillStyle = 'rgba(169,124,240,.95)';
+      ctx.font = '10px ui-monospace, monospace';
+      ctx.fillText(area.label, a.x + 2, a.y - 5);
     }
   }
 
@@ -586,8 +654,9 @@
         ctx.fill();
         ctx.stroke();
 
-        if (labels) {
-          ctx.fillStyle = 'rgba(204,214,228,.9)';
+        var nearShip = labels ? labelAlpha(p) : 0;
+        if (nearShip) {
+          ctx.fillStyle = 'rgba(204,214,228,' + (0.9 * nearShip).toFixed(3) + ')';
           ctx.font = '10px ui-monospace, monospace';
           ctx.fillText(s.name, p.x + 7, p.y + 3);
         }
@@ -607,6 +676,17 @@
     ctx.moveTo(p.x, p.y - r); ctx.lineTo(p.x, p.y - 3);
     ctx.moveTo(p.x, p.y + 3); ctx.lineTo(p.x, p.y + r);
     ctx.stroke();
+  }
+
+  /* How strongly to draw a label at screen point P: full near the pointer, fading out
+     towards the edge of the label radius, and nothing beyond it or with no pointer. */
+  function labelAlpha(p) {
+    var c = Map2.cursor;
+    if (!c) { return 0; }
+    var d = Math.sqrt((p.x - c.x) * (p.x - c.x) + (p.y - c.y) * (p.y - c.y));
+    var r = Map2.labelRadius;
+    if (d >= r) { return 0; }
+    return clamp((r - d) / (r * 0.4), 0, 1);
   }
 
   /* -------------------------------- colour -------------------------------- */

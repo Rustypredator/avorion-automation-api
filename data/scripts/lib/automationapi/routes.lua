@@ -13,6 +13,7 @@
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
 local Config = include("automationapi/config")
+local RoutePlanner = include("automationapi/routeplanner")
 
 local Routes = {}
 
@@ -135,6 +136,80 @@ function Routes.describe(route)
         jumps = math.max(0, #route - 1),
         distance = distance,
     }
+end
+
+-- #### PLANNED ROUTES #### --
+
+local PREFERENCES = {"preferGates", "avoidRifts", "preferUncontrolled"}
+
+local function flag(value)
+    return value == true or value == "true" or value == "1" or value == 1
+end
+
+-- The planner preferences in a body or a query, or nil when none was given at all - which
+-- is what decides between calculateJumpPath and this mod's own planner.
+function Routes.preferences(source)
+    if type(source) ~= "table" then return nil end
+
+    local given = false
+    local result = {}
+
+    for _, name in ipairs(PREFERENCES) do
+        if source[name] ~= nil then given = true end
+        result[name] = flag(source[name])
+    end
+
+    return given and result or nil
+end
+
+-- A finished planner search in the shape GET /galaxy/route answers with, so a caller can
+-- treat the two planners alike: `route` includes the origin, as the engine's does.
+function Routes.describePlan(result, fromX, fromY, toX, toY, jumpRange, canPassRifts, preferences)
+    local body =
+    {
+        from = {x = fromX, y = fromY},
+        to = {x = toX, y = toY},
+        reachable = result.reachable == true,
+        jumpRange = jumpRange or 0,
+        canPassRifts = canPassRifts == true,
+        planner = "automation",
+        preferences = preferences,
+        expansions = result.expansions or 0,
+    }
+
+    if not result.reachable then
+        body.reason = result.reason
+        body.route = Json.array({})
+        body.hops = Json.array({})
+        body.jumps = 0
+        body.gates = 0
+        body.distance = 0
+        return body
+    end
+
+    local hops = RoutePlanner.describeHops(result.hops, {x = fromX, y = fromY})
+
+    local route = Json.array({{x = fromX, y = fromY}})
+    local described = Json.array({})
+    local distance, gates, controlled = 0, 0, 0
+
+    for index, hop in ipairs(hops) do
+        route[#route + 1] = {x = hop.x, y = hop.y}
+        described[index] = hop
+        distance = distance + hop.distance
+        if hop.kind ~= "jump" then gates = gates + 1 end
+        if hop.controlled then controlled = controlled + 1 end
+    end
+
+    body.route = route
+    body.hops = described
+    -- hops of any kind, as the engine planner's `jumps` counts them
+    body.jumps = #hops
+    body.gates = gates
+    body.controlledSectors = controlled
+    body.distance = distance
+
+    return body
 end
 
 -- #### TRAVEL GATES #### --

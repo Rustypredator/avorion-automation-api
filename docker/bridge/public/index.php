@@ -108,8 +108,24 @@ function fail(int $status, string $code, string $message): never
 function record(History $history, string $path, array $query, stdClass $answer): void
 {
     try {
+        // Who the key belongs to and which alliance they are in, which is what decides
+        // whose history it may read. A console connecting is exactly this call.
+        if ($path === '/ping') {
+            $history->recordPing($answer);
+            return;
+        }
+
         if ($path === '/ships') {
             $history->recordShips($answer);
+            return;
+        }
+
+        // /ships/<name>: the hold and who is aboard, for a goods search to start from.
+        if (preg_match('#^/ships/([^/]+)$#', $path, $found) === 1) {
+            $ship = $answer->name ?? rawurldecode($found[1]);
+            if (is_string($ship) && $ship !== '') {
+                $history->recordManifest($ship, $answer);
+            }
             return;
         }
 
@@ -151,6 +167,104 @@ function record(History $history, string $path, array $query, stdClass $answer):
     } catch (Throwable $e) {
         error_log('AutomationAPI bridge: history write failed: ' . $e->getMessage());
     }
+}
+
+/**
+ * One call through the file transport: write the request, wait for the mod's answer.
+ *
+ * Returns the mod's status and body, or status 0 with an `error` of [status, code, message]
+ * saying why no answer came back. The caller decides what to do with either - the main
+ * path turns an error into the reply, while the history store's membership check simply
+ * treats it as "the mod could not be asked".
+ *
+ * @return array{status: int, body: mixed, error?: array{0: int, 1: string, 2: string}}
+ */
+function relay(string $requestDir, string $responseDir, string $key, string $method,
+               string $path, array $query, stdClass $body): array
+{
+    $requestId = bin2hex(random_bytes(16)); // matches [A-Za-z0-9_-]+
+    $envelope = [
+        'id' => $requestId,
+        'key' => $key,
+        'method' => $method,
+        'path' => $path,
+        // Objects, not arrays: an empty PHP array encodes as [], which the mod ignores
+        // silently, and the parameters would vanish.
+        'query' => (object) $query,
+        'body' => $body,
+    ];
+
+    // Write under a name the mod's ^[A-Za-z0-9_-]+\.json$ filter rejects, then rename it
+    // in. Our rename is atomic, so the mod never picks up a half-written request.
+    $staged = $requestDir . '/' . $requestId . '.part.json';
+    $final = $requestDir . '/' . $requestId . '.json';
+    $json = json_encode($envelope, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+    if (@file_put_contents($staged, $json) === false || !@rename($staged, $final)) {
+        @unlink($staged);
+        return ['status' => 0, 'body' => null, 'error' => [500, 'bridge_write_failed',
+            'Could not write the request file. Check the galaxy mount and its permissions.']];
+    }
+
+    $responseFile = $responseDir . '/' . $requestId . '.json';
+    $deadline = microtime(true) + TIMEOUT;
+
+    while (microtime(true) < $deadline) {
+        clearstatcache(true, $responseFile);
+        $raw = @file_get_contents($responseFile);
+
+        if ($raw === false) {
+            usleep(POLL_US);
+            continue;
+        }
+
+        $payload = json_decode($raw);
+        if (!$payload instanceof stdClass) {
+            // The mod cannot write responses atomically - os.rename() inside the sandbox
+            // reports success and then loses the file - so a failed parse means we caught
+            // it mid-write. Retry rather than fail.
+            usleep(POLL_US);
+            continue;
+        }
+
+        // Delete it, or the mod deletes it 60 seconds later and we raced it for nothing.
+        @unlink($responseFile);
+
+        return [
+            'status' => isset($payload->status) && is_int($payload->status) ? $payload->status : 500,
+            'body' => $payload->body ?? new stdClass(),
+        ];
+    }
+
+    /*
+     * Nothing came back, and which half of the round trip is broken is the only useful
+     * thing to say here. The request file answers it: the mod deletes it the instant it
+     * picks it up, so one still sitting there means nothing is reading that directory.
+     *
+     * That case is otherwise completely silent. The directory check below passes whether
+     * or not the mod ever created it, because Docker makes an empty directory on the host
+     * for any bind mount whose source is missing - so a GALAXY_DIR pointing at the wrong
+     * galaxy looks like a healthy bridge right up to this point.
+     */
+    clearstatcache(true, $final);
+
+    if (file_exists($final)) {
+        // Take it back out. Nothing is reading the directory now, but a mod that is merely
+        // down would answer every abandoned request at once on its way back up, long after
+        // the callers stopped listening.
+        @unlink($final);
+
+        return ['status' => 0, 'body' => null, 'error' => [504, 'mod_not_responding',
+            'The mod never picked this request up. Check that the game server is running with '
+            . 'the mod loaded, and that GALAXY_DIR points at the galaxy that server is actually '
+            . 'running.']];
+    }
+
+    return ['status' => 0, 'body' => null, 'error' => [504, 'bridge_timeout', sprintf(
+        'The mod took the request but wrote no response within %ds. Check the game server log '
+        . 'for AutomationAPI errors - a response the mod cannot write fails exactly like this, '
+        . 'so make sure the responses directory is writable by the account the server runs as.',
+        (int) TIMEOUT)]];
 }
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -241,9 +355,10 @@ if (is_string($rawQuery) && $rawQuery !== '') {
  * a month of travel data with server frame time. So the copy lives here, built out of
  * answers the bridge was relaying anyway.
  *
- * No key check happens first, and none is needed. The store is addressed by a hash of the
- * key, so an unknown key reads an empty history rather than anyone else's, and nothing is
- * ever written except off the back of a call the mod itself answered.
+ * No key check happens here. The store asks the mod itself, by relaying a /ping for this
+ * key whenever its last answer about the key is older than HISTORY_VERIFY_TTL: that is what
+ * says which player the key is and which alliance's history it may read. A key the mod
+ * refuses reads nothing. See History::scope.
  */
 if (str_starts_with($path, '/history')) {
     if (!$keepHistory) {
@@ -253,7 +368,8 @@ if (str_starts_with($path, '/history')) {
             . '/ships/{name}/events instead.');
     }
 
-    $history = new History($key);
+    $history = new History($key, static fn (): array
+        => relay($requestDir, $responseDir, $key, 'GET', '/ping', [], new stdClass()));
     $what = rawurldecode(substr($path, strlen('/history')));
 
     $filter = [
@@ -304,6 +420,10 @@ if (str_starts_with($path, '/history')) {
         reply(200, $history->economyGoods($filter));
     }
 
+    if ($method === 'GET' && $what === '/manifests') {
+        reply(200, ['manifests' => $history->manifests($filter)]);
+    }
+
     /*
      * The measured economy, out of what stations recorded from inside themselves: real
      * cycles against slot time, units per good, and trades at the prices they happened at.
@@ -318,14 +438,20 @@ if (str_starts_with($path, '/history')) {
     }
 
     if ($method === 'POST' && $what === '/clear') {
+        if ($filter['owner'] === 'alliance') {
+            fail(403, 'history_shared',
+                'Alliance history is shared by every member, and the bridge cannot ask the '
+                . 'game which of them may delete it, so none can. POST /history/clear removes '
+                . 'your own craft\'s history only.');
+        }
         reply(200, $history->clear($filter['ship'] !== '' ? $filter['ship'] : null));
     }
 
     fail(404, 'no_such_route', sprintf(
         'The bridge serves GET /history/summary, /history/visits, /history/heatmap, '
-        . '/history/events, /history/economy/summary, /history/economy/series, '
-        . '/history/economy/goods, /history/economy/observed and /history/economy/events, '
-        . 'and POST /history/clear. It does not serve %s %s.',
+        . '/history/events, /history/manifests, /history/economy/summary, '
+        . '/history/economy/series, /history/economy/goods, /history/economy/observed and '
+        . '/history/economy/events, and POST /history/clear. It does not serve %s %s.',
         $method, $what === '' ? '/history' : '/history' . $what));
 }
 
@@ -354,93 +480,22 @@ if (is_string($rawBody) && $rawBody !== '') {
     $body = $decoded;
 }
 
-$requestId = bin2hex(random_bytes(16)); // matches [A-Za-z0-9_-]+
-$envelope = [
-    'id' => $requestId,
-    'key' => $key,
-    'method' => $method,
-    'path' => $path,
-    // Objects, not arrays: an empty PHP array encodes as [], which the mod ignores
-    // silently, and the parameters would vanish.
-    'query' => (object) $query,
-    'body' => $body,
-];
+$result = relay($requestDir, $responseDir, $key, $method, $path, $query, $body);
 
-// Write under a name the mod's ^[A-Za-z0-9_-]+\.json$ filter rejects, then rename it
-// in. Our rename is atomic, so the mod never picks up a half-written request.
-$staged = $requestDir . '/' . $requestId . '.part.json';
-$final = $requestDir . '/' . $requestId . '.json';
-$json = json_encode($envelope, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-
-if (@file_put_contents($staged, $json) === false || !@rename($staged, $final)) {
-    @unlink($staged);
-    fail(500, 'bridge_write_failed', 'Could not write the request file. Check the galaxy mount and its permissions.');
+if (isset($result['error'])) {
+    [$status, $code, $message] = $result['error'];
+    fail($status, $code, $message);
 }
 
-$responseFile = $responseDir . '/' . $requestId . '.json';
-$deadline = microtime(true) + TIMEOUT;
+$status = $result['status'];
+$answer = $result['body'];
 
-while (microtime(true) < $deadline) {
-    clearstatcache(true, $responseFile);
-    $raw = @file_get_contents($responseFile);
-
-    if ($raw === false) {
-        usleep(POLL_US);
-        continue;
-    }
-
-    $payload = json_decode($raw);
-    if (!$payload instanceof stdClass) {
-        // The mod cannot write responses atomically - os.rename() inside the sandbox
-        // reports success and then loses the file - so a failed parse means we caught
-        // it mid-write. Retry rather than fail.
-        usleep(POLL_US);
-        continue;
-    }
-
-    // Delete it, or the mod deletes it 60 seconds later and we raced it for nothing.
-    @unlink($responseFile);
-
-    $status = isset($payload->status) && is_int($payload->status) ? $payload->status : 500;
-    $answer = $payload->body ?? new stdClass();
-
-    // Keep a durable copy of the two answers worth keeping, on the way past. A successful
-    // reply is also proof the mod recognised this key, which is the only authentication
-    // the store gets - and the reason nothing is written before this line.
-    if ($keepHistory && $method === 'GET' && $status >= 200 && $status < 300
-        && $answer instanceof stdClass) {
-        record(new History($key), $path, $query, $answer);
-    }
-
-    reply($status, $answer);
+// Keep a durable copy of the answers worth keeping, on the way past. A successful reply is
+// also proof the mod recognised this key, which is the only authentication the store gets -
+// and the reason nothing is written before this line.
+if ($keepHistory && $method === 'GET' && $status >= 200 && $status < 300
+    && $answer instanceof stdClass) {
+    record(new History($key), $path, $query, $answer);
 }
 
-/**
- * Nothing came back, and which half of the round trip is broken is the only useful thing
- * to say here. The request file answers it: the mod deletes it the instant it picks it up,
- * so one still sitting there means nothing is reading that directory at all.
- *
- * That case is otherwise completely silent. The directory check above passes whether or
- * not the mod ever created it, because Docker makes an empty directory on the host for any
- * bind mount whose source is missing - so a GALAXY_DIR pointing at the wrong galaxy looks
- * like a healthy bridge right up to this line.
- */
-clearstatcache(true, $final);
-
-if (file_exists($final)) {
-    // Take it back out. Nothing is reading the directory now, but a mod that is merely
-    // down would answer every abandoned request at once on its way back up, long after
-    // the callers stopped listening.
-    @unlink($final);
-
-    fail(504, 'mod_not_responding',
-        'The mod never picked this request up. Check that the game server is running with '
-        . 'the mod loaded, and that GALAXY_DIR points at the galaxy that server is actually '
-        . 'running.');
-}
-
-fail(504, 'bridge_timeout', sprintf(
-    'The mod took the request but wrote no response within %ds. Check the game server log '
-    . 'for AutomationAPI errors - a response the mod cannot write fails exactly like this, '
-    . 'so make sure the responses directory is writable by the account the server runs as.',
-    (int) TIMEOUT));
+reply($status, $answer);

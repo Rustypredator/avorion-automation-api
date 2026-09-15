@@ -1,1 +1,5 @@
 .env
+
+# Machine-specific paths and keys for tools/localserver.sh, and its runtime state.
+tools/local.env
+.local/

@@ -75,10 +75,7 @@ end
 
 -- #### COMPONENTS #### --
 
-local function captainOf(entry)
-    local captain = safe(function() return entry:getCaptain() end)
-    if not captain then return nil end
-
+local function describeCaptain(captain)
     local classes = Json.array({})
     for _, class in ipairs({captain.primaryClass, captain.secondaryClass}) do
         if class and class ~= 0 then
@@ -104,6 +101,29 @@ local function captainOf(entry)
         classes = classes,
         perks = perks,
     }
+end
+
+local function captainOf(entry)
+    local captain = safe(function() return entry:getCaptain() end)
+    if not captain then return nil end
+
+    return describeCaptain(captain)
+end
+
+-- Captains riding along rather than in command: bought at a station, or moved off another
+-- craft. They are Captain objects in the same shape, returned as varargs off the crew.
+local function passengersOf(entry)
+    local result = Json.array({})
+
+    local crew = safe(function() return entry:getCrew() end)
+    if not crew then return result end
+
+    for _, passenger in ipairs({safe(function() return crew:getPassengers() end)}) do
+        local ok, described = pcall(describeCaptain, passenger)
+        if ok then result[#result + 1] = described end
+    end
+
+    return result
 end
 
 local function crewBreakdown(crew)
@@ -199,6 +219,79 @@ local function energyOf(entry)
 
     return {required = required, produced = produced, sufficient = required <= produced}
 end
+
+local ORDER_FIELDS =
+{
+    chain = true, currentIndex = true, finished = true, coordinates = true,
+    defenseAutoAI = true, autoAIConfig = true, ship = true, automationApi = true,
+}
+
+-- getOrderInfo() is the order chain's own state as a JSON string (a table in some builds):
+-- the chain, which link is running, the defensive AI setting. Passed through verbatim it is
+-- unreadable, so it is decoded to the same shape the order events use. `activeIndex` is the
+-- engine's 1-based currentIndex, 0 when nothing runs. Top-level scalars the chain does not
+-- define - scripts add their own - land in `extra` rather than being lost. nil when there
+-- is no chain state, or it is not JSON (the raw string stays on `orderInfo` either way).
+local function ordersOf(raw)
+    local info = raw
+    if type(raw) == "string" then info = Json.decode(raw) end
+    if type(info) ~= "table" then return nil end
+
+    local chain = Json.array({})
+    for _, link in ipairs(type(info.chain) == "table" and info.chain or {}) do
+        if type(link) == "table" then
+            local entry =
+            {
+                name = Serialize.displayName(link.name) or "",
+                action = Serialize.number(link.action, 0),
+            }
+            if link.x ~= nil and link.y ~= nil then entry.sector = Serialize.vec2(link.x, link.y) end
+            if link.gate ~= nil then entry.gate = link.gate == true end
+            chain[#chain + 1] = entry
+        end
+    end
+
+    local result =
+    {
+        chain = chain,
+        activeIndex = Serialize.number(info.currentIndex, 0),
+        finished = info.finished == true,
+    }
+
+    if type(info.coordinates) == "table" then
+        result.sector = Serialize.vec2(info.coordinates.x, info.coordinates.y)
+    end
+    if type(info.defenseAutoAI) == "string" and info.defenseAutoAI ~= "" then
+        result.defense = Serialize.displayName(info.defenseAutoAI)
+    end
+    if type(info.autoAIConfig) == "table" then
+        for key, value in pairs(info.autoAIConfig) do
+            local kind = type(value)
+            if kind == "number" or kind == "boolean" or kind == "string" then
+                result.autoAI = result.autoAI or {}
+                result.autoAI[tostring(key)] = value
+            end
+        end
+    end
+
+    for key, value in pairs(info) do
+        local kind = type(value)
+        if not ORDER_FIELDS[key] and (kind == "number" or kind == "boolean" or kind == "string") then
+            result.extra = result.extra or {}
+            result.extra[tostring(key)] = kind == "string" and Serialize.displayName(value) or value
+        end
+    end
+
+    -- Published by this mod's orderchain.lua extension. As of the last time the game wrote
+    -- the row, so it can trail the live event feed by a save; see handlers/navigation.lua.
+    if type(info.automationApi) == "table" then
+        result.automation = Serialize.value(info.automationApi)
+    end
+
+    return result
+end
+
+ShipData.ordersOf = ordersOf
 
 -- Ships carry many copies of the same turret and getTurrets() keys by design instance,
 -- so two identical turrets arrive as two separate entries. They are grouped here by
@@ -332,7 +425,9 @@ function ShipData.detail(owner, name)
     result.statusMessage = Serialize.format(safe(function() return entry:getStatusMessage() end))
     result.title = Serialize.format(safe(function() return entry:getTitle() end))
     result.icon = Serialize.string(safe(function() return entry:getIcon() end))
-    result.orderInfo = Serialize.string(safe(function() return entry:getOrderInfo() end))
+    local orderInfo = safe(function() return entry:getOrderInfo() end)
+    result.orderInfo = type(orderInfo) ~= "table" and Serialize.string(orderInfo) or nil
+    result.orders = ordersOf(orderInfo)
 
     result.blocks = Serialize.number(safe(function() return entry.numBlocks end), 0)
     result.planValue = Serialize.number(safe(function() return entry:getPlanValue() end), 0)
@@ -340,6 +435,7 @@ function ShipData.detail(owner, name)
         Serialize.number(safe(function() return entry:getReconstructionValue() end), 0)
 
     result.captain = captainOf(entry)
+    result.passengers = passengersOf(entry)
     result.crew = crewOf(entry)
     result.cargo = cargoOf(entry)
     result.hyperspace = hyperspaceOf(entry)

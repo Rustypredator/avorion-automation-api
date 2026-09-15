@@ -39,6 +39,10 @@ function crew:getWorkForce() return {[{value = 0}] = 3.5} end
 function crew:getNumMembersByProfession()
     return {[{value = 0}] = 8, [{value = 5}] = 120, [{value = 3}] = 52}
 end
+function crew:getPassengers()
+    return {name = "Oren", displayName = "Oren Dask", level = 4, tier = 1, primaryClass = 3,
+            salary = 1100, experiencePercentage = 0.2}
+end
 
 local function good(name, price, size, flags)
     local g = {name = name, plural = name, price = price, size = size}
@@ -149,12 +153,22 @@ local refinery = Mock.addShip(1, "Home Base",
 Mock.player(1).money = 12500000
 Mock.player(1).resources = {[0] = 40000, [1] = 9000}
 
+-- An alliance with a second member, so the bridge's shared history has two people to
+-- share between: craft either of them records under the alliance, the other one reads.
+-- The second key is printed after the first, so anything that takes the first key it
+-- finds in the output still gets the owner of the fleet above.
+Mock.addPlayer(2, os.getenv("MOCK_MEMBER") or "Wingmate")
+Mock.addAlliance(77, "Test Alliance", 1, nil, {1, 2})
+Mock.addShip(77, "Alliance Hauler", {x = 8, y = -6, statusText = "Idle"})
+
 Bridge.initialize()
 
 local key = Auth.createKey(1, "fakeserver")
+local memberKey = Auth.createKey(2, "fakeserver")
 
 print("fakeserver: transport directory: " .. Config.getRoot())
 print("fakeserver: API key: " .. key)
+print("fakeserver: alliance member's API key: " .. memberKey)
 print("fakeserver: polling, Ctrl-C to stop")
 io.stdout:flush()
 

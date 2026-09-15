@@ -18,8 +18,12 @@ local ShipData = include("automationapi/shipdata")
 local MissionTypes = include("automationapi/missiontypes")
 local Analysis = include("automationapi/analysis")
 local FactionScope = include("automationapi/factionscope")
+local Routes = include("automationapi/routes")
 
 local SimulationUtility = include("simulationutility")
+
+-- Pure data defining the `goods` global; trade routes are priced off it.
+include("goods")
 
 local Missions = {}
 
@@ -144,11 +148,123 @@ local function describeMission(key, ownerIndex, shipName)
     return described
 end
 
+-- #### TRADE ROUTES #### --
+
+-- Trade is the one mission whose analysis offers a choice: up to four routes, of which
+-- config.goodName picks one. The order window lists them; preview never did, so a caller
+-- had no way to learn what goodName could even be, let alone compare two areas.
+--
+-- Each route is predicted the way the order window would at its deposit slider's maximum:
+-- the whole contract, in as few flights as the cargo bay allows. The window's slider tops
+-- out at min(goods available, cargo space) units at the pre-perk purchase price, and the
+-- goods available only come out of a prediction - so the route is predicted twice, once
+-- with a deposit big enough never to be the limit, then again at the window's figure.
+local UNLIMITED_DEPOSIT = 1e15
+
+local function round2(value)
+    return math.floor(value * 100 + 0.5) / 100
+end
+
+local function describeTradeRoutes(command, owner, shipName, area, config)
+    local routes = Json.array({})
+
+    local analysis = area.analysis
+    if type(analysis) ~= "table" or type(analysis.routes) ~= "table" then return routes end
+
+    local freeCargo = 0
+    local entry = ShipDatabaseEntry(owner.index, shipName)
+    if entry then
+        local ok, free = pcall(function() return entry:getFreeCargoSpace() end)
+        if ok and type(free) == "number" then freeCargo = free end
+    end
+
+    local function predict(goodName, deposit)
+        local routeConfig = {}
+        for field, value in pairs(config or {}) do routeConfig[field] = value end
+        routeConfig.goodName = goodName
+        routeConfig.deposit = deposit
+
+        local ok, predicted = pcall(function()
+            return FactionScope.with(owner.faction, function()
+                return command:calculatePrediction(owner.index, shipName, area, routeConfig)
+            end)
+        end)
+
+        if not ok then return {error = tostring(predicted)} end
+        return type(predicted) == "table" and predicted or {}
+    end
+
+    for _, route in ipairs(analysis.routes) do
+        local lowest = Serialize.number(route.lowest, 0)
+        local highest = Serialize.number(route.highest, 0)
+
+        local described =
+        {
+            good = Serialize.string(route.name),
+            lowest = lowest,
+            highest = highest,
+            -- the order window's "%" column: the spread between buying and selling
+            margin = round2(highest - lowest),
+            -- the window's "¢/u" column, before captain perks
+            profitPerUnit = Serialize.number(route.profit),
+            from = route.from and Serialize.vec2(route.from.x, route.from.y) or nil,
+            to = route.to and Serialize.vec2(route.to.x, route.to.y) or nil,
+            selected = config and config.goodName == route.name or false,
+        }
+
+        local reference = goods and goods[route.name or ""] or nil
+        if reference then
+            described.price = Serialize.number(reference.price)
+            described.size = Serialize.number(reference.size)
+        end
+
+        local open = predict(route.name, UNLIMITED_DEPOSIT)
+        local maxAvailable = open.maxAvailable and Serialize.number(open.maxAvailable.value)
+        local transported = Serialize.number(open.transportedPerFlight, 0)
+
+        if open.error or not maxAvailable or transported <= 0 or not reference then
+            described.error = Serialize.message(open.error or "Not enough cargo space!", open.errorArgs)
+        else
+            -- what a unit actually earns, captain perks included
+            local unitProfit = Serialize.number(open.profitPerFlight.to, 0) / transported
+
+            local carriable = math.min(maxAvailable, math.floor(freeCargo / reference.size))
+            local minPrice = math.ceil(reference.price * (1 + lowest))
+            local deposit = carriable * minPrice
+
+            local full = predict(route.name, deposit)
+            if full.error then full = open end
+
+            described.deposit = deposit
+            described.maxAvailable = maxAvailable
+            described.perFlight = Serialize.number(full.transportedPerFlight)
+            described.flights = full.flights and
+                {from = Serialize.number(full.flights.from), to = Serialize.number(full.flights.to)}
+            described.profitPerFlight = full.profitPerFlight and
+                {from = Serialize.number(full.profitPerFlight.from),
+                 to = Serialize.number(full.profitPerFlight.to)}
+            -- each flight pays out 90-100% of its figure, as the command rolls it
+            local contract = math.floor(maxAvailable * unitProfit)
+            described.contractProfit = {from = math.ceil(contract * 0.9), to = contract}
+            described.flightTime = full.flightTime and Serialize.number(full.flightTime.value)
+            described.attackChance = full.attackChance and Serialize.number(full.attackChance.value)
+        end
+
+        routes[#routes + 1] = described
+    end
+
+    return routes
+end
+
 -- #### PREVIEW AND START #### --
 
--- Validates and predicts against a completed analysis. Shared by preview and start so the
--- two can never disagree about whether a mission is startable.
-local function assess(owner, shipName, key, missionType, area, results, config)
+-- Validates and predicts against a completed analysis. Shared by preview, start and the
+-- mission automation, so none of them can disagree about whether a mission is startable.
+--
+-- opts.brief skips the parts only a person reads - the captain's assessment and the trade
+-- route table - for the automation, which assesses many configs against one analysis.
+local function assess(owner, shipName, key, missionType, area, results, config, opts)
+    opts = opts or {}
     area.analysis = results
 
     local command = MissionTypes.make(missionType, shipName, area, config)
@@ -199,7 +315,7 @@ local function assess(owner, shipName, key, missionType, area, results, config)
         if ok then captain = found end
     end
 
-    if captain and command.generateAssessmentFromPrediction then
+    if captain and command.generateAssessmentFromPrediction and not opts.brief then
         local ok, lines = pcall(function()
             return FactionScope.with(owner.faction, function()
                 return command:generateAssessmentFromPrediction(prediction, captain,
@@ -257,12 +373,20 @@ local function assess(owner, shipName, key, missionType, area, results, config)
     local okStats, stats = pcall(function() return SimulationUtility.getAreaStats(area) end)
     if okStats then areaStats = Serialize.value(stats) end
 
+    local routes
+    if key == "trade" and not opts.brief then
+        routes = describeTradeRoutes(command, owner, shipName, area, command.config)
+    end
+
     return
     {
         command = command,
+        -- the raw prediction, before serialization, for callers that do arithmetic on it
+        prediction = prediction,
         body =
         {
             mission = key,
+            routes = routes,
             ship = shipName,
             owner = Owner.describe(owner),
             area =
@@ -284,6 +408,10 @@ local function assess(owner, shipName, key, missionType, area, results, config)
     }
 end
 
+Missions.assess = assess
+Missions.plainArea = plainArea
+Missions.plainConfig = plainConfig
+
 -- Runs an analysis and calls back with the assessment. Returns Router.DEFERRED.
 local function withAssessment(ctx, params, onAssessed)
     local key = string.lower(params.key or "")
@@ -295,6 +423,13 @@ local function withAssessment(ctx, params, onAssessed)
     local command = MissionTypes.make(missionType, shipName, nil, {})
     local config = MissionTypes.buildConfig(key, ctx.body)
     local area = MissionTypes.buildArea(command, owner.index, shipName, ctx.body)
+
+    -- A travel area is the destination sector. Checked against the gates the game applies
+    -- before an analysis is spent on it, so an impossible destination comes back at once
+    -- with a reason rather than as a start the game silently refuses.
+    if key == "travel" and area.lower.x == area.upper.x and area.lower.y == area.upper.y then
+        Routes.checkTravelDestination(owner, shipName, area.lower.x, area.lower.y)
+    end
 
     Analysis.start(owner.index, ctx.playerIndex, shipName, missionType, area,
         function(analyzedArea, results)
@@ -342,15 +477,14 @@ local JOB_TIMEOUT = 12
 
 Missions.uptime = 0
 
--- Called by the bridge on behalf of the player agent. Returns a JSON string rather than
--- a table: tables are known to cross Player->Simulation safely because vanilla does it,
--- but nothing proves it for the galaxy boundary, and after the segfault above this code
--- does not assume. Strings are proven.
-function Missions.takeJobs(playerIndex)
+-- Returns a JSON string rather than a table: tables are known to cross Player->Simulation
+-- safely because vanilla does it, but nothing proves it for the galaxy boundary, and after
+-- the segfault above this code does not assume. Strings are proven.
+local function claimJobs(wanted)
     local claimed = {}
 
     for _, job in ipairs(pendingJobs) do
-        if job.playerIndex == playerIndex and not job.claimed then
+        if not job.claimed and wanted(job) then
             job.claimed = true
 
             claimed[#claimed + 1] =
@@ -358,6 +492,8 @@ function Missions.takeJobs(playerIndex)
                 id = job.id,
                 kind = job.kind,
                 ownerKind = job.owner.kind,
+                -- who asked; the alliance agent checks their privileges, see agent.lua
+                playerIndex = job.playerIndex,
                 shipName = job.shipName,
                 missionType = job.missionType,
                 area = job.area,
@@ -367,6 +503,7 @@ function Missions.takeJobs(playerIndex)
                 sector = job.sector,
                 clear = job.clear,
                 calls = job.calls,
+                run = job.run,
             }
         end
     end
@@ -374,6 +511,31 @@ function Missions.takeJobs(playerIndex)
     if #claimed == 0 then return "" end
 
     return Json.encode(Json.array(claimed))
+end
+
+-- An alliance's Simulation runs on the alliance's own script thread, and a player script
+-- calling Alliance:invokeFunction is refused with an undocumented result code 7 - every
+-- call, nothing reaches simulation.lua. So simulation work on alliance craft goes to the
+-- agent attached to the alliance itself, and the player agent only gets the rest.
+--
+-- In-sector orders stay with the player agent whoever owns the ship: they go through
+-- invokeEntityFunction, which never touches the alliance's scripts.
+local function forAllianceAgent(job)
+    return job.owner.kind == "alliance" and job.kind ~= "orders"
+end
+
+-- Called by the bridge on behalf of a player agent.
+function Missions.takeJobs(playerIndex)
+    return claimJobs(function(job)
+        return job.playerIndex == playerIndex and not forAllianceAgent(job)
+    end)
+end
+
+-- Called by the bridge on behalf of the agent attached to an alliance.
+function Missions.takeAllianceJobs(allianceIndex)
+    return claimJobs(function(job)
+        return forAllianceAgent(job) and job.owner.index == allianceIndex
+    end)
 end
 
 -- Called by the bridge when the agent reports back. Each result resolves one request.
@@ -385,6 +547,15 @@ function Missions.report(payload)
         for index, job in ipairs(pendingJobs) do
             if job.id == result.id then
                 table.remove(pendingJobs, index)
+
+                if result.code == "missing_privilege" then
+                    job.complete(403, {error =
+                    {
+                        code = result.code,
+                        message = "Your alliance rank does not allow managing alliance ships.",
+                    }})
+                    break
+                end
 
                 if result.ok == false and job.kind ~= "start" then
                     job.complete(502, {error =
@@ -434,8 +605,11 @@ function Missions.tick(elapsed)
             job.complete(409, {error =
             {
                 code = "agent_unavailable",
-                message = "The owner's player agent did not pick the request up. The "
-                          .. "owning player has to be logged in.",
+                message = job.owner.kind == "alliance"
+                          and "The alliance's agent did not pick the request up. An "
+                              .. "alliance member has to be logged in."
+                          or "The owner's player agent did not pick the request up. The "
+                             .. "owning player has to be logged in.",
             }})
         end
     end

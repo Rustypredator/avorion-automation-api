@@ -2,14 +2,15 @@
 --
 -- The two are genuinely different and the difference matters to a planner:
 --
---   /travel   starts a Travel captain mission. Galaxy-wide, loads no sectors, survives
---             the ship being anywhere, and reports a real prediction first. This is the
---             one to use for anything that is not tactical.
+--   /travel   starts a Travel captain mission - an alias of missions/travel/start.
+--             Galaxy-wide, loads no sectors, survives the ship being anywhere, and
+--             reports a real prediction first.
 --   /orders   enqueues in-sector orders on the ship's own order chain. Only works while
---             the sector is loaded, is fire-and-forget with no return value, and is
---             therefore answered 202 rather than 200.
+--             the sector is loaded, and the engine's dispatch returns nothing, so the
+--             answer is held until the ship reports its chain back.
 --
--- Both are writes, so both need the owning player online.
+-- Planned routes, boss farming and idle defence build on /orders' half; they live in
+-- handlers/navigation.lua. Every write needs the owning player online.
 
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
@@ -19,6 +20,7 @@ local Routes = include("automationapi/routes")
 local ShipData = include("automationapi/shipdata")
 local Config = include("automationapi/config")
 local ShipEvents = include("automationapi/shipevents")
+local RoutePlanner = include("automationapi/routeplanner")
 
 -- Defines the global OrderType, which is how the published order info identifies each
 -- order. Matching on it rather than on the display name keeps this independent of
@@ -255,6 +257,20 @@ local function chainMatches(event, calls, replaced)
     return true
 end
 
+Movement.chainMatches = chainMatches
+
+-- Holds a dispatched request open until the ship's own event feed shows it took effect.
+--
+--   spec.owner, spec.shipName  whose feed to watch
+--   spec.check(event)          nil to keep waiting, or the status to answer with; called
+--                              with the newest order event, which may be nil
+--   spec.body                  the response, filled in with the resulting chain
+--   spec.complete              the request's completion
+function Movement.awaitConfirmation(spec)
+    spec.waited = 0
+    pendingConfirms[#pendingConfirms + 1] = spec
+end
+
 function Movement.tick(elapsed)
     if #pendingConfirms == 0 then return end
 
@@ -264,19 +280,22 @@ function Movement.tick(elapsed)
         confirm.waited = confirm.waited + (elapsed or 0)
 
         local event = ShipEvents.latestOrder(confirm.owner.index, confirm.shipName)
-        local matched = chainMatches(event, confirm.calls, confirm.replaced)
+        local status = confirm.check(event)
         local expired = confirm.waited >= Config.orderConfirmWindow
 
-        if matched or expired then
+        if status or expired then
             local body = confirm.body
             body.chain = (event or {}).chain or Json.array({})
             body.activeIndex = Serialize.number((event or {}).activeIndex, 0)
             body.finished = (event or {}).finished == true
-            body.confirmed = matched
+            body.confirmed = status == 200
 
-            if matched then
-                -- 200: the ship reported back a chain holding what we sent
-                confirm.complete(200, body)
+            if event and event.automation then body.automation = event.automation end
+
+            if status then
+                -- 200: the ship reported back a state holding what we sent. Anything else
+                -- is the ship reporting that it refused, which the check has explained.
+                confirm.complete(status, body)
             else
                 -- 202: dispatched, but no event showed these orders. Not proof of failure -
                 -- a one-shot order that completes instantly can land and clear again inside
@@ -296,18 +315,99 @@ function Movement.tick(elapsed)
     pendingConfirms = remaining
 end
 
+Movement.isPilotedByPlayer = isPilotedByPlayer
+
+-- Everything that has to be true of the world before anything is put on a ship's order
+-- chain: the owner online, the ship out of the background simulation, its sector loaded,
+-- and the captain gates. Returns the ship's sector.
+--
+-- needsCaptain lists {name, rule} for orders stricter than the universal gate; rule is
+-- true (a captain, always) or "unless_piloted" (a captain or a player aboard). Pass
+-- {skipCaptain = true} in options for calls that give the ship no order at all.
+function Movement.requireOrderable(ctx, owner, shipName, needsCaptain, options)
+    options = options or {}
+
+    Missions.requireOnline(owner)
+
+    local availability = owner.faction:getShipAvailability(shipName)
+    if availability == ShipAvailability.InBackground then
+        Router.fail(409, "ship_in_background",
+                    "'" .. shipName .. "' is out on a captain mission and has no "
+                    .. "order chain to talk to. Recall it first.")
+    end
+
+    local x, y = owner.faction:getShipPosition(shipName)
+    if type(x) ~= "number" or type(y) ~= "number" then
+        Router.fail(404, "no_ship_position",
+                    "The game does not report a position for '" .. shipName .. "'.")
+    end
+
+    local loaded = false
+    local ok, result = pcall(function() return Galaxy():sectorLoaded(x, y) end)
+    if ok then loaded = result == true end
+
+    if not loaded then
+        Router.fail(409, "sector_not_loaded",
+                    string.format("(%d:%d) is not loaded, so the ship's scripts are "
+                                  .. "not running and orders would be dropped without "
+                                  .. "a trace. A Travel captain mission "
+                                  .. "(POST /ships/%s/missions/travel/start) moves a ship "
+                                  .. "wherever it is.", x, y, shipName))
+    end
+
+    if options.skipCaptain then return x, y end
+
+    -- The captain gates. orderchain.lua checks these itself, but reports a refusal
+    -- only by chat message to a calling player - which an API caller is not - so the
+    -- order would otherwise vanish into a 202 with nothing to show for it.
+    --
+    -- canReceivePlayerOrder() (orderchain.lua:811) is the universal one: any order from
+    -- a player needs the craft to have a captain, or the player to be in its sector.
+    -- Individual orders then add a stricter check of their own.
+    local hasCaptain = ShipData.hasCaptain(owner.index, shipName)
+
+    if not hasCaptain then
+        local piloted = isPilotedByPlayer(owner, shipName)
+
+        if not piloted and not playerInSector(ctx, x, y) then
+            Router.fail(422, "needs_captain",
+                        "'" .. shipName .. "' has no captain, and the game only "
+                        .. "accepts orders for a captainless ship while its owner is "
+                        .. "in the same sector.",
+                        {captain = false, sector = {x = x, y = y}})
+        end
+
+        for _, need in ipairs(needsCaptain or {}) do
+            if need.rule == "unless_piloted" then
+                if not piloted then
+                    Router.fail(422, "needs_captain",
+                                "A '" .. need.name .. "' order changes sector, so the "
+                                .. "game requires either a captain or a player aboard. "
+                                .. "'" .. shipName .. "' has neither.",
+                                {captain = false, order = need.name})
+                end
+            else
+                Router.fail(422, "needs_captain",
+                            "A '" .. need.name .. "' order is carried out by a captain, "
+                            .. "and '" .. shipName .. "' has none. Vanilla says: "
+                            .. "\"Your ship needs a captain for that!\"",
+                            {captain = false, order = need.name})
+            end
+        end
+    end
+
+    return x, y
+end
+
 -- #### ENDPOINTS #### --
 
 function Movement.register(router)
 
-    -- A Travel mission by another name. The destination is checked against the same gates
-    -- the game applies before the analysis is spent, so an impossible destination comes
-    -- back immediately with a reason rather than as a start the game silently refuses.
+    -- A Travel mission by another name, kept so existing callers keep working. The start
+    -- itself - destination checks included - is POST /ships/{name}/missions/travel/start;
+    -- all this adds is `swiftness` at the top level of the body.
     router:post("/ships/{name}/travel", function(ctx, params)
-        local owner = Owner.findShip(ctx, params.name)
-
         local toX, toY = Routes.destination(ctx.body)
-        Routes.checkTravelDestination(owner, params.name, toX, toY)
 
         -- rewritten into the shape the travel mission's area builder expects
         ctx.body.to = {x = toX, y = toY}
@@ -336,71 +436,7 @@ function Movement.register(router)
         -- should be told what is wrong with it, not that nobody is logged in.
         local calls, needsCaptain, oneShot = buildOrders(ctx.body)
 
-        Missions.requireOnline(owner)
-
-        local availability = owner.faction:getShipAvailability(params.name)
-        if availability == ShipAvailability.InBackground then
-            Router.fail(409, "ship_in_background",
-                        "'" .. params.name .. "' is out on a captain mission and has no "
-                        .. "order chain to talk to. Recall it first.")
-        end
-
-        local x, y = owner.faction:getShipPosition(params.name)
-        if type(x) ~= "number" or type(y) ~= "number" then
-            Router.fail(404, "no_ship_position",
-                        "The game does not report a position for '" .. params.name .. "'.")
-        end
-
-        local loaded = false
-        local ok, result = pcall(function() return Galaxy():sectorLoaded(x, y) end)
-        if ok then loaded = result == true end
-
-        if not loaded then
-            Router.fail(409, "sector_not_loaded",
-                        string.format("(%d:%d) is not loaded, so the ship's scripts are "
-                                      .. "not running and orders would be dropped without "
-                                      .. "a trace. Use POST /ships/%s/travel to move it "
-                                      .. "instead.", x, y, params.name))
-        end
-
-        -- The captain gates. orderchain.lua checks these itself, but reports a refusal
-        -- only by chat message to a calling player - which an API caller is not - so the
-        -- order would otherwise vanish into a 202 with nothing to show for it.
-        --
-        -- canReceivePlayerOrder() (orderchain.lua:811) is the universal one: any order from
-        -- a player needs the craft to have a captain, or the player to be in its sector.
-        -- Individual orders then add a stricter check of their own.
-        local hasCaptain = ShipData.hasCaptain(owner.index, params.name)
-
-        if not hasCaptain then
-            local piloted = isPilotedByPlayer(owner, params.name)
-
-            if not piloted and not playerInSector(ctx, x, y) then
-                Router.fail(422, "needs_captain",
-                            "'" .. params.name .. "' has no captain, and the game only "
-                            .. "accepts orders for a captainless ship while its owner is "
-                            .. "in the same sector.",
-                            {captain = false, sector = {x = x, y = y}})
-            end
-
-            for _, need in ipairs(needsCaptain) do
-                if need.rule == "unless_piloted" then
-                    if not piloted then
-                        Router.fail(422, "needs_captain",
-                                    "A '" .. need.name .. "' order changes sector, so the "
-                                    .. "game requires either a captain or a player aboard. "
-                                    .. "'" .. params.name .. "' has neither.",
-                                    {captain = false, order = need.name})
-                    end
-                else
-                    Router.fail(422, "needs_captain",
-                                "A '" .. need.name .. "' order is carried out by a captain, "
-                                .. "and '" .. params.name .. "' has none. Vanilla says: "
-                                .. "\"Your ship needs a captain for that!\"",
-                                {captain = false, order = need.name})
-                end
-            end
-        end
+        local x, y = Movement.requireOrderable(ctx, owner, params.name, needsCaptain)
 
         -- clear defaults to true: enqueueing onto whatever the ship was already doing is
         -- rarely what an external planner means, and vanilla's map UI clears too. A
@@ -435,13 +471,16 @@ function Movement.register(router)
 
                 -- Hold the answer open until the chain actually moves, so the caller is
                 -- told what happened rather than only that we asked.
-                pendingConfirms[#pendingConfirms + 1] =
+                local replaced = clear or oneShot
+
+                Movement.awaitConfirmation
                 {
                     owner = owner,
                     shipName = params.name,
-                    calls = calls,
-                    replaced = clear or oneShot,
-                    waited = 0,
+                    check = function(event)
+                        if chainMatches(event, calls, replaced) then return 200 end
+                        return nil
+                    end,
                     body = body,
                     complete = ctx.complete,
                 }
@@ -494,7 +533,32 @@ function Movement.register(router)
 
         owner = owner or Owner.resolve(ctx)
 
+        -- Any preference means this mod's own planner, since calculateJumpPath takes
+        -- none. It is sliced across ticks, so the answer is deferred.
+        local preferences = Routes.preferences(query)
+
         Routes.throttle(ctx.playerIndex)
+
+        if preferences then
+            RoutePlanner.run(
+            {
+                owner = owner,
+                from = {x = fromX, y = fromY},
+                to = {x = toX, y = toY},
+                range = jumpRange,
+                canPassRifts = canPassRifts,
+                preferGates = preferences.preferGates,
+                avoidRifts = preferences.avoidRifts,
+                preferUncontrolled = preferences.preferUncontrolled,
+            },
+            function(result)
+                ctx.complete(200, Routes.describePlan(result, fromX, fromY, toX, toY,
+                                                      jumpRange, canPassRifts, preferences))
+            end,
+            ctx.complete)
+
+            return Router.DEFERRED
+        end
 
         local route = Routes.calculate(owner, fromX, fromY, toX, toY,
                                        jumpRange, canPassRifts)
@@ -526,6 +590,7 @@ function Movement.register(router)
             distance = Serialize.number(described.distance, 0),
             jumpRange = Serialize.number(jumpRange, 0),
             canPassRifts = canPassRifts == true,
+            planner = "engine",
         }
     end)
 

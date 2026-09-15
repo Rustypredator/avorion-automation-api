@@ -10,20 +10,35 @@
 	# Nothing here needs the admin API, and it would otherwise listen on :2019.
 	admin off
 
-	# Only relevant if API_DOMAIN is a local name Caddy signs itself: do not try to
-	# install a CA certificate into the container's trust store.
+	# Caddy signs the self-signed site below with its own local CA, kept in the caddy_data
+	# volume. Do not try to install that CA into the container's trust store - the browser
+	# is the one that has to trust it, see docs/local-testing.md.
 	skip_install_trust
+
+	# Plain HTTP stays plain HTTP. Without this, every name in TLS_HOSTS would get a
+	# redirect to HTTPS on :80 - and the healthcheck and the poller call 127.0.0.1 and
+	# api over HTTP, which must keep answering rather than bounce.
+	auto_https disable_redirects
+
+	# Browsers send no SNI when the address is an IP, so Caddy cannot tell which of the
+	# TLS_HOSTS certificates to present - it would look for one matching the container's own
+	# address, and fail the handshake. The name set here is presented instead: set it to the
+	# LAN IP the console is opened by. Only one IP can be served this way.
+	default_sni {$TLS_DEFAULT_SNI:localhost}
 }
 
-# Set API_DOMAIN to a hostname that resolves here and Caddy provisions a certificate
-# for it automatically. Leave it unset and the API is served over plain HTTP on :80 -
-# fine on a private network or behind your own TLS, not on the open internet.
-{$API_DOMAIN::80} {
+# Everything the API serves, shared by the sites below.
+(api) {
 	root * /app/public
 
-	# Caddy logs no request headers, so the API key stays out of the access log. Keep
-	# it that way if you switch to a custom format.
-	log
+	# Caddy's access log records request headers. It redacts Authorization and cookies on
+	# its own, but not X-API-Key, which would put every key in `docker compose logs` - so
+	# that header is dropped from the log. Keep the filter if you change the format.
+	log {
+		format filter {
+			request>headers>X-Api-Key delete
+		}
+	}
 
 	encode zstd gzip
 
@@ -56,4 +71,29 @@
 		header Access-Control-Allow-Origin "{$CORS_ORIGIN:*}"
 		respond `{"error":{"code":"bridge_unavailable","message":"{err.status_code} {err.status_text}"}}` {err.status_code}
 	}
+}
+
+# Set API_DOMAIN to a hostname that resolves here and Caddy provisions a publicly trusted
+# certificate for it automatically. Leave it unset and the API is served over plain HTTP on
+# :80 - fine on a private network or behind your own TLS, not on the open internet.
+{$API_DOMAIN::80} {
+	import api
+}
+
+# HTTPS with a self-signed certificate, for the names and addresses in TLS_HOSTS.
+#
+# The console's browser notifications only work in a secure context: HTTPS, or a page on
+# localhost. Opening the console as http://192.168.x.y/console/ from another machine is
+# neither, so the browser offers no notifications at all. This site is that secure context
+# without a public domain. The certificate is signed by Caddy's local CA; browsers warn
+# until that CA is trusted, and clicking through the warning is not a dependable substitute
+# for features that want a secure context - so trust the CA, as docs/local-testing.md
+# describes.
+#
+# Every name a browser uses to reach the stack must be listed, separated by spaces, because
+# the certificate is issued for exactly those: "localhost 127.0.0.1 192.168.1.20 gamebox.lan".
+# (Caddy substitutes the variable inside one token, so a bare comma is refused.)
+https://{$TLS_HOSTS:localhost} {
+	tls internal
+	import api
 }

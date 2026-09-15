@@ -94,6 +94,11 @@ function ShipEvents.push(ownerIndex, shipName, kind, payload)
 
     local event = {kind = kind}
 
+    -- The automation state as the ship encoded it. Compared as text, since a change in it
+    -- is worth an event even when the chain itself did not move - a fight starting while
+    -- the ship waits out a jump cooldown, say.
+    local automationText
+
     if kind == "order" then
         event.chain = chainOf(payload)
         event.activeIndex = Serialize.number(payload.activeIndex, 0)
@@ -105,6 +110,14 @@ function ShipEvents.push(ownerIndex, shipName, kind, payload)
 
         -- The most useful single field for a planner: the chain emptied on its own.
         event.idle = event.finished or #event.chain == 0
+
+        if type(payload.automation) == "string" and payload.automation ~= "" then
+            local decoded, automation = pcall(Json.decode, payload.automation)
+            if decoded and type(automation) == "table" then
+                automationText = payload.automation
+                event.automation = automation
+            end
+        end
     else
         event.text = Serialize.string(payload.text)
         event.template = Serialize.string(payload.template)
@@ -112,7 +125,16 @@ function ShipEvents.push(ownerIndex, shipName, kind, payload)
     end
 
     local log = logFor(ownerIndex, shipName)
-    if sameAsLast(log, kind, event) then return false end
+
+    if sameAsLast(log, kind, event)
+       and (kind ~= "order" or automationText == nil or automationText == log.automationText) then
+        return false
+    end
+
+    if automationText then
+        log.automationText = automationText
+        log.automation = event.automation
+    end
 
     nextSeq = nextSeq + 1
     event.seq = nextSeq
@@ -179,6 +201,15 @@ function ShipEvents.latestOrder(ownerIndex, shipName)
     end
 
     return nil
+end
+
+-- The newest automation state the ship published, and the server runtime it arrived at.
+-- Kept apart from the ring buffer so a busy ship cannot push it out.
+function ShipEvents.latestAutomation(ownerIndex, shipName)
+    local log = logs[keyOf(ownerIndex, shipName)]
+    if not log or not log.automation then return nil end
+
+    return log.automation
 end
 
 -- The highest sequence number issued so far, so a caller can start watching from "now"
