@@ -866,34 +866,46 @@ const ready = window.document.readyState === 'loading'
     check(/auto · blocked/.test($('[data-ship="Wingman"]').textContent),
           'a craft with a rule is badged in the fleet list with what the loop is doing');
 
-    const autoStatus = () => $('#sv-mission [data-auto-status]');
-    check(/Not automated/.test(autoStatus().textContent), 'Ore Hound starts with no rule');
+    const summary = () => $('#sv-mission [data-auto-summary]');
+    check(/Not automated/.test(summary().textContent), 'Ore Hound starts with no rule');
+    check(!$('#sv-mission .auto-editor') && !$('#sv-mission [data-auto-status]'),
+          'the Mission tab keeps only a summary line of automation');
 
     click(planner.querySelector('[data-auto-act="new"]'));
-    await settle(50);
+    await settle(300);
 
-    const flightsField = planner.querySelector('[data-auto-limit="maxFlights"]');
+    const autoPane = $('#automation-pane');
+    const autoStatus = () => $('#automation-pane [data-auto-status]');
+    check($('#view-automation').classList.contains('active'),
+          'automating the planned mission opens the Automation tab');
+    check(autoPane.querySelector('.auto-editor') && /Ore Hound/.test(autoPane.querySelector('h1').textContent),
+          'with the new rule\'s editor for the selected craft');
+    check(autoPane.querySelector('[data-standing-orders]')
+          && /Standing orders/.test(autoPane.textContent),
+          'and its standing orders beside it');
+
+    const flightsField = autoPane.querySelector('[data-auto-limit="maxFlights"]');
     check(flightsField && flightsField.value === '3',
           'a new trade rule starts at the three flights a customer always waits for');
 
-    const ambush = planner.querySelector('[data-auto-limit="maxAttackChance"]');
+    const ambush = autoPane.querySelector('[data-auto-limit="maxAttackChance"]');
     ambush.value = '8';
     ambush.dispatchEvent(new window.Event('input', { bubbles: true }));
 
     posts.length = 0;
-    click(planner.querySelector('[data-auto-act="test"]'));
+    click(autoPane.querySelector('[data-auto-act="test"]'));
     await settle(400);
 
     const tested = posts.filter((p) => /automation\/evaluate$/.test(p.path)).pop();
     check(tested && tested.body.limits.maxAttackChance === 0.08 && tested.body.limits.maxFlights === 3,
           'testing sends the limits in the API\'s units');
-    const testRows = $$('#sv-mission .auto-editor ~ .card tbody tr');
+    const testRows = $$('#automation-pane .auto-editor ~ .card tbody tr');
     check(testRows.length === 2 && /chosen/.test(testRows[0].textContent)
           && /ambush chance 9% is above 8%/.test(testRows[1].textContent),
           'and shows each option with why it would or would not go');
 
     posts.length = 0;
-    click(planner.querySelector('[data-auto-act="save"]'));
+    click(autoPane.querySelector('[data-auto-act="save"]'));
     await settle(400);
 
     const saved = posts.filter((p) => p.path === '/ships/Ore%20Hound/mission/automation').pop();
@@ -904,10 +916,29 @@ const ready = window.document.readyState === 'loading'
           'without the planner\'s route and deposit, which the automation picks each time');
     check(saved && saved.body.escorts.indexOf('Wingman') !== -1 && saved.body.area.mode === 'ship',
           'with the planner\'s escorts, following the ship');
-    check(!planner.querySelector('.auto-editor'), 'the editor closes');
+    check(!autoPane.querySelector('.auto-editor'), 'the editor closes');
     check(/send out automatically/.test(autoStatus().textContent)
-          && planner.querySelector('[data-auto-toggle]').checked,
+          && autoPane.querySelector('[data-auto-toggle]').checked,
           'and the rule shows with its switch on');
+    check(/trade · waiting/.test(summary().textContent),
+          'the Mission tab\'s summary line follows it');
+
+    const autoRows = () => $$('#automation-rows [data-auto-ship]').map((row) => row.dataset.autoShip);
+    check(autoRows().includes('Ore Hound') && autoRows().includes('Wingman'),
+          'the Automation tab lists every craft with a rule');
+    check(!autoRows().includes('Far Scout') && !autoRows().includes('Rusty Refinery'),
+          'and leaves out ships with nothing automated, and stations');
+    check($('#automation-rows [data-auto-ship="Ore Hound"]').classList.contains('sel'),
+          'marking the selected one');
+    check(/standing · fight enemies, collect loot/.test($('#automation-rows [data-auto-ship="Ore Hound"]').textContent),
+          'with its standing orders');
+
+    click($('#automation-filter [data-v="all"]'));
+    await settle(50);
+    check(autoRows().includes('Far Scout') && !autoRows().includes('Rusty Refinery'),
+          'All ships lists the rest too, stations still aside');
+    click($('#automation-filter [data-v="automated"]'));
+    await settle(50);
     check(/auto · waiting/.test($('[data-ship="Ore Hound"]').textContent),
           'the fleet list picks it up at once');
 
@@ -915,7 +946,7 @@ const ready = window.document.readyState === 'loading'
     automationStore['player/Ore Hound'].rule.revision = 7;
 
     posts.length = 0;
-    const toggle = planner.querySelector('[data-auto-toggle]');
+    const toggle = autoPane.querySelector('[data-auto-toggle]');
     toggle.checked = false;
     toggle.dispatchEvent(new window.Event('change', { bubbles: true }));
     await settle(400);
@@ -927,8 +958,20 @@ const ready = window.document.readyState === 'loading'
           'a rule changed elsewhere is not overwritten');
 
     await settle(300);
-    check(planner.querySelector('[data-auto-toggle]').checked === true,
+    check(autoPane.querySelector('[data-auto-toggle]').checked === true,
           'and the console reloads it rather than showing the switch it failed to flip');
+
+    click($('#automation-rows [data-auto-ship="Wingman"]'));
+    await settle(400);
+    check(/Wingman/.test(autoPane.querySelector('h1').textContent) && autoStatus()
+          && /blocked/.test(autoStatus().textContent),
+          'picking another craft in the list shows its rule');
+    check($('#ship-name').textContent === 'Wingman', 'and selects it on the Fleet tab too');
+
+    $('[data-view="fleet"]').click();
+    await settle(50);
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
 
     console.log('\nexplanations behind a mark');
 

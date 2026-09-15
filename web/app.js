@@ -62,6 +62,7 @@
     autoSeen: {},       // ship name -> the last automation state seen, for notifications
     expectEnd: {},      // ship name -> true while a stop sent from here is on its way
     standingSaving: null, // ship name whose standing orders are being saved
+    autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
     recording: {},      // ship name -> boolean
     traffic: [],
 
@@ -1044,6 +1045,13 @@
     $$('.view').forEach(function (v) { v.classList.toggle('active', v.id === 'view-' + name); });
     if (name === 'map') { setTimeout(GalaxyMap.resize, 0); }
     if (name === 'galaxy') { renderGalaxy(); }
+    if (name === 'automation') {
+      renderAutomationView();
+      if (S.connected) {
+        loadAutomations(true);
+        if (S.selected) { loadAutomation(); }
+      }
+    }
     if (name === 'industry') {
       renderIndustry();
       if (S.connected) { loadIndustry(true); }
@@ -1118,6 +1126,7 @@
 
         S.fleetCount = body.count;
         renderFleet();
+        renderAutomationList();
         sweepCargo();
         GalaxyMap.setShips(S.ships);
 
@@ -1371,6 +1380,7 @@
     if (!name) {
       $('#ship-detail').classList.add('hidden');
       $('#ship-empty').classList.remove('hidden');
+      renderAutomationView();
       return;
     }
 
@@ -1397,7 +1407,8 @@
     loadStation();
     renderOrders();
     renderTravel();
-    if (S.sub === 'travel' || S.sub === 'orders') { loadAutomation(); }
+    if (S.sub === 'travel' || S.sub === 'orders' || S.view === 'automation') { loadAutomation(); }
+    renderAutomationView();
     renderShipLog();
 
     if (changed && S.history.selectedOnly && historyWanted()) { loadHistory(true); }
@@ -2036,7 +2047,7 @@
     var out = [];
 
     out.push(renderMissionStatus());
-    out.push(renderAutomation());
+    out.push(renderMissionAutomationSummary());
     out.push(renderMissionPlanner());
 
     $('#sv-mission').innerHTML = out.join('');
@@ -3028,15 +3039,166 @@
 
   /* The poll only ever redraws the status half: the editor below it may have focus. */
   function refreshAutomationStatus() {
-    var node = $('#sv-mission [data-auto-status]');
+    var node = $('#automation-pane [data-auto-status]');
     if (node && S.selected) { node.innerHTML = renderAutomationStatus(); }
+    var summary = $('#sv-mission [data-auto-summary]');
+    if (summary && S.selected) { summary.innerHTML = missionAutomationSummary(); }
+    renderAutomationList();
   }
 
   function renderAutomation() {
-    return '<div class="section auto-section"><h2>Automation ' + explain('auto-overview') + '</h2>'
+    return '<div class="section auto-section"><h2>Mission automation ' + explain('auto-overview') + '</h2>'
       + '<div data-auto-status>' + renderAutomationStatus() + '</div>'
       + '<div data-auto-editor>' + renderAutomationEditor() + '</div>'
       + '</div>';
+  }
+
+  /* What the Mission tab keeps of automation: a line saying whether this craft has a rule,
+     and the way into the editor. A new rule is still started from here, since it is made
+     of what the planner below holds. */
+  function renderMissionAutomationSummary() {
+    return '<div class="section auto-section"><h2>Automation ' + explain('auto-overview') + '</h2>'
+      + '<div class="row" data-auto-summary>' + missionAutomationSummary() + '</div></div>';
+  }
+
+  function missionAutomationSummary() {
+    if (!S.automations.loaded) { return '<span class="muted">loading…</span>'; }
+
+    var entry = automationFor(S.selected);
+    if (entry && entry.rule) {
+      var st = entry.state || {};
+      var phase = entry.rule.enabled
+        ? AUTO_PHASES[st.phase] || { tone: 'info', label: st.phase || 'unknown' }
+        : { tone: '', label: 'off' };
+      return '<span class="badge ' + phase.tone + '">' + esc(entry.rule.mission) + ' · ' + esc(phase.label) + '</span>'
+        + '<span class="auto-message">' + esc(entry.rule.enabled ? st.message || '' : 'Automation is switched off for this craft.') + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-auto-act="open">Open in Automation</button>';
+    }
+
+    return '<span class="note">Not automated. Set a mission up below, then let the mod keep '
+      + 'sending ' + esc(S.selected) + ' out on it whenever it is free.</span>'
+      + '<span class="spacer"></span>'
+      + '<button data-auto-act="new"' + (S.missionForm ? '' : ' disabled') + '>Automate '
+      + esc(S.missionForm ? S.missionForm.mission : 'a mission') + '…</button>';
+  }
+
+  /* ============================= AUTOMATION TAB =============================
+   *
+   * Everything a craft does by itself, in one place: the mission automation rule the
+   * galaxy bridge runs, and the standing orders the ship runs. It shares the Fleet tab's
+   * selection, so picking a craft on either picks it on both.
+   */
+
+  /* The ship's own automation as last seen: the event feed has it for every craft it
+     sweeps, and the selected craft's read may be fresher still. */
+  function shipAutomation(name) {
+    if (S.selected === name && S.nav.automation && S.nav.automation.automation) {
+      return S.nav.automation.automation;
+    }
+    return S.autoSeen[name] || null;
+  }
+
+  function standingOn(automation) {
+    var standing = automation && automation.standing;
+    if (!standing) { return automation && automation.autoAggressive ? ['enemies'] : []; }
+    return STANDING.filter(function (spec) {
+      return standing[spec.key] && standing[spec.key].enabled;
+    }).map(function (spec) { return spec.key; });
+  }
+
+  function isAutomated(ship) {
+    var entry = automationFor(ship.name);
+    if (entry && entry.rule) { return true; }
+    var automation = shipAutomation(ship.name);
+    return !!(automation && (automation.plan || automation.reaction || standingOn(automation).length));
+  }
+
+  function shipAutomationBadges(ship) {
+    var automation = shipAutomation(ship.name);
+    var out = [automationBadge(ship)];
+    if (!automation) { return out.join(''); }
+
+    if (automation.plan) {
+      out.push('<span class="badge ' + (PHASE_TONE[automation.plan.phase] || 'info') + '">'
+        + esc(automation.plan.kind) + ' · ' + esc(automation.plan.phase) + '</span>');
+    }
+    if (automation.reaction) {
+      out.push('<span class="badge ' + ((REACTION_PHASES[automation.reaction.phase] || [])[0] || 'info') + '">'
+        + esc(automation.reaction.kind) + ' · ' + esc(automation.reaction.phase) + '</span>');
+    }
+    var on = standingOn(automation);
+    if (on.length) {
+      out.push('<span class="badge" title="standing orders">standing · ' + esc(on.map(function (key) {
+        return standingLabel(key).toLowerCase();
+      }).join(', ')) + '</span>');
+    }
+    return out.join('');
+  }
+
+  function renderAutomationList() {
+    var rows = $('#automation-rows');
+    if (!rows) { return; }
+
+    var ships = S.ships.filter(function (ship) { return !isStation(ship); });
+    var automated = ships.filter(isAutomated);
+    var shown = S.autoFilter === 'all' ? ships : automated;
+
+    $('#automation-count').textContent = numText(automated.length) + ' of ' + numText(ships.length) + ' ships automated';
+
+    rows.innerHTML = shown.map(function (ship) {
+      var entry = automationFor(ship.name);
+      var automation = shipAutomation(ship.name);
+      var sub = [];
+      if (entry && entry.rule) { sub.push(esc(entry.rule.mission) + ': ' + esc((entry.state || {}).message || '')); }
+      if (automation && automation.plan && automation.plan.target) { sub.push('heading for ' + esc(coords(automation.plan.target))); }
+      if (!sub.length) { sub.push(esc(coords(ship.position))); }
+
+      return '<div class="ship-row' + (ship.name === S.selected ? ' sel' : '') + '" data-auto-ship="' + esc(ship.name) + '">'
+        + '<div class="n">' + esc(ship.name) + '</div>'
+        + '<div class="badges">' + (isAutomated(ship) ? shipAutomationBadges(ship) : '<span class="badge">manual</span>') + '</div>'
+        + '<div class="s">' + sub.join(' · ') + '</div>'
+        + '</div>';
+    }).join('')
+      || '<div class="empty muted">' + (S.connected
+        ? (S.autoFilter === 'all' ? 'No ships listed. The Fleet tab\'s owner filter applies here too.'
+          : 'No ship is automated yet. Pick one under All ships.')
+        : 'Connect first.') + '</div>';
+  }
+
+  function renderAutomationPane() {
+    var pane = $('#automation-pane');
+    if (!pane) { return; }
+
+    var name = S.selected;
+    var ship = name && S.byName[name];
+
+    if (!name) {
+      pane.innerHTML = '<div class="empty muted">Select a ship.</div>';
+      return;
+    }
+    if (isStation(ship)) {
+      pane.innerHTML = '<div class="empty muted">' + esc(name) + ' is a station, which has no automation to set here.</div>';
+      return;
+    }
+
+    pane.innerHTML = '<div class="ship-head" style="padding:0 0 10px">'
+      + '<div><h1>' + esc(name) + '</h1><div class="muted">'
+      + esc(ship ? coords(ship.position) + (ship.owner && ship.owner.kind === 'alliance' ? ' · alliance craft' : '') : '')
+      + '</div></div>'
+      + '<div class="badges">' + (ship ? availabilityBadge(ship) : '') + '</div>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-act="open-fleet">open in Fleet</button>'
+      + '</div>'
+      + renderAutomation()
+      + '<div data-standing-orders></div>';
+
+    renderStanding();
+  }
+
+  function renderAutomationView() {
+    renderAutomationList();
+    renderAutomationPane();
   }
 
   function limitsText(rule) {
@@ -3079,10 +3241,12 @@
     if (!entry || !entry.rule) {
       if (S.autoForm && S.autoForm.ship === name) { return ''; }
       return '<div class="row">'
-        + '<span class="note">Not automated. Set a mission up below, then let the mod keep '
-        + 'sending ' + esc(name) + ' out on it whenever it is free.</span>'
-        + '<button data-auto-act="new"' + (S.missionForm ? '' : ' disabled') + '>Automate '
-        + esc(S.missionForm ? S.missionForm.mission : 'a mission') + '…</button>'
+        + '<span class="note">Not automated. A rule flies the mission, area, config, materials '
+        + 'and escorts set up in the mission planner, so start there.</span>'
+        + (S.missionForm
+          ? '<button data-auto-act="new">Automate ' + esc(S.missionForm.mission) + '…</button>'
+          : '')
+        + '<button class="ghost" data-auto-act="planner">Open the mission planner</button>'
         + '</div>';
     }
 
@@ -3281,7 +3445,7 @@
       existing: !!rule,
       dry: null
     };
-    renderMission();
+    redrawAutomation();
   }
 
   function autoBody(form) {
@@ -3383,7 +3547,7 @@
     toast('warn', 'Rule changed elsewhere',
           'Someone else saved this rule since it was loaded. It has been reloaded; apply your change again.');
     S.autoForm = null;
-    loadAutomations(true).then(renderMission);
+    loadAutomations(true).then(redrawAutomation);
     return true;
   }
 
@@ -3402,7 +3566,7 @@
         storeAutomation(result);
         S.autoForm = null;
         toast('good', 'Automation saved', name + ': ' + (result.rule.enabled ? 'the mod checks it on its next pass.' : 'switched off.'));
-        renderMission();
+        redrawAutomation();
       })
       .catch(function (error) {
         if (autoConflict(error)) { return; }
@@ -3419,7 +3583,7 @@
     var holder = { ship: name, running: true };
 
     if (stored) { S.autoDry = holder; } else { form.dry = holder; }
-    renderMission();
+    redrawAutomation();
 
     return guard(button, Api.post(autoPath(name, '/evaluate'), body, { owner: ownerParamFor(name) },
                                   { priority: Api.P.USER, label: 'test automation' }))
@@ -3427,12 +3591,12 @@
         holder.running = false;
         holder.evaluation = result.evaluation;
         holder.assessment = result.assessment;
-        if (S.selected === name) { renderMission(); }
+        if (S.selected === name) { redrawAutomation(); }
       })
       .catch(function (error) {
         holder.running = false;
         holder.error = error;
-        if (S.selected === name) { renderMission(); }
+        if (S.selected === name) { redrawAutomation(); }
       });
   }
 
@@ -3470,15 +3634,23 @@
         S.autoForm = null;
         S.autoDry = null;
         toast('good', 'Automation removed', name);
-        renderMission();
+        redrawAutomation();
       })
       .catch(function (error) { apiFailed(error, 'Could not remove the rule'); });
   }
 
+  /* The editor lives on the Automation tab; the Mission tab only shows a summary line. */
+  function redrawAutomation() {
+    renderAutomationPane();
+    refreshAutomationStatus();
+  }
+
   function automationAction(act, button) {
-    if (act === 'new') { openAutoEditor(null); }
+    if (act === 'new') { openAutoEditor(null); showView('automation'); }
+    else if (act === 'open') { showView('automation'); }
+    else if (act === 'planner') { showView('fleet'); showSub('mission'); }
     else if (act === 'edit') { openAutoEditor(automationFor(S.selected)); }
-    else if (act === 'cancel') { S.autoForm = null; renderMission(); }
+    else if (act === 'cancel') { S.autoForm = null; redrawAutomation(); }
     else if (act === 'save') { saveAutomation(button); }
     else if (act === 'test') { testAutomation(button, false); }
     else if (act === 'check') { testAutomation(button, true); }
@@ -3489,7 +3661,7 @@
       if (source.mission === 'trade' && S.autoForm.limits.maxFlights == null) { S.autoForm.limits.maxFlights = 3; }
       S.autoForm.source = source;
       S.autoForm.dry = null;
-      renderMission();
+      redrawAutomation();
     }
   }
 
@@ -3563,7 +3735,7 @@
 
     out.push('<div id="order-result"></div>');
 
-    out.push('<div id="standing-orders"></div>');
+    out.push('<div id="standing-orders" data-standing-orders></div>');
 
     $('#sv-orders').innerHTML = out.join('');
     renderStanding();
@@ -3598,27 +3770,31 @@
     stopped: 'stopped'
   };
 
+  function paintStanding(nodes, html) {
+    nodes.forEach(function (node) { node.innerHTML = html; });
+  }
+
   function renderStanding() {
-    var node = $('#standing-orders');
-    if (!node || !S.selected) { return; }
+    var nodes = $$('[data-standing-orders]');
+    if (!nodes.length || !S.selected) { return; }
 
     var nav = S.nav;
     var head = '<div class="section"><h2>Standing orders ' + explain('standing-orders') + '</h2>';
 
     if (nav.automationError) {
-      node.innerHTML = head + errorBox('Could not read the standing orders', nav.automationError) + '</div>';
+      paintStanding(nodes, head + errorBox('Could not read the standing orders', nav.automationError) + '</div>');
       return;
     }
-    if (!nav.automation) { node.innerHTML = head + '<p class="muted">loading…</p></div>'; return; }
+    if (!nav.automation) { paintStanding(nodes, head + '<p class="muted">loading…</p></div>'); return; }
 
     var a = nav.automation.automation || {};
     if (!nav.automation.reported || !a.standing) {
-      node.innerHTML = head + '<div class="note">'
+      paintStanding(nodes, head + '<div class="note">'
         + (nav.automation.reported
           ? 'This ship runs a mod version without standing orders.'
           : 'This ship has not reported its settings yet. It does once its sector is loaded '
             + 'with this version of the mod.')
-        + '</div></div>';
+        + '</div></div>');
       return;
     }
 
@@ -3667,7 +3843,7 @@
         + (last.resumed ? ' · chain resumed' : ''));
     }
 
-    node.innerHTML = head + rows + civilians
+    paintStanding(nodes, head + rows + civilians
       + (badges.length || stats.length
         ? '<div class="row" style="margin-top:8px">' + badges.join('')
           + '<span class="spacer"></span>'
@@ -3675,7 +3851,7 @@
           + '</div>'
           + (stats.length ? '<div class="mute2" style="margin-top:4px">' + stats.join(' · ') + '</div>' : '')
         : '')
-      + '</div>';
+      + '</div>');
   }
 
   function saveStanding(body, label) {
@@ -3704,6 +3880,38 @@
 
   function standingLabel(key) {
     return (STANDING.filter(function (spec) { return spec.key === key; })[0] || {}).label || key;
+  }
+
+  /* The section is drawn on the Orders tab and the Automation tab alike, so both hand their
+     clicks and changes here first. Each answers whether it was a standing-order control. */
+  function standingClick(button) {
+    if (button.dataset.standingMode) {
+      if (!button.classList.contains('on')) {
+        var key = button.dataset.standingKey;
+        var patch = {};
+        patch[key] = { mode: button.dataset.standingMode };
+        saveStanding({ standing: patch }, standingLabel(key) + ': '
+          + (button.dataset.standingMode === 'interrupt' ? 'interrupts' : 'only when idle'));
+      }
+      return true;
+    }
+    if (button.dataset.act === 'standing-stop') { stopAutomation(button); return true; }
+    return false;
+  }
+
+  function standingChange(node) {
+    if (node.dataset.standingOn !== undefined) {
+      var patch = {};
+      patch[node.dataset.standingOn] = { enabled: node.checked };
+      saveStanding({ standing: patch }, standingLabel(node.dataset.standingOn) + (node.checked ? ' on' : ' off'));
+      return true;
+    }
+    if (node.dataset.standingCiv !== undefined) {
+      saveStanding({ attackCivilians: node.checked },
+                   node.checked ? 'Civilians count as enemies' : 'Civilians left alone');
+      return true;
+    }
+    return false;
   }
 
   function dispatchOrders(button) {
@@ -4285,13 +4493,14 @@
         S.nav.automation = body;
         S.nav.automationError = null;
         if (S.sub === 'travel') { renderTravel(); }
-        if (S.sub === 'orders') { renderStanding(); }
+        renderStanding();
+        renderAutomationList();
       })
       .catch(function (error) {
         if (error.code === 'cancelled' || S.selected !== name) { return; }
         S.nav.automationError = error;
         if (S.sub === 'travel') { renderTravel(); }
-        if (S.sub === 'orders') { renderStanding(); }
+        renderStanding();
       });
   }
 
@@ -4333,6 +4542,8 @@
     return Promise.all(work).then(function () {
       renderRecordingNote();
       renderFleet();
+      // every craft's automation state rides on its events, so the list follows the sweep
+      renderAutomationList();
       if (S.sub === 'log') { renderShipLog(); }
     });
   }
@@ -4383,7 +4594,7 @@
         S.nav.automation = { ship: name, source: 'live', reported: true,
                              automation: event.automation, receivedAt: arrived - offset * 1000 };
         if (S.sub === 'travel') { renderTravel(); }
-        if (S.sub === 'orders') { renderStanding(); }
+        renderStanding();
       }
 
       if (event.seq > (S.cursors[name] || -1)) { S.cursors[name] = event.seq; }
@@ -6750,18 +6961,6 @@
       if (!button) { return; }
 
       if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
-      if (button.dataset.autoArea && S.autoForm) {
-        S.autoForm.areaMode = button.dataset.autoArea;
-        S.autoForm.dry = null;
-        renderMission();
-        return;
-      }
-      if (button.dataset.autoObjective && S.autoForm) {
-        S.autoForm.objective = button.dataset.autoObjective;
-        S.autoForm.dry = null;
-        renderMission();
-        return;
-      }
 
       if (button.dataset.mission) { pickMission(button.dataset.mission); return; }
       if (button.dataset.size) { S.missionForm.sizeIndex = Number(button.dataset.size); renderMission(); return; }
@@ -6831,22 +7030,61 @@
       }
     });
 
-    $('#sv-mission').addEventListener('change', function (e) {
+    /* --- automation tab ----------------------------------------------- */
+    bindSeg('#automation-filter', function (value) { S.autoFilter = value; renderAutomationList(); });
+
+    $('#automation-refresh').addEventListener('click', function () {
+      loadAutomations(true);
+      refreshFleet(true);
+      if (S.selected) { loadAutomation(); }
+    });
+
+    $('#automation-rows').addEventListener('click', function (e) {
+      var row = e.target.closest('[data-auto-ship]');
+      if (row) { select(row.dataset.autoShip); }
+    });
+
+    $('#automation-pane').addEventListener('click', function (e) {
+      var button = e.target.closest('button');
+      if (!button) { return; }
+
+      if (standingClick(button)) { return; }
+      if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
+      if (button.dataset.autoArea && S.autoForm) {
+        S.autoForm.areaMode = button.dataset.autoArea;
+        S.autoForm.dry = null;
+        redrawAutomation();
+        return;
+      }
+      if (button.dataset.autoObjective && S.autoForm) {
+        S.autoForm.objective = button.dataset.autoObjective;
+        S.autoForm.dry = null;
+        redrawAutomation();
+        return;
+      }
+      if (button.dataset.act === 'open-fleet') { showView('fleet'); }
+    });
+
+    $('#automation-pane').addEventListener('change', function (e) {
       var node = e.target;
+      if (standingChange(node)) { return; }
       if (node.dataset.autoToggle !== undefined) { toggleAutomation(node); }
       else if (node.dataset.autoCollect !== undefined && S.autoForm) {
         S.autoForm.collectYields = node.checked;
       }
     });
 
-    $('#sv-mission').addEventListener('input', function (e) {
+    $('#automation-pane').addEventListener('input', function (e) {
       var node = e.target;
 
       // Kept on the form as typed and never redrawn from here, so the field keeps focus.
       if (node.dataset.autoLimit && S.autoForm) {
         S.autoForm.limits[node.dataset.autoLimit] = node.value === '' ? null : Number(node.value);
-        return;
       }
+    });
+
+    $('#sv-mission').addEventListener('input', function (e) {
+      var node = e.target;
 
       var form = S.missionForm;
       if (!form) { return; }
@@ -6897,20 +7135,10 @@
         return;
       }
 
-      if (button.dataset.standingMode) {
-        if (button.classList.contains('on')) { return; }
-        var key = button.dataset.standingKey;
-        var patch = {};
-        patch[key] = { mode: button.dataset.standingMode };
-        saveStanding({ standing: patch }, standingLabel(key) + ': '
-          + (button.dataset.standingMode === 'interrupt' ? 'interrupts' : 'only when idle'));
-        return;
-      }
+      if (standingClick(button)) { return; }
 
       var act = button.dataset.act;
       var i = Number(button.dataset.i);
-
-      if (act === 'standing-stop') { stopAutomation(button); return; }
 
       if (act === 'row-add') { S.orderRows.push({ type: 'patrol' }); renderOrders(); }
       else if (act === 'row-del') { S.orderRows.splice(i, 1); renderOrders(); }
@@ -6925,17 +7153,7 @@
       var node = e.target;
       var i;
 
-      if (node.dataset.standingOn !== undefined) {
-        var patch = {};
-        patch[node.dataset.standingOn] = { enabled: node.checked };
-        saveStanding({ standing: patch }, standingLabel(node.dataset.standingOn) + (node.checked ? ' on' : ' off'));
-        return;
-      }
-      if (node.dataset.standingCiv !== undefined) {
-        saveStanding({ attackCivilians: node.checked },
-                     node.checked ? 'Civilians count as enemies' : 'Civilians left alone');
-        return;
-      }
+      if (standingChange(node)) { return; }
 
       if (node.dataset.rowType !== undefined) {
         i = Number(node.dataset.rowType);

@@ -443,6 +443,19 @@ marker#pa-warn path { fill: #5c4c1e; }
 .chain-legend .lg.good { background: #12261e; border-color: #2a5a44; }
 .chain-legend .lg.warn { background: #262013; border-color: #5c4c1e; }
 
+/* ------------------------------ automation ------------------------------- */
+
+/* The fleet layout: automated craft down the side, the selected one's automation beside. */
+#view-automation { grid-template-columns: 300px 1fr; }
+#automation-list { border-right: 1px solid var(--line); display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--bg-2); }
+#automation-pane { overflow: auto; min-height: 0; padding: 14px 16px; }
+#automation-pane .ship-head { margin-bottom: 12px; }
+
+@media (max-width: 900px) {
+  #view-automation { grid-template-columns: 1fr; grid-template-rows: 200px 1fr; }
+  #automation-list { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+
 /* ------------------------------- industry -------------------------------- */
 
 /* The fleet layout again: sectors down the side, the one being drawn beside them. */

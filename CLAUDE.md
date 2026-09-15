@@ -85,8 +85,8 @@ docker/                         deployment only, NOT shipped to Workshop
 web/                            browser console, no build step, no deps, NOT shipped
   index.html, app.css
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
-  app.js      the whole console UI (~6.7k lines: fleet, missions, automation, economy,
-              industry, orders)
+  app.js      the whole console UI (~7.4k lines: fleet, missions, orders + standing orders,
+              Automation tab (mission rules + standing orders per craft), economy, industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/
   mock_avorion.lua   hostile mock of the sandbox (Mock.install/reset/addPlayer/addAlliance/
