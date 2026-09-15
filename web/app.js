@@ -2094,6 +2094,8 @@
       if (!Object.prototype.hasOwnProperty.call(entry.configurable, field)) { continue; }
       config[field] = entry.configurable[field]['default'];
     }
+    var lists = LIST_MISSIONS[key] ? LIST_MISSIONS[key]() : {};
+    for (var list in lists) { config[list] = lists[list]; }
 
     S.missionForm = {
       mission: key,
@@ -2134,9 +2136,10 @@
       escorts: form.escorts
     };
 
-    for (var field in form.config) {
-      if (!Object.prototype.hasOwnProperty.call(form.config, field)) { continue; }
-      var value = form.config[field];
+    var config = LIST_MISSIONS[form.mission] ? finishedLists(form.config) : form.config;
+    for (var field in config) {
+      if (!Object.prototype.hasOwnProperty.call(config, field)) { continue; }
+      var value = config[field];
       if (value !== null && value !== undefined && value !== '') { body.config[field] = value; }
     }
 
@@ -2351,6 +2354,8 @@
       });
       left.push('</div>');
     }
+
+    if (LIST_MISSIONS[form.mission]) { left.push(renderListConfig(form)); }
 
     /* --- materials ---------------------------------------------------- */
     if (entry.materials) {
@@ -2762,6 +2767,297 @@
       + '</div>';
   }
 
+  /* --- list-shaped mission configs -----------------------------------------
+     Procure, sell, supply and maintenance take lists the catalog cannot describe (the
+     game's own configurable values for them are placeholders). The choices come from the
+     last preview's `options`; before one has run, names can still be typed. */
+  var LIST_MISSIONS = {
+    procure: function () { return { goods: [] }; },
+    sell: function () { return { goods: [] }; },
+    supply: function () { return { routes: [] }; },
+    maintenance: function () { return { crew: 'none', torpedoes: [], fighters: [] }; }
+  };
+
+  var RARITIES = [
+    { id: 0, name: 'Common' }, { id: 1, name: 'Uncommon' },
+    { id: 2, name: 'Rare' }, { id: 3, name: 'Exceptional' }
+  ];
+
+  function listItemText(v) {
+    if (!v || typeof v !== 'object') { return String(v); }
+    if (v.from !== undefined) { return v.from + ' → ' + v.to; }
+    if (v.warheadName !== undefined || v.warhead !== undefined) {
+      return (v.warheadName || v.warhead) + ' ' + (v.rarityName || '') + ' ' + v.percentage + '%';
+    }
+    if (v.squad !== undefined) {
+      return 'squad ' + v.squad + ': ' + v.amount + '× ' + (v.weaponTypeName || v.weaponType);
+    }
+    return (v.amount != null ? v.amount + '× ' : '') + (v.name || JSON.stringify(v))
+      + (v.stolen ? ' (stolen)' : '');
+  }
+
+  /* Only rows that say something are sent: a half-filled line would be refused whole. */
+  function finishedLists(config) {
+    var out = {};
+    Object.keys(config).forEach(function (k) { out[k] = config[k]; });
+
+    if (Array.isArray(config.goods)) {
+      out.goods = config.goods.filter(function (g) { return g.name; }).map(function (g) {
+        return { name: g.name, amount: g.amount == null ? 0 : g.amount, stolen: !!g.stolen };
+      });
+    }
+    if (Array.isArray(config.routes)) {
+      out.routes = config.routes.filter(function (r) { return r.from && r.to; }).map(function (r) {
+        var route = { from: r.from, to: r.to };
+        if (r.goods && r.goods.length) { route.goods = r.goods; }
+        return route;
+      });
+    }
+    if (Array.isArray(config.torpedoes)) {
+      out.torpedoes = config.torpedoes.filter(function (t) {
+        return t.warhead !== '' && t.warhead != null;
+      });
+    }
+    if (Array.isArray(config.fighters)) {
+      out.fighters = config.fighters.filter(function (f) {
+        return f.squad != null && f.weaponType !== '' && f.weaponType != null;
+      });
+    }
+    return out;
+  }
+
+  function listOptions(form) {
+    return (form.preview && form.preview.mission === form.mission && form.preview.options) || null;
+  }
+
+  function listSelect(path, value, choices, attrs) {
+    return '<select data-list="' + path + '"' + (attrs || '') + '>'
+      + choices.map(function (c) {
+          return '<option value="' + esc(c.id) + '"' + (String(c.id) === String(value) ? ' selected' : '')
+            + '>' + esc(c.name) + '</option>';
+        }).join('')
+      + '</select>';
+  }
+
+  function listRemove(path) {
+    return '<button class="ghost small" data-list-remove="' + path + '" title="Remove this line">✕</button>';
+  }
+
+  function renderListConfig(form) {
+    var opts = listOptions(form);
+    var c = form.config;
+    var note = opts
+      ? (opts.error ? '<div class="note warn">' + esc(opts.error) + '</div>' : '')
+      : '<div class="mute2" style="margin-bottom:6px">Preview once to load the choices '
+        + 'for this ship and area.</div>';
+
+    if (form.mission === 'procure' || form.mission === 'sell') {
+      return renderGoodsList(form, opts, note);
+    }
+    if (form.mission === 'supply') { return renderSupplyList(form, opts, note); }
+    return renderMaintenanceList(form, opts, note, c);
+  }
+
+  function renderGoodsList(form, opts, note) {
+    var selling = form.mission === 'sell';
+    var rows = form.config.goods;
+    var max = selling ? Infinity : ((opts && opts.maxGoods) || 5);
+    var stolenAllowed = selling || !!(opts && opts.stolenAllowed);
+
+    var known = opts ? (selling ? opts.cargo : opts.goods) || [] : [];
+    var datalist = '<datalist id="mission-list-goods">' + known.map(function (g) {
+      var label = selling
+        ? num(g.amount) + ' aboard' + (g.stolen ? ', stolen' : '') + (g.sellable ? '' : ' — not sellable here')
+        : ({ area: 'sold in the area', elsewhere: 'not sold here, double price',
+             stolen: 'only illegally, stolen' })[g.availability] || '';
+      return '<option value="' + esc(g.name) + '" label="' + esc(label) + '">';
+    }).join('') + '</datalist>';
+
+    var lines = rows.map(function (g, i) {
+      return '<div class="row tight" style="margin:5px 0">'
+        + '<input data-list="goods.' + i + '.name" list="mission-list-goods" value="' + esc(g.name)
+        + '" placeholder="good" style="flex:1;min-width:120px">'
+        + '<input type="number" min="0" step="1" data-list="goods.' + i + '.amount" value="'
+        + esc(g.amount == null ? '' : g.amount) + '" placeholder="amount" style="width:92px">'
+        + (stolenAllowed || g.stolen
+            ? '<label class="check"><input type="checkbox" data-list="goods.' + i + '.stolen"'
+              + (g.stolen ? ' checked' : '') + '><span>stolen</span></label>'
+            : '')
+        + listRemove('goods.' + i)
+        + '</div>';
+    }).join('');
+
+    var sellable = selling && opts ? (opts.cargo || []).filter(function (g) { return g.sellable; }) : [];
+
+    return '<div class="card"><h3>' + (selling ? 'Goods to sell' : 'Goods to procure') + '</h3>'
+      + note + datalist
+      + (lines || '<div class="mute2">No goods yet.</div>')
+      + '<div class="row tight" style="margin-top:6px">'
+      + '<button class="ghost small" data-list-add="goods"' + (rows.length >= max ? ' disabled' : '')
+      + '>+ add good</button>'
+      + (sellable.length
+          ? '<button class="ghost small" data-act="sell-all">add all ' + sellable.length + ' sellable</button>'
+          : '')
+      + (isFinite(max) ? '<span class="mute2">up to ' + max + '</span>' : '')
+      + '</div></div>';
+  }
+
+  function renderSupplyList(form, opts, note) {
+    var rows = form.config.routes;
+    var stations = (opts && opts.stations) || [];
+    var byName = {};
+    stations.forEach(function (s) { byName[s.name] = s; });
+
+    var fromList = '<datalist id="mission-list-stations">' + stations.map(function (s) {
+      return '<option value="' + esc(s.name) + '" label="' + esc(s.title || '') + '">';
+    }).join('') + '</datalist>';
+
+    var lines = rows.map(function (r, i) {
+      var from = byName[r.from];
+      var deliveries = from ? from.deliveries : [];
+      var delivery = deliveries.filter(function (d) { return d.to === r.to; })[0];
+      var toId = 'mission-list-to-' + i;
+
+      return '<div style="margin:7px 0">'
+        + '<div class="row tight">'
+        + '<input data-list="routes.' + i + '.from" data-list-redraw list="mission-list-stations" value="'
+        + esc(r.from) + '" placeholder="load at station" style="flex:1;min-width:110px">'
+        + '<span class="mute2">→</span>'
+        + '<datalist id="' + toId + '">' + deliveries.map(function (d) {
+            return '<option value="' + esc(d.to) + '" label="' + esc(d.goods.join(', ')
+              + (d.blocked ? ' — beyond the rift' : '')) + '">';
+          }).join('') + '</datalist>'
+        + '<input data-list="routes.' + i + '.to" data-list-redraw list="' + toId + '" value="'
+        + esc(r.to) + '" placeholder="deliver to station" style="flex:1;min-width:110px">'
+        + listRemove('routes.' + i)
+        + '</div>'
+        + '<div class="row tight" style="margin-top:3px">'
+        + '<input data-list="routes.' + i + '.goods" value="' + esc((r.goods || []).join(', '))
+        + '" placeholder="goods (all by default), comma separated" style="flex:1">'
+        + '</div>'
+        + (delivery
+            ? '<div class="mute2" style="font-size:11px">trades ' + esc(delivery.goods.join(', '))
+              + (delivery.blocked ? ' <span class="badge warn">beyond the rift</span>' : '') + '</div>'
+            : (from && r.to ? '<div class="note warn">' + esc(r.to) + ' buys nothing '
+                + esc(r.from) + ' sells.</div>' : ''))
+        + '</div>';
+    }).join('');
+
+    var max = (opts && opts.maxRoutes) || 5;
+    return '<div class="card"><h3>Supply routes</h3>' + note + fromList
+      + (lines || '<div class="mute2">No routes yet. A route loads at one of your stations and '
+        + 'delivers to another.</div>')
+      + '<div class="row tight" style="margin-top:6px">'
+      + '<button class="ghost small" data-list-add="routes"' + (rows.length >= max ? ' disabled' : '')
+      + '>+ add route</button><span class="mute2">up to ' + max + '</span></div></div>';
+  }
+
+  function renderMaintenanceList(form, opts, note, c) {
+    var warheads = (opts && opts.warheads) || [];
+    var squads = (opts && opts.squads) || [];
+
+    var crew = '<div class="row" style="justify-content:space-between;margin:5px 0">'
+      + '<span class="mute2">hire crew</span>'
+      + listSelect('crew', c.crew, [
+          { id: 'none', name: 'No crew hiring' }, { id: 'required', name: 'Required crew' },
+          { id: 'maximum', name: 'Maximum crew' }])
+      + '</div>';
+
+    var torpedoes = c.torpedoes.map(function (t, i) {
+      var path = 'torpedoes.' + i;
+      return '<div class="row tight" style="margin:5px 0">'
+        + (warheads.length
+            ? listSelect(path + '.warhead', t.warhead, warheads)
+            : '<input data-list="' + path + '.warhead" value="' + esc(t.warhead) + '" placeholder="warhead" style="width:100px">')
+        + listSelect(path + '.rarity', t.rarity, RARITIES)
+        + '<input type="number" min="0" max="100" step="1" data-list="' + path + '.percentage" value="'
+        + esc(t.percentage) + '" style="width:70px"><span class="mute2">% of free space</span>'
+        + listRemove(path)
+        + '</div>';
+    }).join('');
+
+    var fighters = c.fighters.map(function (f, i) {
+      var path = 'fighters.' + i;
+      var squad = squads.filter(function (s) { return s.squad === Number(f.squad); })[0];
+      var types = squad ? squad.weaponTypes.slice() : [];
+      if (!squad || squad.shuttles) { types.push({ id: 'shuttle', name: 'Boarding shuttle' }); }
+      var shuttle = f.weaponType === 'shuttle';
+
+      return '<div class="row tight" style="margin:5px 0">'
+        + (squads.length
+            ? listSelect(path + '.squad', f.squad, squads.map(function (s) {
+                return { id: s.squad, name: (s.squad + 1) + ': ' + (s.name || 'squad') + ' (' + s.fighters + '/12)' };
+              }), ' data-list-redraw')
+            : '<input type="number" min="0" max="9" data-list="' + path + '.squad" value="' + esc(f.squad)
+              + '" title="hangar squad, from 0" style="width:56px">')
+        + (squad
+            ? listSelect(path + '.weaponType', f.weaponType, types, ' data-list-redraw')
+            : '<input data-list="' + path + '.weaponType" data-list-redraw value="' + esc(f.weaponType)
+              + '" placeholder="weapon type or shuttle" style="width:130px">')
+        + (shuttle ? '' : listSelect(path + '.rarity', f.rarity, RARITIES))
+        + '<input type="number" min="0" max="' + (squad ? squad.buyable : 12) + '" step="1" data-list="'
+        + path + '.amount" value="' + esc(f.amount) + '" style="width:60px">'
+        + listRemove(path)
+        + '</div>';
+    }).join('');
+
+    var freeSquad = squads.filter(function (s) {
+      return !c.fighters.some(function (f) { return Number(f.squad) === s.squad; });
+    })[0];
+
+    return '<div class="card"><h3>Maintenance</h3>' + note + crew
+      + '<div class="mute2" style="margin-top:8px">Torpedoes</div>'
+      + (torpedoes || '<div class="mute2" style="font-size:11px">none</div>')
+      + '<button class="ghost small" data-list-add="torpedoes">+ add torpedoes</button>'
+      + '<div class="mute2" style="margin-top:10px">Fighters</div>'
+      + (fighters || '<div class="mute2" style="font-size:11px">none</div>')
+      + '<button class="ghost small" data-list-add="fighters"'
+      + (opts && !freeSquad ? ' disabled title="Every squad already has a line"' : '') + '>+ add fighters</button>'
+      + '<div class="mute2" style="font-size:11px;margin-top:6px">Repairs are always included when needed.</div>'
+      + '</div>';
+  }
+
+  function newListRow(form, field) {
+    var opts = listOptions(form) || {};
+    if (field === 'goods') { return { name: '', amount: null, stolen: false }; }
+    if (field === 'routes') { return { from: '', to: '', goods: null }; }
+    if (field === 'torpedoes') {
+      return { warhead: (opts.warheads && opts.warheads[0]) ? opts.warheads[0].id : '', rarity: 0, percentage: 100 };
+    }
+    var squad = (opts.squads || []).filter(function (s) {
+      return !form.config.fighters.some(function (f) { return Number(f.squad) === s.squad; });
+    })[0];
+    var type = squad ? (squad.weaponTypes[0] ? squad.weaponTypes[0].id : 'shuttle') : '';
+    return { squad: squad ? squad.squad : 0, weaponType: type, rarity: 0, amount: squad ? squad.buyable : 12 };
+  }
+
+  /* Returns true when the change needs the planner redrawn (another field's choices depend on it). */
+  function setListValue(form, node) {
+    var parts = node.dataset.list.split('.');
+    if (parts.length === 1) { form.config[parts[0]] = node.value; return false; }
+
+    var row = (form.config[parts[0]] || [])[Number(parts[1])];
+    if (!row) { return false; }
+    var prop = parts[2];
+
+    if (node.type === 'checkbox') {
+      row[prop] = node.checked;
+    } else if (prop === 'goods') {
+      var names = node.value.split(',').map(function (n) { return n.trim(); }).filter(Boolean);
+      row[prop] = names.length ? names : null;
+    } else if (prop === 'amount' || prop === 'percentage' || prop === 'rarity' || prop === 'squad') {
+      row[prop] = node.value === '' ? null : Number(node.value);
+    } else if (prop === 'warhead' || prop === 'weaponType') {
+      // ids from a select, or whatever name was typed; the mod accepts either
+      row[prop] = /^\d+$/.test(node.value) ? Number(node.value) : node.value;
+    } else {
+      row[prop] = node.value;
+    }
+
+    if (parts[0] === 'fighters' && prop === 'weaponType' && row.weaponType === 'shuttle') { row.rarity = 0; }
+    return node.dataset.listRedraw !== undefined;
+  }
+
   function renderRoutes(p) {
     var form = S.missionForm || {};
     var goodName = p.config && p.config.goodName;
@@ -2938,7 +3234,7 @@
     if (p.config) {
       cards.push(meterCard('Config as accepted', kv(Object.keys(p.config).map(function (k) {
         var v = p.config[k];
-        return [esc(k), Array.isArray(v) ? esc(v.join(', ') || '—')
+        return [esc(k), Array.isArray(v) ? esc(v.map(listItemText).join(', ') || '—')
                       : (typeof v === 'object' ? esc(JSON.stringify(v)) : esc(String(v)))];
       }))));
     }
@@ -9300,6 +9596,19 @@
         return;
       }
 
+      if (button.dataset.listAdd) {
+        var field = button.dataset.listAdd;
+        S.missionForm.config[field].push(newListRow(S.missionForm, field));
+        renderMission();
+        return;
+      }
+      if (button.dataset.listRemove) {
+        var at2 = button.dataset.listRemove.split('.');
+        S.missionForm.config[at2[0]].splice(Number(at2[1]), 1);
+        renderMission();
+        return;
+      }
+
       if (button.dataset.route) { useRoute(button.dataset.route); return; }
       if (button.dataset.areaMap) {
         var b = button.dataset.areaMap.split(',').map(Number);
@@ -9318,6 +9627,14 @@
         var picked = S.missionForm.escorts;
         escortCandidates().forEach(function (c) {
           if (c.near && picked.indexOf(c.ship.name) === -1) { picked.push(c.ship.name); }
+        });
+        renderMission();
+      }
+      else if (act === 'sell-all') {
+        var sellForm = S.missionForm;
+        var cargo = (listOptions(sellForm) || {}).cargo || [];
+        sellForm.config.goods = cargo.filter(function (g) { return g.sellable; }).map(function (g) {
+          return { name: g.name, amount: g.amount, stolen: !!g.stolen };
         });
         renderMission();
       }
@@ -9421,6 +9738,9 @@
       var form = S.missionForm;
       if (!form) { return; }
 
+      // typed values are kept without a redraw, so the field keeps focus; see 'change'
+      if (node.dataset.list) { setListValue(form, node); return; }
+
       if (node.dataset.form === 'cx') { form.center.x = Math.round(Number(node.value)) || 0; syncArea(); }
       else if (node.dataset.form === 'cy') { form.center.y = Math.round(Number(node.value)) || 0; syncArea(); }
       else if (node.dataset.config) {
@@ -9444,6 +9764,15 @@
         var box = $('[data-config="' + node.dataset.configRange + '"]', $('#sv-mission'));
         if (box) { box.value = node.value; }
       }
+    });
+
+    /* A list field other fields depend on (a route's station, a fighter squad) redraws
+       once it is committed, which is when its dependants' choices change. */
+    $('#sv-mission').addEventListener('change', function (e) {
+      var node = e.target;
+      var form = S.missionForm;
+      if (!form || !node.dataset.list) { return; }
+      if (setListValue(form, node)) { renderMission(); }
     });
 
     /* Redrawing on every keystroke would steal focus from the input being typed in, so

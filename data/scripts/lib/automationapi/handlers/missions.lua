@@ -16,6 +16,7 @@ local Serialize = include("automationapi/serialize")
 local Owner = include("automationapi/owner")
 local ShipData = include("automationapi/shipdata")
 local MissionTypes = include("automationapi/missiontypes")
+local MissionLists = include("automationapi/missionlists")
 local Analysis = include("automationapi/analysis")
 local FactionScope = include("automationapi/factionscope")
 local Routes = include("automationapi/routes")
@@ -101,13 +102,23 @@ local function describeConfigurable(command, ownerIndex, shipName)
 
     local result = {}
     for name, properties in pairs(values) do
-        result[name] =
-        {
-            from = Serialize.number(properties.from),
-            to = Serialize.number(properties.to),
-            default = Serialize.value(properties.default),
-            displayName = Serialize.string(properties.displayName),
-        }
+        -- Only single values are described. Procure lists five placeholder slots here,
+        -- and sell and maintenance an empty table; none of them is what the command
+        -- reads, and a client rendering them as fields sent numbers the command then
+        -- raised on. Those missions take lists instead, see missionlists.lua.
+        local scalar = type(properties) == "table"
+                       and (properties.from ~= nil or properties.to ~= nil
+                            or properties.default ~= nil or properties.displayName ~= nil)
+
+        if scalar then
+            result[name] =
+            {
+                from = Serialize.number(properties.from),
+                to = Serialize.number(properties.to),
+                default = Serialize.value(properties.default),
+                displayName = Serialize.string(properties.displayName),
+            }
+        end
     end
 
     return result
@@ -270,6 +281,9 @@ local function assess(owner, shipName, key, missionType, area, results, config, 
     local command = MissionTypes.make(missionType, shipName, area, config)
     MissionTypes.clampConfig(command, owner.index, shipName)
 
+    -- supply routes only become flyable once matched against the analysis
+    local configError = MissionLists.complete(key, command, owner, shipName, area)
+
     local usable = ShipData.usable(owner.index, shipName, ignoredErrorsOf(command))
 
     -- Both of these are vanilla code running on data vanilla does not usually hand it.
@@ -349,6 +363,7 @@ local function assess(owner, shipName, key, missionType, area, results, config, 
     }
 
     if not usable.ok then errors.usable = usable end
+    if configError then errors.config = Serialize.message(configError) end
 
     if commandFailure and not errors.command then
         errors.command = Serialize.message(
@@ -378,6 +393,12 @@ local function assess(owner, shipName, key, missionType, area, results, config, 
         routes = describeTradeRoutes(command, owner, shipName, area, command.config)
     end
 
+    -- what the list-shaped missions can be given, as their order windows would offer it
+    local options
+    if not opts.brief then
+        options = MissionLists.options(key, command, owner, shipName, area)
+    end
+
     return
     {
         command = command,
@@ -387,6 +408,7 @@ local function assess(owner, shipName, key, missionType, area, results, config, 
         {
             mission = key,
             routes = routes,
+            options = options,
             ship = shipName,
             owner = Owner.describe(owner),
             area =
@@ -401,6 +423,7 @@ local function assess(owner, shipName, key, missionType, area, results, config, 
             assessment = assessment,
             errors = errors,
             canStart = errors.usable == nil
+                       and errors.config == nil
                        and errors.command == nil
                        and errors.prediction == nil
                        and errors.start == nil,

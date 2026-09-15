@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.5.3", "game": "2.5.13",
+  "api": 1, "mod": "0.6.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true,
@@ -141,6 +141,10 @@ captain - a Miner captain raises Mine's maximum duration - so this is the useful
 `areaFixed` means the game recentres the area on the ship regardless of what you send.
 Trade reports three alternative area shapes.
 
+`configurable` lists single values only. Procure, sell, supply and maintenance take lists
+instead (see [List-shaped configs](#list-shaped-configs)); the placeholders the game
+reports for them are left out.
+
 ## POST /ships/{name}/missions/{mission}/preview
 
 Side-effect free, and a genuine dry run: it runs the same area analysis, validation and
@@ -174,8 +178,9 @@ Salvage but from 1 for Refine, and this API never exposes that.
 ```
 
 `errors` is empty when the mission is startable. Otherwise it carries any of `usable`
-(the ship-level check), `command` (the mission's own validation) and `prediction`, each
-with the game's own wording:
+(the ship-level check), `config` (a list config that cannot be flown, see below),
+`command` (the mission's own validation) and `prediction`, each with the game's own
+wording where the game has one:
 
 ```json
 {"command": {"template": "Not enough turret slots for all turrets!", "args": {}, "text": "..."}}
@@ -226,6 +231,83 @@ placements** does this, trying each of the three shapes with the ship in every c
 middle of every side and the centre. Each placement is a separate area analysis, so run
 them one after another - a second analysis for the same ship answers
 `409 analysis_in_progress`.
+
+### List-shaped configs
+
+Procure, sell, supply and maintenance are configured with lists. The API takes them in
+the shape below, builds what the game's order window would build from it, and echoes
+them back in the same shape. Names are matched case-insensitively. A malformed list is
+refused whole with `400` and one of `bad_goods`, `bad_routes`, `bad_crew`,
+`bad_torpedoes`, `bad_fighters`.
+
+The choices depend on the ship, its captain and the area, so each of these previews
+carries `options`: what the order window would offer. A first preview with an empty
+config is how you learn them.
+
+**procure**: up to five goods to buy. `stolen` procures illegally (smugglers only).
+
+```jsonc
+"config": {"goods": [{"name": "Energy Cell", "amount": 500, "stolen": false}]}
+
+"options": {
+  "goods": [{"name": "Energy Cell", "availability": "area"}],  // or "elsewhere" (merchant, double price), "stolen" (smuggler)
+  "maxGoods": 5, "stolenAllowed": false,
+  "captain": {"merchant": false, "smuggler": false}
+}
+```
+
+**sell**: goods from the hold. `stolen` picks the stolen stack of that good.
+
+```jsonc
+"config": {"goods": [{"name": "Energy Cell", "amount": 300, "stolen": false}]}
+
+"options": {
+  "cargo": [{"name": "Energy Cell", "amount": 300, "stolen": false, "illegal": false,
+             "dangerous": false, "suspicious": false, "price": 61, "size": 1,
+             "sellable": true}],                    // whether this captain can sell it in this area
+  "captain": {"merchant": false, "smuggler": false}
+}
+```
+
+**supply**: up to five routes between your own stations. `goods` is optional and narrows
+what is carried; the goods themselves come from what the two stations trade, matched
+against the area analysis the same way the order window matches them. The echo's
+`carried` shows the result. A route that cannot be flown (unknown station, both in one
+sector, nothing traded between them, a rift in the way) sets `errors.config` naming the
+route, and `canStart` is false.
+
+```jsonc
+"config": {"routes": [{"from": "Solar Plant", "to": "Oil Refinery", "goods": ["Energy Cell"]}]}
+
+"options": {
+  "maxRoutes": 5,
+  "stations": [{"name": "Solar Plant", "title": "Solar Power Plant", "position": {"x": 12, "y": 10},
+                "deliveries": [{"to": "Oil Refinery", "goods": ["Energy Cell"], "blocked": false}]}]
+}
+```
+
+**maintenance**: repairs are always included when needed. `crew` is `none`, `required`
+or `maximum`. A torpedo line fills `percentage` of the free torpedo storage. A fighter
+line is per hangar squad (`squad` from 0), up to 12 fighters a squad; `weaponType`
+`"shuttle"` buys boarding shuttles, which are always Common. Warheads, weapon types and
+rarities can be ids or names (`"Neutron"`, `"ChainGun"`, `"Rare"`); the echo carries both.
+Lines at 0 are dropped, as the order window drops them.
+
+```jsonc
+"config": {
+  "crew": "required",
+  "torpedoes": [{"warhead": "Neutron", "rarity": "Rare", "percentage": 50}],
+  "fighters": [{"squad": 0, "weaponType": "ChainGun", "rarity": 2, "amount": 8}]
+}
+
+"options": {
+  "crew": ["none", "required", "maximum"],
+  "rarities": [{"id": 0, "name": "Common"}, "... up to 3, Exceptional"],
+  "warheads": [{"id": 2, "name": "Neutron"}],       // on sale around the ship
+  "squads": [{"squad": 0, "name": "Alpha", "fighters": 4, "buyable": 8,
+              "weaponTypes": [{"id": 0, "name": "ChainGun"}], "shuttles": false}]
+}
+```
 
 ## POST /ships/{name}/missions/{mission}/start
 

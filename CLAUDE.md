@@ -59,6 +59,8 @@ data/scripts/                   everything the game loads
                       + per-station running totals
     enums.lua         engine userdata enums -> names
     missiontypes.lua  API mission keys <-> vanilla command UUIDs, config/area building
+    missionlists.lua  list configs (procure/sell goods, supply routes, maintenance buys):
+                      request shape <-> command shape, supply route matching, preview options
     missionrules.lua  pure arithmetic for mission automation limits/candidates
     programrules.lua  order program vocabulary: actions, conditions, validation, evaluation
     transferrules.lua cargo transfer request vocabulary, shared by /transfer and program steps

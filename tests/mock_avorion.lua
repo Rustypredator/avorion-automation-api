@@ -710,7 +710,52 @@ function M.makeCommand(missionType, shipName, area, config)
     function c:isAreaFixed() return M.areaFixed end
     function c:isShipRequiredInArea() return true end
     function c:getConfigurableValues()
+        if M.configurableFor then return M.configurableFor(missionType) end
         return {duration = {from = 0.5, to = 2, default = 1, displayName = "Duration"}}
+    end
+
+    -- SupplyCommand's own route matching, which the mod calls rather than reimplements.
+    -- Reduced to what vanilla reads: a delivery exists when a script on `to` buys what a
+    -- script on `from` sells, and never between two stations in the same sector.
+    if missionType == M.commandTypes.Supply then
+        function c:detectDeliverableStations(ownerIndex, from, analysis)
+            local fromEntry = ShipDatabaseEntry(ownerIndex, from.name)
+            local fx, fy = fromEntry:getCoordinates()
+
+            local result = {}
+            for _, station in pairs(analysis.stations) do
+                local toEntry = ShipDatabaseEntry(ownerIndex, station.name)
+                local tx, ty = toEntry:getCoordinates()
+
+                if station.name ~= from.name and not (fx == tx and fy == ty) then
+                    local transportable = {}
+                    for _, sells in pairs(from.opportunities) do
+                        for _, good in pairs(sells.sold) do
+                            for _, buys in pairs(station.opportunities) do
+                                for _, bought in pairs(buys.bought) do
+                                    if good == bought then
+                                        table.insert(transportable, {name = good, fromScript = sells.script,
+                                                                     toScript = buys.script})
+                                    end
+                                end
+                            end
+                        end
+                    end
+
+                    if #transportable > 0 then
+                        table.insert(result, {station = station, transportable = transportable})
+                    end
+                end
+            end
+
+            return result
+        end
+
+        function c:blockedByRing(ship, station)
+            local _, canPassRifts = ship:getHyperspaceProperties()
+            if canPassRifts then return false end
+            return Balancing_InsideRing(ship:getCoordinates()) ~= Balancing_InsideRing(station:getCoordinates())
+        end
     end
     function c:getPredictableValues() return {yields = {}, attackChance = {value = 0}} end
     function c:getErrors() return M.commandError, M.commandErrorArgs end

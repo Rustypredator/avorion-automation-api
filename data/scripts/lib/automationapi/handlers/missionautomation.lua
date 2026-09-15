@@ -285,7 +285,7 @@ local function firstError(errors)
         return errors.usable.message or errors.usable.code
     end
 
-    for _, name in ipairs({"command", "prediction", "start"}) do
+    for _, name in ipairs({"config", "command", "prediction", "start"}) do
         local e = errors[name]
         if type(e) == "table" and e.text then return Serialize.displayName(e.text) end
     end

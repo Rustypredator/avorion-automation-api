@@ -10,6 +10,7 @@ package.path = package.path .. ";data/scripts/player/background/simulation/?.lua
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
 local Serialize = include("automationapi/serialize")
+local MissionLists = include("automationapi/missionlists")
 
 local CommandType = include("commandtype")
 local CommandFactory = include("commandfactory")
@@ -248,6 +249,9 @@ function MissionTypes.buildConfig(key, body)
 
     applyMaterials(key, config)
 
+    -- goods, routes, torpedoes and fighters; see missionlists.lua
+    MissionLists.build(key, config)
+
     return config
 end
 
@@ -268,6 +272,8 @@ function MissionTypes.describeConfig(key, config)
 
     local materials = MissionTypes.describeMaterials(key, config or {})
     if materials then result.materials = materials end
+
+    MissionLists.describe(key, config, result)
 
     return result
 end

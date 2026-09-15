@@ -201,8 +201,31 @@ const tradeCatalog = {
     missions: [{
         mission: 'trade', areaFixed: false, shipRequiredInArea: true, configurable: {},
         areaSizes: [{ x: 17, y: 17 }, { x: 29, y: 11 }, { x: 11, y: 29 }]
+    }, {
+        // no configurable fields: its routes are a list, with choices from the preview
+        mission: 'supply', areaFixed: true, shipRequiredInArea: false, configurable: {},
+        areaSizes: [{ x: 1, y: 1 }]
     }]
 };
+
+/* A supply preview as the mod answers it: the stations that trade, and where each
+   can deliver, ride along as options. */
+function supplyPreview(body) {
+    return {
+        mission: 'supply', ship: 'Ore Hound', canStart: (body.config.routes || []).length > 0,
+        area: { lower: body.area.lower, upper: body.area.upper }, config: body.config,
+        prediction: {}, assessment: [], errors: {},
+        options: {
+            maxRoutes: 5,
+            stations: [
+                { name: 'Rusty Refinery', title: 'Oil Refinery', position: { x: 1, y: 2 },
+                  deliveries: [{ to: 'Solar Plant', goods: ['Oil'], blocked: false }] },
+                { name: 'Solar Plant', title: 'Solar Power Plant', position: { x: 9, y: 2 },
+                  deliveries: [{ to: 'Rusty Refinery', goods: ['Energy Cell'], blocked: false }] }
+            ]
+        }
+    };
+}
 
 function tradeRoute(good, margin, contract, sellX) {
     return {
@@ -416,6 +439,7 @@ const dynamic = {
     '/ships/Ore%20Hound/mission/automation': saveAutomation,
     '/ships/Ore%20Hound/mission/automation/evaluate': tradeEvaluation,
     '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
+    '/ships/Ore%20Hound/missions/supply/preview': supplyPreview,
     '/ships/Ore%20Hound/route': flownRoute,
     '/ships/Ore%20Hound/automation': saveStanding
 };
@@ -1528,6 +1552,60 @@ const ready = window.document.readyState === 'loading'
           'the end of the cooldown is notified');
     check(notifications.filter((n) => n.title === 'Boss spawned').length === 1,
           'and nothing seen before is notified twice');
+
+    console.log('\nlist-shaped mission configs');
+
+    $('[data-ship="Ore Hound"]').click();
+    await settle(400);
+    tab('mission').click();
+    await settle(600);
+
+    const missionPane = $('#sv-mission');
+    click(missionPane.querySelector('[data-mission="supply"]'));
+    await settle(50);
+    check(/Supply routes/.test(missionPane.textContent) && /Preview once/.test(missionPane.textContent),
+          'supply offers a route list, and says where its choices come from');
+
+    posts.length = 0;
+    click(missionPane.querySelector('[data-act="preview"]'));
+    await settle(400);
+    let supplySent = posts.filter((p) => /supply\/preview$/.test(p.path)).pop();
+    check(supplySent && Array.isArray(supplySent.body.config.routes) && supplySent.body.config.routes.length === 0,
+          'an empty list is sent as an empty list, never a number');
+
+    click(missionPane.querySelector('[data-list-add="routes"]'));
+    await settle(50);
+    const typeInto = (selector, value, event) => {
+        const node = missionPane.querySelector(selector);
+        node.value = value;
+        node.dispatchEvent(new window.Event(event || 'input', { bubbles: true }));
+    };
+    typeInto('[data-list="routes.0.from"]', 'Solar Plant', 'change');
+    await settle(50);
+    check($$('#mission-list-to-0 option').map((o) => o.value).join() === 'Rusty Refinery',
+          'picking where to load offers only the stations it can deliver to');
+    typeInto('[data-list="routes.0.to"]', 'Rusty Refinery', 'change');
+    await settle(50);
+    check(/trades Energy Cell/.test(missionPane.textContent), 'and says what the route would carry');
+
+    click(missionPane.querySelector('[data-list-add="routes"]'));
+    await settle(50);
+    check(missionPane.querySelector('[data-list="routes.0.to"]').value === 'Rusty Refinery',
+          'adding a line keeps the lines already filled in');
+
+    posts.length = 0;
+    click(missionPane.querySelector('[data-act="preview"]'));
+    await settle(400);
+    supplySent = posts.filter((p) => /supply\/preview$/.test(p.path)).pop();
+    check(supplySent && supplySent.body.config.routes.length === 1
+          && supplySent.body.config.routes[0].from === 'Solar Plant'
+          && supplySent.body.config.routes[0].to === 'Rusty Refinery'
+          && supplySent.body.config.routes[0].goods === undefined,
+          'only finished routes are sent, without a goods filter nobody set');
+
+    click(missionPane.querySelector('[data-list-remove="routes.1"]'));
+    await settle(50);
+    check(missionPane.querySelectorAll('[data-list-remove]').length === 1, 'a line can be removed');
 
     console.log('');
     if (failures === 0) {
