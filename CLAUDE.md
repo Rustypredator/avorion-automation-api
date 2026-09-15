@@ -67,6 +67,7 @@ data/scripts/                   everything the game loads
       missions.lua          catalog, preview, start, status, recall, collect; owns
                             Missions.enqueue (job queue) + Missions.tick
       missionautomation.lua per-craft automation rules (Server values) + loop (.tick)
+      missionlibrary.lua    named mission rules per faction that program mission steps fly
       programs.lua          order programs (Server values) + runner (.tick); steps run as
                             internal router:dispatch requests to the real endpoints
       movement.lua          /travel (mission alias), /orders (in-sector order chain)

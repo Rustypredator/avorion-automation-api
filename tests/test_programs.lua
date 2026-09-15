@@ -97,6 +97,14 @@ check(Rules.evaluate(program.steps[1], {cargo = {capacity = 0, used = 0}}).done 
       "and not before")
 check(Rules.nextStep(program, 1) == 2 and Rules.nextStep(program, 2) == 1,
       "next and goto lead where they say")
+check(raises(function()
+    Rules.normalize({steps = {route, {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 5}}},
+                              ["then"] = "goto"}}})
+end, "bad_program"), "then goto without a step is refused")
+local restart = Rules.normalize({steps = {route, {action = {type = "wait"},
+    ["until"] = {conditions = {{type = "elapsed", seconds = 5}}}, ["then"] = "start"}}})
+check(restart.steps[2]["then"] == "start" and restart.steps[2]["goto"] == nil and Rules.nextStep(restart, 2) == 1,
+      "then start goes back to step 1 without a number")
 
 -- #### THE RUNNER #### --
 
@@ -353,6 +361,107 @@ _, rule = call("GET", "/ships/Miner/mission/automation")
 check(rule.state.phase ~= "program" and rule.state.dispatches == 1,
       "and the craft's own enabled rule takes it back, sending it out by itself ("
       .. tostring(rule.state.phase) .. ")")
+
+-- #### THE MISSION LIBRARY #### --
+
+print("\nthe mission library")
+
+-- Without the craft's own rule, which would otherwise send it out between the steps here.
+call("POST", "/ships/Miner/mission/automation/delete")
+ship.availability = ShipAvailability.Available
+ship.analyzedType = nil
+
+status, body = call("POST", "/automation/missions/library/Mine%20safe",
+                    {mission = "mine", limits = {maxAttackChance = 0.2, maxDuration = 3600}, materials = {"Unobtainium"}})
+check(status == 400, "a library mission is checked like a rule: an unknown material is refused ("
+      .. tostring(status) .. ")")
+
+status, body = call("POST", "/automation/missions/library/Mine%20safe",
+                    {mission = "mine", limits = {maxAttackChance = 0.2, maxDuration = 3600}, materials = {"Iron"}})
+check(status == 200 and body.name == "Mine safe" and body.revision == 1 and body.rule.mission == "mine"
+      and body.rule.enabled == nil, "a library mission is saved under its name, with no on or off")
+status, body = call("POST", "/automation/missions/library/Mine%20safe", {objective = "total", ifRevision = 0})
+check(status == 409 and body.error.code == "library_changed", "a stale revision is refused")
+status, body = call("POST", "/automation/missions/library/Mine%20safe", {objective = "total", ifRevision = 1})
+check(status == 200 and body.rule.objective == "total" and body.rule.limits.maxAttackChance == 0.2,
+      "an update merges over the stored mission")
+
+status, body = call("POST", "/ships/Miner/program", {steps = {{action = {type = "mission", library = "Nope"}}}})
+check(status == 400 and body.error.code == "bad_program", "a step naming a mission the library lacks is refused")
+
+status, body = call("POST", "/ships/Miner/program", {name = "Library", enabled = false, steps =
+{
+    {action = {type = "mission", library = "Mine safe"}, ["then"] = "stop"},
+}})
+check(status == 200 and body.program.steps[1].action.library == "Mine safe", "a step names a library mission")
+
+local _, library = call("GET", "/automation/missions/library")
+check(#library.missions == 1 and library.missions[1].usedBy[1] == "Miner", "the library says which craft use it")
+
+status, body = call("POST", "/automation/missions/library/Mine%20safe/delete")
+check(status == 409 and body.error.code == "mission_in_use", "a mission a program flies cannot be deleted")
+
+status, body = call("POST", "/automation/missions/library/Mine%20safe", {rename = "Mine carefully"})
+check(status == 200 and body.name == "Mine carefully", "a library mission can be renamed")
+local _, renamed = call("GET", "/ships/Miner/program")
+check(renamed.program.steps[1].action.library == "Mine carefully" and renamed.program.revision == 2,
+      "and the programs naming it follow, keeping their revision")
+
+-- Every option predicts a 12% ambush, so a 10% ceiling refuses them all.
+call("POST", "/automation/missions/library/Mine%20carefully", {limits = {maxAttackChance = 0.1}})
+check(ship.availability == ShipAvailability.Available, "(the program was saved switched off, so nothing left yet)")
+call("POST", "/ships/Miner/program", {enabled = true})
+run(4)
+state = stateOf("Miner")
+check(state.status == "retrying" and state.message:find("nothing_within_limits", 1, true) ~= nil,
+      "the step flies the library mission as it is when the step starts (" .. tostring(state.message) .. ")")
+
+call("POST", "/automation/missions/library/Mine%20carefully", {limits = {maxAttackChance = 0.2, maxDuration = 3600}})
+run(8)
+state = stateOf("Miner")
+check(ship.availability == ShipAvailability.InBackground and state.message:find("Mine carefully", 1, true) ~= nil,
+      "and once it allows a start, the ship goes out on it (" .. tostring(state.message) .. ")")
+
+call("POST", "/ships/Miner/program/delete")
+status, body = call("POST", "/automation/missions/library/Mine%20carefully/delete")
+check(status == 200 and body.deleted == true, "unused, it can be deleted")
+
+-- #### TRAVEL STEPS #### --
+
+print("\ntravel steps")
+
+check(raises(function() Rules.normalize({steps = {{action = {type = "travel", to = {x = 60, y = 0}, swiftness = 5}}}}) end,
+             "bad_program"), "swiftness is 0 to 3")
+
+Mock.addShip(1, "Courier", {x = 0, y = 0, range = 5, captain = captain, cargoCapacity = 100, cargoFree = 100})
+Mock.simulationCalls = {}
+status = call("POST", "/ships/Courier/program", {name = "Run", steps =
+{
+    {action = {type = "travel", to = {x = 60, y = 0}, swiftness = 1}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 3}}}, ["then"] = "stop"},
+}})
+check(status == 200, "(saved)")
+
+for _ = 1, 8 do
+    tick(0.25)
+    Mock.flushAsync({route = {{x = 0, y = 0}, {x = 30, y = 0}, {x = 60, y = 0}},
+                     sectors = 1, reachableCoordinates = {}})
+end
+run(3)
+
+local courier = Mock.getShip(1, "Courier")
+local travelled
+for _, c in ipairs(Mock.simulationCalls) do
+    if c.fn == "startAreaAnalysis" and c.args[2] == Mock.commandTypes.Travel then travelled = true end
+end
+state = stateOf("Courier")
+check(travelled and courier.availability == ShipAvailability.InBackground and state.step == 1
+      and state.status == "running", "a travel step starts a Travel mission (" .. tostring(state.message) .. ")")
+
+courier.availability = ShipAvailability.Available
+courier.x, courier.y = 60, 0
+run(2)
+check(stateOf("Courier").step == 2, "and ends once the craft is back, at the other end")
 
 print("")
 if failures > 0 then print(failures .. " check(s) failed"); os.exit(1) end

@@ -1007,6 +1007,12 @@ MissionAutomation.ownerOf = ownerOf
 MissionAutomation.hasPrivilege = hasPrivilege
 
 -- The craft's stored rule, or nil.
+-- Raises the error a save would for a rule whose config cannot be built (an unknown material,
+-- say), for callers storing rules of their own: the mission library.
+function MissionAutomation.checkRule(rule)
+    baseConfigOf(rule)
+end
+
 function MissionAutomation.ruleFor(index, shipName)
     return loadFaction(index).ships[shipName]
 end

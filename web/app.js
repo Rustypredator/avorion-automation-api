@@ -66,6 +66,7 @@
     /* Order programs, off /automation/programs, shaped like `automations`. `progForm` is the
        program editor open for the selected craft. */
     programs: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
+    library: { byKind: { player: [], alliance: [] }, loaded: false, error: null },
     progForm: null,
     recording: {},      // ship name -> boolean
     traffic: [],
@@ -559,10 +560,23 @@
       + '<b>Repeat</b> starts the action again each time it ends until the conditions are '
       + 'met &mdash; mission after mission until the hold is full. A route or farm still '
       + 'flying when its step ends is stopped.</p>'
-      + '<p>Mission steps fly the craft&rsquo;s mission rule under its limits; while a program '
-      + 'runs, the rule does not send the craft out on its own. Conditions read the ship '
+      + '<p>Mission steps fly a mission from the library, or the craft&rsquo;s own mission rule, '
+      + 'under its limits; while a program runs, the rule does not send the craft out on its '
+      + 'own. Travel steps start a Travel mission, which crosses any distance without loading '
+      + 'sectors, and end when the craft arrives. Conditions read the ship '
       + 'database and what the ship last reported, so cargo is as fresh as the game keeps '
       + 'that row. A failed step is retried every minute.</p>',
+
+    'mission-library':
+      '<p>Missions kept under a name &mdash; &ldquo;Refine, safe&rdquo;, &ldquo;Mine 2h&rdquo; &mdash; '
+      + 'for programs to fly. A program&rsquo;s mission step picks one, and the mod loads it '
+      + 'when the step starts, so an edit here changes every program that flies it from its '
+      + 'next start on. Each is a mission rule without a craft: mission, area, config, '
+      + 'materials, escorts, what to optimise for and the limits.</p>'
+      + '<p>An area that follows the ship recentres on whichever craft flies it. Materials and '
+      + 'escorts are taken as they are named, so a mission with escorts only suits craft those '
+      + 'escorts can join. Your craft fly your library; alliance craft fly the alliance&rsquo;s, '
+      + 'which every member shares. A mission a program still flies cannot be deleted.</p>',
 
     'auto-evaluation':
       'Every option the check weighed, best first: everything inside the limits ahead of '
@@ -1000,6 +1014,7 @@
     loop('events', EVERY.events, sweepEvents);
     loop('automations', EVERY.automations, loadAutomations);
     loop('programs', EVERY.automations, loadPrograms);
+    loop('library', EVERY.automations, loadLibrary);
     loop('mission', EVERY.mission, function () {
       if (!S.selected) { return; }
       var ship = S.byName[S.selected];
@@ -1071,6 +1086,7 @@
       if (S.connected) {
         loadAutomations(true);
         loadPrograms(true);
+        loadLibrary(true);
         if (S.selected) { loadAutomation(); }
       }
     }
@@ -3073,7 +3089,7 @@
   function renderAutomation() {
     return '<div class="section auto-section"><h2>Mission automation ' + explain('auto-overview') + '</h2>'
       + '<div data-auto-status>' + renderAutomationStatus() + '</div>'
-      + '<div data-auto-editor>' + renderAutomationEditor() + '</div>'
+      + '<div data-auto-editor>' + renderAutomationEditor(false) + '</div>'
       + '</div>';
   }
 
@@ -3217,6 +3233,7 @@
       + '</div>'
       + renderProgram()
       + renderAutomation()
+      + renderLibrary()
       + '<div data-standing-orders></div>';
 
     renderStanding();
@@ -3250,6 +3267,7 @@
     ['farm', 'farm bosses'],
     ['orders', 'run orders'],
     ['mission', 'go on a mission'],
+    ['travel', 'travel (mission)'],
     ['standing', 'set standing orders'],
     ['wait', 'wait']
   ];
@@ -3269,7 +3287,10 @@
 
   /* Actions that end by themselves; the rest need a condition. */
   var PROGRAM_NATURAL_END = { route: 'when it arrives', orders: 'when the chain runs out',
-                              mission: 'when it is back', standing: 'at once' };
+                              mission: 'when it is back', travel: 'when it arrives', standing: 'at once' };
+
+  /* The Travel mission's swiftness, as the order window offers it. */
+  var SWIFTNESS = [['0', 'careful'], ['1', 'cautious'], ['2', 'swift'], ['3', 'reckless']];
 
   var PROGRAM_ORDER_TYPES = ['patrol', 'repair', 'aggressive', 'mine', 'salvage', 'refine', 'jump'];
 
@@ -3345,7 +3366,12 @@
       }).join(' → '));
     }
     if (action.type === 'mission') {
+      if (action.library) { return 'mission: <b>' + esc(action.library) + '</b> <span class="mute2">from the library</span>'; }
       return action.rule ? 'mission: ' + esc(action.rule.mission) + ' (own limits)' : 'mission under the craft\'s rule';
+    }
+    if (action.type === 'travel') {
+      var swift = SWIFTNESS.filter(function (s) { return Number(s[0]) === (action.swiftness == null ? 2 : action.swiftness); })[0];
+      return 'travel to ' + coords(action.to) + (swift ? ', ' + swift[1] : '');
     }
     if (action.type === 'standing') {
       var parts = [];
@@ -3381,6 +3407,7 @@
 
   function thenText(step, index, count) {
     if (step['then'] === 'stop') { return 'then stop'; }
+    if (step['then'] === 'start') { return 'then back to step 1'; }
     if (step['then'] === 'goto') { return 'then step ' + num(step['goto']); }
     return index + 1 < count ? 'then next' : 'then the program ends';
   }
@@ -3480,10 +3507,11 @@
 
   function blankStep(type) {
     var action = { type: type };
-    if (type === 'route') {
+    if (type === 'route' || type === 'travel') {
       var ship = S.byName[S.selected] || {};
       action.to = { x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 };
     }
+    if (type === 'travel') { action.swiftness = 2; }
     if (type === 'farm') { action.boss = 'auto'; }
     if (type === 'orders') { action.orders = [{ type: 'patrol' }]; }
     if (type === 'standing') { action.standing = { enemies: { enabled: true, mode: 'interrupt' } }; }
@@ -3557,7 +3585,18 @@
           : '');
     }
     if (a.type === 'mission') {
-      return '<span class="mute2">flies the craft\'s mission rule below, under its limits</span>';
+      var names = libraryFor(S.selected).map(function (m) { return m.name; });
+      if (a.library && names.indexOf(a.library) === -1) { names.push(a.library); }
+      return pfSelect(p + 'library', a.library || '', [['', 'the craft\'s mission rule']].concat(names.map(function (n) {
+          return [n, n];
+        })), 'data-pf-rerender')
+        + '<span class="mute2">' + (a.library ? 'from the mission library, as it is when the step starts'
+          : names.length ? 'under its limits' : 'under its limits &mdash; add missions to the library below to pick others') + '</span>';
+    }
+    if (a.type === 'travel') {
+      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
+        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+        + pfSelect(p + 'swiftness', a.swiftness == null ? 2 : a.swiftness, SWIFTNESS, 'data-pf-num');
     }
     if (a.type === 'standing') {
       return STANDING.map(function (spec) {
@@ -3629,7 +3668,7 @@
         + '</div>'
         + conditions
         + '<div class="row tight" style="margin-top:6px"><span class="mute2">then</span>'
-        + pfSelect('steps.' + i + '.then', step['then'] || 'next', [['next', i + 1 < count ? 'next step' : 'end'], ['goto', 'go to step'], ['stop', 'stop']], 'data-pf-rerender')
+        + pfSelect('steps.' + i + '.then', step['then'] || 'next', [['next', i + 1 < count ? 'next step' : 'end'], ['start', 'go to start'], ['goto', 'go to step'], ['stop', 'stop']], 'data-pf-rerender')
         + (step['then'] === 'goto'
           ? pfInput('steps.' + i + '.goto', step['goto'] || 1, 'type="number" min="1" max="' + count + '" data-pf-num style="width:56px"')
           : '')
@@ -3711,7 +3750,17 @@
     }
 
     if (path === 'name') { form.name = value; return false; }
+    if (/^steps\.\d+\.action\.library$/.test(path) && !value) {
+      delete form.steps[Number(path.split('.')[1])].action.library;
+      return true;
+    }
     setPath(form, path, value);
+    // The step box shows 1 as soon as "go to step" is picked; store it too, or a save
+    // without retyping the number sends no goto at all.
+    if (/^steps\.\d+\.then$/.test(path) && value === 'goto') {
+      var target = form.steps[Number(path.split('.')[1])];
+      if (target['goto'] == null) { target['goto'] = 1; }
+    }
     return node.dataset.pfRerender !== undefined;
   }
 
@@ -3926,6 +3975,7 @@
       + '<span class="spacer"></span>'
       + '<button class="ghost small" data-auto-act="check"' + (dry && dry.running ? ' disabled' : '') + '>check now</button>'
       + (editing ? '' : '<button class="ghost small" data-auto-act="edit">edit</button>')
+      + '<button class="ghost small" data-auto-act="to-library" title="Keep a copy under a name, for programs to fly">copy to library</button>'
       + '<button class="ghost small danger" data-auto-act="remove">remove</button>'
       + '</div>');
 
@@ -4139,16 +4189,28 @@
     return true;
   }
 
-  function renderAutomationEditor() {
+  /* One form edits both a craft's rule and a library mission, which is a rule without a
+     craft; `forLibrary` says which section is asking, and only the one the form belongs to
+     draws it. */
+  function renderAutomationEditor(forLibrary) {
     var form = S.autoForm;
-    if (!form || form.ship !== S.selected) { return ''; }
+    if (!form || form.ship !== S.selected || !!form.library !== !!forLibrary) { return ''; }
 
     var source = form.source;
+    var library = form.library;
     var head = '<div class="card auto-editor" style="margin-top:10px">'
       + '<div class="row" style="justify-content:space-between"><h3 style="margin-bottom:0">'
-      + (form.existing ? 'Edit rule' : 'New rule') + ' <span class="mute2">' + esc(source.mission) + '</span></h3>'
+      + (library ? (form.existing ? 'Edit library mission' : 'New library mission')
+        : form.existing ? 'Edit rule' : 'New rule') + ' <span class="mute2">' + esc(source.mission) + '</span></h3>'
       + '<button class="ghost small" data-auto-act="take-planner"' + (S.missionForm ? '' : ' disabled')
-      + ' title="Replace the mission, area, config, materials and escorts with what the planner below holds">take planner settings</button></div>';
+      + ' title="Replace the mission, area, config, materials and escorts with what the planner holds">take planner settings</button></div>'
+      + (library
+        ? '<div class="row tight" style="margin-top:8px"><span class="mute2">name</span>'
+          + '<input type="text" data-auto-libname maxlength="48" style="width:220px" value="' + esc(library.name) + '" placeholder="e.g. Refine, safe">'
+          + (library.original && library.usedBy && library.usedBy.length
+            ? '<span class="mute2">flown by ' + esc(library.usedBy.join(', ')) + '</span>' : '')
+          + '</div>'
+        : '');
 
     var what = [];
     Object.keys(source.config || {}).forEach(function (k) {
@@ -4188,9 +4250,12 @@
       + (form.collectYields ? ' checked' : '') + '><span>collect yields before sending it out again</span></label>'
       + '<div class="row" style="margin-top:10px">'
       + '<button data-auto-act="test"' + (form.dry && form.dry.running ? ' disabled' : '') + '>Test limits</button>'
-      + '<button class="primary" data-auto-act="save">' + (form.existing ? 'Save rule' : 'Save and switch on') + '</button>'
+      + (library
+        ? '<button class="primary" data-auto-act="save-library">Save to library</button>'
+        : '<button class="primary" data-auto-act="save">' + (form.existing ? 'Save rule' : 'Save and switch on') + '</button>')
       + '<button class="ghost" data-auto-act="cancel">Cancel</button>'
-      + '</div>';
+      + '</div>'
+      + (library ? '<div class="mute2" style="margin-top:6px">Test limits tries it on ' + esc(S.selected) + '.</div>' : '');
 
     return head + body + '</div>'
       + (form.dry ? renderAutoEvaluation('Test against the current area', form.dry) : '');
@@ -4315,6 +4380,9 @@
     else if (act === 'test') { testAutomation(button, false); }
     else if (act === 'check') { testAutomation(button, true); }
     else if (act === 'remove') { removeAutomation(button); }
+    else if (act === 'to-library') { openLibraryEditor(null, automationFor(S.selected)); }
+    else if (act === 'library-new') { openLibraryEditor(null, null); }
+    else if (act === 'save-library') { saveLibrary(button); }
     else if (act === 'take-planner') {
       var source = plannerSource();
       if (!source || !S.autoForm) { return; }
@@ -4323,6 +4391,187 @@
       S.autoForm.dry = null;
       redrawAutomation();
     }
+  }
+
+  /* ============================= MISSION LIBRARY =============================
+   *
+   * Named mission rules a faction keeps for its programs: a rule without a craft. A
+   * program's mission step names one and the mod loads it when the step starts, so an
+   * edit here applies to every program flying it. Player craft fly the player's library,
+   * alliance craft the alliance's.
+   */
+
+  function ownerKindOf(name) {
+    var ship = S.byName[name];
+    return ship && ship.owner && ship.owner.kind === 'alliance' ? 'alliance' : 'player';
+  }
+
+  function libraryFor(name) {
+    return S.library.byKind[ownerKindOf(name)] || [];
+  }
+
+  function loadLibrary(userInitiated) {
+    return Api.get('/automation/missions/library', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'mission library' })
+      .then(function (body) {
+        var byKind = { player: [], alliance: [] };
+        (body.missions || []).forEach(function (mission) {
+          byKind[mission.owner && mission.owner.kind === 'alliance' ? 'alliance' : 'player'].push(mission);
+        });
+        S.library = { byKind: byKind, loaded: true, error: null };
+        refreshLibrary();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.library.error = error;
+        S.library.loaded = true;
+        refreshLibrary();
+      });
+  }
+
+  function renderLibrary() {
+    return '<div class="section auto-section"><h2>Mission library ' + explain('mission-library') + '</h2>'
+      + '<div data-library-list>' + renderLibraryList() + '</div>'
+      + '<div data-library-editor>' + renderAutomationEditor(true) + '</div>'
+      + '</div>';
+  }
+
+  function renderLibraryList() {
+    var name = S.selected;
+    if (!name) { return ''; }
+
+    var failed = S.library.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without a mission library.</div>';
+    }
+    if (failed) { return errorBox('Library unavailable', failed); }
+    if (!S.library.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var kind = ownerKindOf(name);
+    var missions = libraryFor(name);
+    var editingName = S.autoForm && S.autoForm.library && S.autoForm.library.original;
+
+    var rows = missions.map(function (mission) {
+      var rule = mission.rule || {};
+      return '<div class="order-row library-row">'
+        + '<div class="program-step-body"><div><b>' + esc(mission.name) + '</b> '
+        + '<span class="badge">' + esc(rule.mission) + '</span></div>'
+        + '<div class="mute2">' + esc(areaText(rule.area)) + ' · ' + limitsText(rule) + '</div>'
+        + '<div class="mute2">' + (mission.usedBy && mission.usedBy.length
+          ? 'flown by ' + esc(mission.usedBy.join(', ')) : 'no program flies it') + '</div></div>'
+        + '<span class="spacer"></span>'
+        + (editingName === mission.name ? ''
+          : '<button class="ghost small" data-lib-edit="' + esc(mission.name) + '">edit</button>')
+        + '<button class="ghost small danger" data-lib-del="' + esc(mission.name) + '"'
+        + (mission.usedBy && mission.usedBy.length ? ' disabled title="A program still flies it"' : '') + '>delete</button>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="row"><span class="note">' + (kind === 'alliance'
+        ? 'The alliance&rsquo;s missions, shared by every member, for alliance craft to fly.'
+        : 'Your missions, for any of your craft&rsquo;s programs to fly.') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-auto-act="library-new"' + (S.missionForm ? '' : ' disabled title="Set a mission up in the planner first"')
+      + '>New from planner…</button></div>'
+      + (rows || '<div class="mute2" style="margin-top:6px">Empty. Copy a craft&rsquo;s rule to the library, or make one from the mission planner.</div>');
+  }
+
+  function refreshLibrary() {
+    var list = $('#automation-pane [data-library-list]');
+    if (list && S.selected) { list.innerHTML = renderLibraryList(); }
+  }
+
+  function redrawLibrary() {
+    var editor = $('#automation-pane [data-library-editor]');
+    if (editor) { editor.innerHTML = renderAutomationEditor(true); }
+    refreshLibrary();
+    redrawProgram();
+  }
+
+  /* Opens the rule form on a library mission: an existing one, a copy of a craft's rule,
+     or what the planner holds. */
+  function openLibraryEditor(mission, fromEntry) {
+    var source = mission ? { rule: mission.rule } : fromEntry && fromEntry.rule ? { rule: fromEntry.rule } : null;
+    openAutoEditor(source);
+    if (!S.autoForm) { return; }
+
+    S.autoForm.existing = !!mission;
+    S.autoForm.revision = mission ? mission.revision : 0;
+    S.autoForm.library = {
+      original: mission ? mission.name : null,
+      name: mission ? mission.name : '',
+      usedBy: mission ? mission.usedBy || [] : []
+    };
+    redrawAutomation();
+  }
+
+  function libraryPath(name, suffix) {
+    return '/automation/missions/library/' + Api.seg(name) + (suffix || '');
+  }
+
+  function saveLibrary(button) {
+    var form = S.autoForm;
+    var name = S.selected;
+    if (!form || !form.library || !name) { return; }
+
+    var wanted = (form.library.name || '').trim();
+    if (!wanted) {
+      toast('warn', 'Name it first', 'A library mission is picked by its name.');
+      return;
+    }
+
+    var body = autoBody(form);
+    body.ifRevision = form.revision;
+    var original = form.library.original;
+    if (original && original !== wanted) { body.rename = wanted; }
+
+    return guard(button, Api.post(libraryPath(original || wanted), body, { owner: ownerKindOf(name) },
+                                  { priority: Api.P.USER, label: 'save library mission' }))
+      .then(function (result) {
+        S.autoForm = null;
+        toast('good', 'Library mission saved', result.name + (result.usedBy && result.usedBy.length
+          ? ': programs fly it this way from their next start.' : ''));
+        return Promise.all([loadLibrary(true), original && original !== wanted ? loadPrograms(true) : null]);
+      })
+      .then(redrawAutomation)
+      .catch(function (error) {
+        if (error.code === 'library_changed') {
+          toast('warn', 'Library mission changed elsewhere',
+                'Someone else saved it since it was loaded. It has been reloaded; apply your change again.');
+          S.autoForm = null;
+          loadLibrary(true).then(redrawAutomation);
+          return;
+        }
+        apiFailed(error, 'Could not save the library mission');
+      });
+  }
+
+  function deleteLibrary(button, missionName) {
+    var name = S.selected;
+    if (!name || !window.confirm('Delete "' + missionName + '" from the mission library?')) { return; }
+
+    return guard(button, Api.post(libraryPath(missionName, '/delete'), {}, { owner: ownerKindOf(name) },
+                                  { priority: Api.P.USER, label: 'delete library mission' }))
+      .then(function () {
+        toast('good', 'Library mission deleted', missionName);
+        return loadLibrary(true);
+      })
+      .then(redrawLibrary)
+      .catch(function (error) { apiFailed(error, 'Could not delete the library mission'); });
+  }
+
+  /* Clicks on the library list. Returns whether it was one of its controls. */
+  function libraryClick(button) {
+    if (button.dataset.libEdit !== undefined) {
+      var mission = libraryFor(S.selected).filter(function (m) { return m.name === button.dataset.libEdit; })[0];
+      if (mission) { openLibraryEditor(mission, null); }
+      return true;
+    }
+    if (button.dataset.libDel !== undefined) {
+      deleteLibrary(button, button.dataset.libDel);
+      return true;
+    }
+    return false;
   }
 
   /* ================================= ORDERS ================================ */
@@ -7696,6 +7945,7 @@
     $('#automation-refresh').addEventListener('click', function () {
       loadAutomations(true);
       loadPrograms(true);
+      loadLibrary(true);
       refreshFleet(true);
       if (S.selected) { loadAutomation(); }
     });
@@ -7711,6 +7961,7 @@
 
       if (standingClick(button)) { return; }
       if (programClick(button)) { return; }
+      if (libraryClick(button)) { return; }
       if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
       if (button.dataset.autoArea && S.autoForm) {
         S.autoForm.areaMode = button.dataset.autoArea;
@@ -7747,6 +7998,9 @@
       // Kept on the form as typed and never redrawn from here, so the field keeps focus.
       if (node.dataset.autoLimit && S.autoForm) {
         S.autoForm.limits[node.dataset.autoLimit] = node.value === '' ? null : Number(node.value);
+      }
+      if (node.dataset.autoLibname !== undefined && S.autoForm && S.autoForm.library) {
+        S.autoForm.library.name = node.value;
       }
       if (node.tagName === 'INPUT' && node.type !== 'checkbox' && node.closest('.program-editor')) {
         programField(node);

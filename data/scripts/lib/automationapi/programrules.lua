@@ -78,6 +78,7 @@ end
 --   farm      never by itself: a farm loops until told otherwise, so it needs conditions
 --   orders    the chain runs out
 --   mission   the craft is back from the mission
+--   travel    the craft is back from the Travel mission: at its destination, available again
 --   standing  at once - the ship keeps the orders after the step
 --   wait      never: it needs an elapsed condition, or another that ends it
 
@@ -147,12 +148,36 @@ ProgramRules.actions =
         naturalEnd = "returned",
         normalize = function(spec)
             local action = {type = "mission"}
-            -- Without a rule of its own the step flies the craft's mission automation rule,
-            -- whatever it is when the step runs.
+            -- Without a rule of its own or a library mission's name, the step flies the
+            -- craft's mission automation rule, whatever it is when the step runs. A library
+            -- mission is looked up when the step starts, so an edit to it applies from the
+            -- next start; whether the name exists is the handler's check, at save.
+            if spec.library ~= nil then
+                if spec.rule ~= nil then fail("A mission step takes 'library' or 'rule', not both.") end
+                local name = type(spec.library) == "string" and string.match(spec.library, "^%s*(.-)%s*$") or ""
+                if name == "" then fail("'action.library' must be the name of a library mission.") end
+                action.library = name
+            end
             if spec.rule ~= nil then
                 local rule = MissionRules.normalize(spec.rule)
                 rule.enabled = nil
                 action.rule = rule
+            end
+            return action
+        end,
+    },
+    -- A Travel captain mission, as POST /ships/{name}/travel starts it: galaxy-wide, with no
+    -- sector loaded, which is what makes it the way to cross long distances between steps.
+    travel =
+    {
+        naturalEnd = "returned",
+        normalize = function(spec)
+            local action = {type = "travel", to = coordinates(spec.to, "'action.to'")}
+            if spec.swiftness ~= nil then
+                action.swiftness = integer(spec.swiftness, "'action.swiftness'")
+                if action.swiftness < 0 or action.swiftness > 3 then
+                    fail("'action.swiftness' is 0 (careful) to 3 (reckless).")
+                end
             end
             return action
         end,
@@ -299,7 +324,7 @@ ProgramRules.conditions =
 ProgramRules.actionNames = sortedNames(ProgramRules.actions)
 ProgramRules.conditionNames = sortedNames(ProgramRules.conditions)
 
-local THEN = {next = true, stop = true, ["goto"] = true}
+local THEN = {next = true, stop = true, start = true, ["goto"] = true}
 
 local function normalizeCondition(spec, index)
     if type(spec) ~= "table" then fail("Condition " .. index .. " must be an object.") end
@@ -367,10 +392,13 @@ local function normalizeStep(spec, index)
         gotoStep = spec["goto"]
     end
     thenValue = tostring(thenValue)
-    if not THEN[thenValue] then fail(where .. ": 'then' is next, stop or {\"goto\": n}.") end
+    if not THEN[thenValue] then fail(where .. ": 'then' is next, start, stop or {\"goto\": n}.") end
 
     step["then"] = thenValue
-    if thenValue == "goto" then step["goto"] = integer(gotoStep, where .. ": 'goto'") end
+    if thenValue == "goto" then
+        if gotoStep == nil then fail(where .. ": 'then' is goto but no 'goto' step is given.") end
+        step["goto"] = integer(gotoStep, where .. ": 'goto'")
+    end
 
     return step
 end
@@ -451,6 +479,7 @@ end
 function ProgramRules.nextStep(program, index)
     local step = program.steps[index]
     if step["then"] == "stop" then return nil end
+    if step["then"] == "start" then return 1 end
     if step["then"] == "goto" then return step["goto"] end
     if index < #program.steps then return index + 1 end
     return nil

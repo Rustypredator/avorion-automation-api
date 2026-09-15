@@ -362,7 +362,24 @@ function controlProgram(sent) {
     return Object.assign({ serverTime: 3600 }, entry);
 }
 
+/* The mission library, as the mod keeps it: saving bumps the revision. */
+const libraryStore = {};
+
+function saveLibraryMission(name) {
+    return function (sent) {
+        const previous = libraryStore[name];
+        const rule = Object.assign({}, previous ? previous.rule : {}, sent);
+        delete rule.ifRevision;
+        libraryStore[name] = {
+            name: name, owner: { kind: 'player', index: 1, name: 'Rusty' }, rule: rule,
+            revision: (previous ? previous.revision : 0) + 1, usedBy: []
+        };
+        return libraryStore[name];
+    };
+}
+
 const dynamic = {
+    '/automation/missions/library/Trade%20run': saveLibraryMission('Trade run'),
     '/ships/Ore%20Hound/program': saveProgram,
     '/ships/Ore%20Hound/program/control': controlProgram,
     '/ships/Ore%20Hound/mission/automation': saveAutomation,
@@ -387,6 +404,7 @@ const routes = {
     '/ships/Ore%20Hound/mission': { active: null },
     '/ships/Ore%20Hound/automation': houndAutomation,
     get '/automation/missions'() { return automationList(); },
+    get '/automation/missions/library'() { return { missions: Object.values(libraryStore), maxName: 48 }; },
     get '/automation/programs'() {
         return { serverTime: 3600, programs: Object.values(programStore),
                  actions: ['farm', 'mission', 'orders', 'route', 'standing', 'wait'], conditions: [] };
@@ -1001,10 +1019,35 @@ const ready = window.document.readyState === 'loading'
           'picking another craft in the list shows its rule');
     check($('#ship-name').textContent === 'Wingman', 'and selects it on the Fleet tab too');
 
-    console.log('\norder programs');
+    console.log('\nthe mission library');
 
     click($('#automation-rows [data-auto-ship="Ore Hound"]'));
     await settle(400);
+
+    const libraryList = () => $('#automation-pane [data-library-list]');
+    check(libraryList() && /Empty/.test(libraryList().textContent), 'the library starts empty');
+
+    click($('#automation-pane [data-auto-act="to-library"]'));
+    await settle(50);
+    const libEditor = () => $('#automation-pane [data-library-editor] .auto-editor');
+    check(libEditor() && /New library mission/.test(libEditor().textContent)
+          && !$('#automation-pane [data-auto-editor] .auto-editor'),
+          'copying the rule opens the editor in the library, not over the rule');
+
+    const libName = libEditor().querySelector('[data-auto-libname]');
+    libName.value = 'Trade run';
+    libName.dispatchEvent(new window.Event('input', { bubbles: true }));
+
+    posts.length = 0;
+    click(libEditor().querySelector('[data-auto-act="save-library"]'));
+    await settle(400);
+    const savedLibrary = posts.filter((p) => p.path === '/automation/missions/library/Trade%20run').pop();
+    check(savedLibrary && savedLibrary.body.mission === 'trade' && savedLibrary.body.ifRevision === 0
+          && savedLibrary.body.limits.maxAttackChance === 0.08 && savedLibrary.body.enabled === undefined,
+          'saving sends the rule under its name, limits in API units, with no switch');
+    check(!libEditor() && /Trade run/.test(libraryList().textContent), 'and it is listed');
+
+    console.log('\norder programs');
 
     const progStatus = () => $('#automation-pane [data-program-status]');
     check(/No program/.test(progStatus().textContent), 'a craft without a program offers to make one');
@@ -1036,9 +1079,13 @@ const ready = window.document.readyState === 'loading'
     change(editor().querySelector('[data-pf="steps.1.action.type"]'), 'route');
     await settle(50);
     typed(editor().querySelector('[data-pf="steps.1.action.to.x"]'), '14');
+    change(editor().querySelector('[data-pf="steps.1.then"]'), 'start');
+    await settle(50);
+    check(!editor().querySelector('[data-pf="steps.1.goto"]'), 'go to start needs no step number');
     change(editor().querySelector('[data-pf="steps.1.then"]'), 'goto');
     await settle(50);
-    change(editor().querySelector('[data-pf="steps.1.goto"]'), '1');
+    // Left at the shown default of 1: that has to be what gets saved.
+    check(editor().querySelector('[data-pf="steps.1.goto"]').value === '1', 'go to step shows step 1 by default');
 
     click(editor().querySelector('[data-prog-cond-add="1"]'));
     await settle(50);
@@ -1078,6 +1125,37 @@ const ready = window.document.readyState === 'loading'
     const moved = posts.filter((p) => p.path === '/ships/Ore%20Hound/program/control').pop();
     check(moved && moved.body.action === 'goto' && moved.body.step === 2, 'go here moves the program');
     check($$('#automation-pane .program-step')[1].classList.contains('current'), 'and the list follows');
+
+    click(progStatus().querySelector('[data-prog-act="edit"]'));
+    await settle(50);
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.2.action.type"]'), 'mission');
+    await settle(50);
+    const libraryPick = editor().querySelector('[data-pf="steps.2.action.library"]');
+    check(libraryPick && Array.from(libraryPick.options).map((o) => o.value).join('|') === '|Trade run',
+          'a mission step offers the craft\'s rule and every library mission');
+    change(libraryPick, 'Trade run');
+    await settle(50);
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.3.action.type"]'), 'travel');
+    await settle(50);
+    typed(editor().querySelector('[data-pf="steps.3.action.to.x"]'), '-300');
+    change(editor().querySelector('[data-pf="steps.3.action.swiftness"]'), '0');
+
+    posts.length = 0;
+    click(editor().querySelector('[data-prog-act="save"]'));
+    await settle(400);
+    const libSteps = (posts.filter((p) => p.path === '/ships/Ore%20Hound/program').pop() || { body: {} }).body.steps;
+    check(libSteps && libSteps[2].action.type === 'mission' && libSteps[2].action.library === 'Trade run',
+          'the mission step is saved naming the library mission');
+    check(libSteps && libSteps[3].action.type === 'travel' && libSteps[3].action.to.x === -300
+          && libSteps[3].action.swiftness === 0, 'and the travel step with its destination and swiftness');
+    const listedSteps = $$('#automation-pane .program-step');
+    check(/Trade run/.test(listedSteps[2].textContent) && /travel to -300/.test(listedSteps[3].textContent),
+          'both read back in the step list');
 
     $('[data-view="fleet"]').click();
     await settle(50);

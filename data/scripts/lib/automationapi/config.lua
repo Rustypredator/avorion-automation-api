@@ -126,6 +126,10 @@ Config.missionAutomationReportedCandidates = 8
 Config.missionAutomationValuePrefix = "automationapi_missionauto_"
 Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
 
+-- Server value key prefix of the mission library, one document per owning faction: named
+-- rules that programs' mission steps fly.
+Config.missionLibraryValuePrefix = "automationapi_missionlib_"
+
 -- #### ORDER PROGRAMS #### --
 
 -- How often the program runner looks at each running program, in seconds. A look reads the

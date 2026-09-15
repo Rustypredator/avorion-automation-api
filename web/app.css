@@ -450,7 +450,7 @@ marker#pa-warn path { fill: #5c4c1e; }
 #automation-list { border-right: 1px solid var(--line); display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--bg-2); }
 #automation-pane { overflow: auto; min-height: 0; padding: 14px 16px; }
 #automation-pane .ship-head { margin-bottom: 12px; }
-.program-step { align-items: flex-start; }
+.program-step, .library-row { align-items: flex-start; }
 .program-step.current { border-color: var(--accent-2); box-shadow: inset 2px 0 0 var(--accent); }
 .program-step-body { min-width: 0; }
 .program-editor select, .program-editor input { max-width: 100%; }

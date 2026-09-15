@@ -36,6 +36,7 @@ local Owner = include("automationapi/owner")
 local ShipEvents = include("automationapi/shipevents")
 local ProgramRules = include("automationapi/programrules")
 local MissionAutomation = include("automationapi/handlers/missionautomation")
+local MissionLibrary = include("automationapi/handlers/missionlibrary")
 
 local Programs = {}
 
@@ -278,6 +279,7 @@ local function requestFor(shipName, action)
     if action.type == "farm" then return base .. "/farm", body end
     if action.type == "orders" then return base .. "/orders", body end
     if action.type == "standing" then return base .. "/automation", body end
+    if action.type == "travel" then return base .. "/travel", body end
 
     return nil
 end
@@ -427,7 +429,17 @@ local function startStep(owner, index, shipName, program, run, authority)
     end
 
     if action.type == "mission" then
-        local rule = action.rule or MissionAutomation.ruleFor(index, shipName)
+        local rule
+        if action.library then
+            rule = MissionLibrary.ruleFor(index, action.library)
+            if not rule then
+                dispatchFailed(run, token, "no_library_mission",
+                               "The library has no mission called '" .. action.library .. "' any more.")
+                return
+            end
+        else
+            rule = action.rule or MissionAutomation.ruleFor(index, shipName)
+        end
         if not rule then
             dispatchFailed(run, token, "no_mission_rule",
                            "The step flies the craft's mission rule, and it has none. Set one up "
@@ -436,7 +448,10 @@ local function startStep(owner, index, shipName, program, run, authority)
         end
 
         MissionAutomation.startOnce(owner, shipName, rule, authority.index,
-            function(summary) dispatched(run, token, program, "Out on a mission: " .. summary) end,
+            function(summary)
+                dispatched(run, token, program, "Out on a mission"
+                           .. (action.library and (" (" .. action.library .. ")") or "") .. ": " .. summary)
+            end,
             function(code, message) dispatchFailed(run, token, code, message) end)
         return
     end
@@ -457,6 +472,7 @@ local function startStep(owner, index, shipName, program, run, authority)
         local what = action.type == "route" and string.format("Flying to (%d:%d).", action.to.x, action.to.y)
                      or action.type == "farm" and "Farming bosses."
                      or action.type == "orders" and "Orders dispatched."
+                     or action.type == "travel" and string.format("Travelling to (%d:%d).", action.to.x, action.to.y)
                      or "Standing orders set."
         if status == 202 then what = what .. " The ship did not confirm it yet." end
 
@@ -618,6 +634,40 @@ MissionAutomation.controlledBy = function(index, shipName)
     return program.name
 end
 
+-- The library asks which programs name a mission before deleting it, and has them follow a
+-- rename.
+local function eachLibraryStep(index, name, fn)
+    local data = loadFaction(index)
+    for _, shipName in ipairs(sortedKeys(data.ships)) do
+        for _, step in ipairs(data.ships[shipName].steps) do
+            if step.action.type == "mission" and step.action.library == name then fn(shipName, step) end
+        end
+    end
+    return data
+end
+
+MissionLibrary.usersOf = function(index, name)
+    local users, seen = {}, {}
+    eachLibraryStep(index, name, function(shipName)
+        if not seen[shipName] then
+            seen[shipName] = true
+            users[#users + 1] = shipName
+        end
+    end)
+    return users
+end
+
+-- The steps are edited in place, without a new revision: the program is the same program,
+-- so a running one carries on where it is.
+MissionLibrary.renamed = function(index, oldName, newName)
+    local changed = false
+    local data = eachLibraryStep(index, oldName, function(_, step)
+        step.action.library = newName
+        changed = true
+    end)
+    if changed then saveFaction(index, data) end
+end
+
 -- #### DESCRIPTIONS #### --
 
 local function describeRun(run, program)
@@ -735,6 +785,15 @@ function Programs.register(r)
         end
 
         local program = ProgramRules.normalize(ctx.body, previous)
+
+        for stepIndex, step in ipairs(program.steps) do
+            local library = step.action.type == "mission" and step.action.library
+            if library and not MissionLibrary.get(owner.index, library) then
+                Router.fail(400, "bad_program", string.format(
+                            "Step %d: the %s library has no mission called '%s'.", stepIndex,
+                            owner.kind == "alliance" and "alliance's" or "owner's", library))
+            end
+        end
 
         local stepsChanged = ctx.body.steps ~= nil
         local run = runs[runKey(owner.index, params.name)]

@@ -482,7 +482,7 @@ station, go back to step 1.
   "action": {"type": "farm", "boss": "auto"},
   "until": {"match": "any", "conditions": [{"type": "cargo", "op": ">=", "percent": 80}]},
   "repeat": false,
-  "then": "next"                           // "next", "stop", or {"goto": 1}
+  "then": "next"                           // "next", "start" (step 1), "stop", or {"goto": n}
 }
 ```
 
@@ -491,7 +491,8 @@ station, go back to step 1.
 | `route` | `to {x, y}`, and optionally `onEnemies`, `attackCivilians`, `preferGates`, `avoidRifts`, `preferUncontrolled` as for `/route` | when the plan ends (arrived, or stopped) |
 | `farm` | `boss`, `onEnemies`, `attackCivilians`, `collectLoot`, `bossCooldown` as for `/farm` | never - needs a condition |
 | `orders` | `orders`, `clear` as for `/orders` | when the chain runs out |
-| `mission` | optionally `rule`, a mission automation rule of its own; without one, the craft's stored rule | when the craft is back |
+| `mission` | optionally `library`, the name of a [library mission](#mission-library), or `rule`, a mission automation rule of its own; with neither, the craft's stored rule | when the craft is back |
+| `travel` | `to {x, y}`, optionally `swiftness` (0-3) as for `/travel` | when the craft is back, at the destination |
 | `standing` | `standing`, `attackCivilians` as for `POST /ships/{name}/automation` | at once |
 | `wait` | - | never - needs a condition |
 
@@ -536,7 +537,7 @@ is doing, and the vocabulary.
       "log": [{"at": 7010, "status": "running", "step": 1, "message": "Farming bosses."}]
     }
   }],
-  "actions": ["farm", "mission", "orders", "route", "standing", "wait"],
+  "actions": ["farm", "mission", "orders", "route", "standing", "travel", "wait"],
   "conditions": ["arrived", "at", "bossKills", "cargo", "elapsed", "enemies", "good", "idle", "missionReturned", "planEnded"],
   "maxSteps": 20
 }
@@ -566,8 +567,8 @@ Switching it off and on keeps its place (the step it was on starts its action ag
 
 Pass `ifRevision` as for mission rules: `409 program_changed` if someone saved since. A
 malformed program is `400 bad_program` (`details.known` lists actions or conditions where one
-is unknown); a mission step's own rule is checked as a mission rule is. Alliance craft need
-`ManageShips`.
+is unknown); a mission step's own rule is checked as a mission rule is, and a `library` name
+must be in the craft owner's library. Alliance craft need `ManageShips`.
 
 ### POST /ships/{name}/program/control
 
@@ -578,6 +579,45 @@ left as it is. Errors: `400 bad_control`, `400 bad_step`, `404 no_program`.
 ### POST /ships/{name}/program/delete
 
 Removes the program. `{"deleted": true}` if there was one.
+
+### Mission library
+
+Named mission rules a faction keeps for its programs' mission steps: a rule without a craft,
+under a name like `Refine, safe`. A step names one, and the runner loads it when the step
+starts, so an edit applies to every program flying it from its next start. Player craft fly
+the player's library, alliance craft the alliance's (`?owner=alliance`), which every member
+shares.
+
+#### GET /automation/missions/library
+
+`?owner=player|alliance|all` (default all).
+
+```json
+{
+  "missions": [{
+    "name": "Refine, safe", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+    "rule": {"mission": "refine", "objective": "hourly", "area": {"mode": "ship"}, "limits": {"maxAttackChance": 0.05}},
+    "revision": 2, "updatedBy": {"index": 1, "name": "Rusty"}, "updatedAt": 1757940000,
+    "usedBy": ["Ore Hound"]
+  }],
+  "maxName": 48
+}
+```
+
+`usedBy` lists the craft whose programs name the mission.
+
+#### POST /automation/missions/library/{name}
+
+Creates or updates the mission called `name`. The body is a rule as for
+`POST /ships/{name}/mission/automation`, merged over the stored one, except that a library
+mission has no `enabled`. `rename` moves it to a new name, and the programs naming it follow
+without a new revision. `ifRevision` as for rules. Errors: `400 bad_name`, `400 bad_rule`,
+`422 not_automatable`, `409 library_changed`, `409 name_taken`, `403 missing_privilege`.
+
+#### POST /automation/missions/library/{name}/delete
+
+Removes it: `{"deleted": true}` if there was one. A mission a program still names is
+`409 mission_in_use`, with the craft in `details.usedBy`.
 
 ## POST /ships/{name}/travel
 
