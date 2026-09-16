@@ -159,8 +159,9 @@ tools/localserver.sh lab setup       # a carrier for PLAYER_INDEX, and Swoks
 tools/localserver.sh lab fighters    # 12 fighters with pilots (needs a frame after setup)
 tools/localserver.sh lab report      # what a farm sees: boss, loot by kind, hangar, stats
 tools/localserver.sh lab kill        # Swoks dies; money, resources, cargo, a subsystem, a torpedo
-tools/localserver.sh lab loot        # every squad on CollectLoot
+tools/localserver.sh lab loot        # every squad on CollectLoot, and the fighters already out
 tools/localserver.sh lab report      # ...a minute later: what the fighters took
+tools/localserver.sh lab orders      # what each deployed fighter is flying right now
 tools/localserver.sh lab recall
 tools/localserver.sh lab pickup      # the stat Transporter Software adds
 tools/localserver.sh lab plan route  # a plan through the mod's orderchain callable
@@ -188,6 +189,7 @@ That is correct, and it is as far as a headless test of the farm loop itself can
 | what fighters need for cargo | a transporter block **and** the `FighterCargoPickup` stat. Either one alone and every cargo drop stays. |
 | does the `Transporter` component tell a transporter block apart | no, every ship has it. `Plan():getNumBlocks(BlockType.Transporter)` does. |
 | `FighterOrders.Return` | the squad was back in the hangar within 25 s |
+| does a squad order reach fighters that are already out | not while they fly an order of their own, which a fight gives them: after an attack the fighters landed and collected nothing, though every squad was on `CollectLoot`. They are re-ordered one by one through `FighterAI:setOrders` now, attackers excepted. Seen in a live game, not in the headless lab; `lab orders` prints what each deployed fighter is flying. |
 | `getSquadFighters` | counts fighters in the hangar only, not the ones out |
 
 ### In game, with the client
@@ -205,7 +207,8 @@ Then check, in the Travel tab and the notifications:
 
 1. the boss shows up as **in sector** and the loop stops for it, before it turns hostile
 2. killing it counts a kill and starts the cooldown countdown
-3. the fighters launch for the loot, cargo only with a transporter block and the software
+3. the fighters launch for the loot, cargo only with a transporter block and the software -
+   including the ones the fight left out, which must turn round rather than land first
 4. they return before the ship moves on, and the ship sits the cooldown out without jumping
 5. with the page in the background: "Boss spawned", "Boss killed" and, once the pause is over,
    "Boss cooldown over". Set the pause to 1 minute on the farm form for that last one.

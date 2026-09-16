@@ -137,6 +137,9 @@ local function newWorld()
         squadFighters = {[0] = 3, [1] = 2},
         deployed = 0,
         squadOrders = {},
+        -- what each deployed fighter is flying, by its index; a fight leaves fighters on
+        -- orders of their own, which a squad order does not take them off
+        fighterOrders = {},
         collectedAll = false,
         crafts = {},     -- other craft in the sector, see craft()
         distance = {},   -- craft name -> nearest distance from the ship
@@ -152,7 +155,7 @@ end
 
 _G.EntityType = {Loot = 8}
 _G.ComponentType = {CargoLoot = 71, DockingPositions = 30}
-_G.FighterOrders = {Return = 3, CollectLoot = 9}
+_G.FighterOrders = {Attack = 1, Return = 3, CollectLoot = 9}
 _G.StatsBonuses = {FighterCargoPickup = 48}
 _G.BlockType = {Transporter = 55}
 _G.Plan = function()
@@ -245,7 +248,19 @@ _G.FighterController = function()
             for i = 1, world.deployed do out[i] = {index = i} end
             return table.unpack(out)
         end,
+        -- as in the engine: the squad's order is what launches fighters still in the
+        -- hangar, and leaves the ones already out flying whatever they were given
         setSquadOrders = function(_, squad, orders) world.squadOrders[squad] = orders end,
+    }
+end
+
+_G.FighterAI = function(fighter)
+    local index = fighter.index
+
+    return
+    {
+        orders = world.fighterOrders[index],
+        setOrders = function(_, orders) world.fighterOrders[index] = orders end,
     }
 end
 
@@ -643,10 +658,15 @@ world.enemies = true
 tick()
 check(actions() == "A", "and is ordered in again once there are enemies")
 
--- the boss dies: gone from a sector the ship never left, drops behind
+-- the boss dies: gone from a sector the ship never left, drops behind. The fight left its
+-- fighters out on orders of their own - most of them already flying home, one still on a
+-- target.
 world.bosses = {}
 world.enemies = false
 world.aiState = "Idle"
+world.deployed = 5
+world.fighterOrders = {FighterOrders.Return, FighterOrders.Return, FighterOrders.Attack,
+                       FighterOrders.Return, FighterOrders.Return}
 world.loot = {{cargo = false}, {cargo = false}, {cargo = true}, {cargo = false, collectable = false}}
 tick()
 local p = state().plan
@@ -662,7 +682,11 @@ tick()
 check(world.squadOrders[0] == FighterOrders.CollectLoot
       and world.squadOrders[1] == FighterOrders.CollectLoot,
       "every squad is sent to collect loot")
-world.deployed = 5
+check(world.fighterOrders[1] == FighterOrders.CollectLoot
+      and world.fighterOrders[4] == FighterOrders.CollectLoot,
+      "and the fighters already out are turned round one by one, or they would land instead")
+check(world.fighterOrders[3] == FighterOrders.Attack,
+      "except one still attacking, which the engine sends home when the sector is clear")
 
 world.loot = {{cargo = false}, {cargo = true}}
 tick()
@@ -1008,9 +1032,17 @@ tick()
 world.loot = {{cargo = false}}
 world.enemies = false
 world.aiState = "Idle"
+-- the fight is over and its fighters are heading home on the orders it gave them
+world.deployed = 3
+world.fighterOrders = {FighterOrders.Return, FighterOrders.Return, FighterOrders.Return}
 tick()
 check(state().reaction and state().reaction.kind == "loot" and state().reaction.phase == "looting",
       "a fight that leaves loot goes on to the loot")
+tick()
+check(world.fighterOrders[1] == FighterOrders.CollectLoot
+      and world.fighterOrders[2] == FighterOrders.CollectLoot
+      and world.fighterOrders[3] == FighterOrders.CollectLoot,
+      "fighters coming back from the fight are sent for the loot instead of landing")
 world.enemies = true
 tick()
 check(actions() == "A" and state().reaction.phase == "fighting",

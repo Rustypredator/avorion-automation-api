@@ -429,6 +429,10 @@ function steps.kill(playerIndex)
     say("boss destroyed, drops placed (torpedo: %s)", tostring(okTorpedo))
 end
 
+-- The same two steps the mod's orderchain takes (automationApiOrderSquads): the squad
+-- order, which is what launches fighters out of the hangar, and then the fighters already
+-- out, which keep an order of their own - a fight gives each of them one - unless they are
+-- told individually. Attackers are left alone.
 local function orderSquads(playerIndex, orders)
     local ship = carrier(playerIndex)
     if not ship then say("no carrier") return end
@@ -437,7 +441,38 @@ local function orderSquads(playerIndex, orders)
     for _, squad in ipairs({Hangar(ship):getSquads()}) do
         controller:setSquadOrders(squad, orders, Uuid())
     end
-    say("squads ordered: %s", tostring(orders))
+
+    local taken, left = 0, 0
+    for _, fighter in ipairs({controller:getDeployedFighters()}) do
+        local ai = FighterAI(fighter)
+        if ai.orders ~= orders and ai.orders ~= FighterOrders.Attack then
+            ai:setOrders(orders, Uuid())
+            taken = taken + 1
+        else
+            left = left + 1
+        end
+    end
+
+    say("squads ordered: %s, deployed re-ordered %d, left alone %d",
+        tostring(orders), taken, left)
+end
+
+-- What every fighter that is out is flying right now, which is how the loot-after-a-fight
+-- problem shows: fighters on Return while the squads are on CollectLoot.
+function steps.orders(playerIndex)
+    local ship = carrier(playerIndex)
+    if not ship then say("no carrier") return end
+
+    local counts, order = {}, {}
+    for _, fighter in ipairs({FighterController(ship):getDeployedFighters()}) do
+        local name = tostring(FighterAI(fighter).orders)
+        if not counts[name] then counts[name] = 0; order[#order + 1] = name end
+        counts[name] = counts[name] + 1
+    end
+
+    local parts = {}
+    for _, name in ipairs(order) do parts[#parts + 1] = name .. " x" .. counts[name] end
+    say("deployed fighter orders: %s", #parts > 0 and table.concat(parts, ", ") or "none out")
 end
 
 -- What Rare Transporter Software adds when installed permanently, without the software.

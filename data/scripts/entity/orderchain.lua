@@ -251,6 +251,37 @@ local function automationApiFighters()
     return math.max(total, deployed), deployed, squads
 end
 
+-- Orders the fighters that are already out, one by one.
+--
+-- A squad order is what the hangar launches on, but it does not take a fighter off an order
+-- of its own, and a fight gives every fighter one: the engine's combat AI assigns targets
+-- per fighter (FighterAI:setOrders, the way vanilla's behemoth does in
+-- entity/background/behemothbehavior.lua). That is why loot collection after a fight found
+-- the squads flying home and nothing collected - the fighters were still flying what the
+-- fight left them, and the squad's CollectLoot only applied to whatever launched next.
+--
+-- A fighter on Attack is left alone. It has something to shoot, and the engine sends it
+-- home by itself once the sector is clear, so taking it off its target to chase a drop
+-- would leave the ship fighting without its fighters. Everything else - above all the
+-- Return the end of a fight leaves behind - is overwritten.
+local function automationApiOrderDeployed(orders)
+    local ok, deployed = pcall(function()
+        return {FighterController():getDeployedFighters()}
+    end)
+    if not ok then return end
+
+    for _, fighter in ipairs(deployed) do
+        pcall(function()
+            local ai = FighterAI(fighter)
+            local current = ai.orders
+
+            if current ~= orders and current ~= FighterOrders.Attack then
+                ai:setOrders(orders, Uuid())
+            end
+        end)
+    end
+end
+
 local function automationApiOrderSquads(orders)
     local _, _, squads = automationApiFighters()
 
@@ -260,6 +291,8 @@ local function automationApiOrderSquads(orders)
             controller:setSquadOrders(squad, orders, Uuid())
         end
     end)
+
+    automationApiOrderDeployed(orders)
 end
 
 -- #### PUBLISHING #### --
