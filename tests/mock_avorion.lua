@@ -701,6 +701,7 @@ M.commandErrorArgs = nil
 M.predictionError = nil
 M.predictionRaises = nil
 M.areaSize = {x = 15, y = 15}
+M.areaSizes = nil
 M.areaFixed = false
 
 function M.makeCommand(missionType, shipName, area, config)
@@ -709,6 +710,8 @@ function M.makeCommand(missionType, shipName, area, config)
     -- TravelCommand's area is the destination sector alone, whatever the other missions use
     function c:getAreaSize()
         if missionType == M.commandTypes.Travel then return {x = 1, y = 1} end
+        -- several shapes, as TradeCommand offers three, when a test sets M.areaSizes
+        if M.areaSizes then return table.unpack(M.areaSizes) end
         return M.areaSize
     end
     function c:isAreaFixed() return M.areaFixed end
@@ -780,7 +783,9 @@ function M.makeCommand(missionType, shipName, area, config)
     return c
 end
 
--- Delivers queued asyncf results, standing in for the worker thread finishing.
+-- Delivers queued asyncf results, standing in for the worker thread finishing. `results`
+-- is the analysis every job gets, or a function(area) giving each area its own - which is
+-- what a sweep over several areas needs to find anything to choose between.
 function M.flushAsync(results)
     local queued = M.asyncQueue
     M.asyncQueue = {}
@@ -789,7 +794,8 @@ function M.flushAsync(results)
         local ownerIndex, shipName, missionType, area, callingPlayer = table.unpack(job.args)
 
         area.origin = {x = 0, y = 0}
-        local analysis = results or
+        local analysis = (type(results) == "function" and results(area))
+                         or (type(results) == "table" and results) or
         {
             sectors = 225, reachable = 200, unreachable = 25,
             sectorsByFaction = {[0] = 120}, reachableCoordinates = {},

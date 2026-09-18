@@ -376,18 +376,57 @@ assessment preview runs, then the same agent handshake.
 - **Automatable missions**: mine, salvage, trade, expedition, scout, refine, sell, procure,
   maintenance. Travel ends elsewhere and supply never finishes, so neither can be repeated.
 
-Each check runs one area analysis and predicts every config worth trying against it:
+Each check runs an area analysis - one, or one per area of a sweep - and predicts every
+config worth trying against each:
 
 | mission | what is searched |
 |---|---|
 | mine, salvage | every half hour of duration the captain allows |
 | expedition | 30, 60, 90 and 120 minutes |
-| trade | every route in the area, at every flight count from the fewest the cargo bay allows, each with the smallest deposit that achieves it |
+| trade | every route in the area, at every flight count from the fewest the cargo bay allows, each with the smallest deposit that achieves it; goods in `goods.avoid` are skipped |
 | others | the config as given |
 
-Options that break a limit - or that the game itself would refuse - are dropped, and the best
-of the rest by the rule's `objective` is started. Ties go to the lower ambush chance. At most
-one check runs per pass, and never on the last free analysis slot.
+Options that break a limit - or that the game itself would refuse - are dropped. Of the rest,
+a good in `goods.prefer` goes first, then the rule's `priorities` decide in order, each
+breaking the ties of the one before; remaining ties go to the lower ambush chance, then the
+better value an hour. At most one check starts per pass, and never on the last free analysis
+slot.
+
+### Sweeps
+
+A trade analysis offers at most four routes, chosen from the stations inside the area, and a
+route a contract just flew is hidden for two hours. One area around the ship therefore often
+has nothing left worth flying. A rule with `"area": {"mode": "sweep"}` (the default for trade)
+lays the area around the craft at nine placements - centre, each corner, the middle of each
+side - at every shape the captain allows (trade: 17x17, 29x11, 11x29), and judges every
+candidate from every one of them together. The chosen option starts in the area it was found
+in. Areas are analysed one after another, each waiting for a free slot below the one kept for
+the console, so a sweep takes a while: up to `Config.missionAutomationSweepTimeout` (600s),
+after which it is ranked on what it has. A mission whose area the game recentres on the ship
+anyway sweeps its shapes only.
+
+The deposit search runs in every area, so `maxAttackChance` picks, per route and area, the
+deposit that stays under the ceiling - the ambush chance depends on the area as well as the
+deposit.
+
+### Pairs
+
+A rule's `escorts` go out with the craft, and the pair stays together: the game moves each
+escort to its primary when the mission ends, wherever that is. Every escort is required unless
+it is in `optionalEscorts`.
+
+- Before each check the automation asks each escort what the start would: is it available, not
+  driven by a program, within one jump of the primary (measured with the escort's own drive)
+  and on the same side of the barrier unless it can cross rifts, and usable (captain, crew,
+  energy, undamaged). The game answers these only in chat, so they are asked here first.
+- A **required** escort that is not ready holds the primary back in phase `escort`, with the
+  reason. Nothing brings it over by itself; move it, and the pair goes on the next check.
+- An **optional** escort that is not ready is left behind, logged with why, and the limits
+  judge the mission without it - so a pair whose ambush chance only fits with the escort
+  still waits.
+- An escort belongs to **one enabled pair** at a time, and an escort cannot lead a pair of
+  its own. An escort may keep a rule of its own; it waits in phase `paired` while its primary's
+  rule is on. Switching the primary's rule off frees it.
 
 ### Trade and the impatient customer
 
@@ -408,7 +447,9 @@ pull against each other, and the trade search exists to find the deposit that sa
   "mission": "trade",
   "enabled": true,
   "objective": "hourly",
-  "area": {"mode": "ship", "size": {"x": 17, "y": 17}, "placement": {"fx": 0.5, "fy": 0.5}},
+  "priorities": ["hourly", "fewestFlights", "safest"],
+  "area": {"mode": "sweep"},
+  "goods": {"prefer": ["Energy Cell"], "avoid": ["Oil"]},
   "limits": {
     "maxAttackChance": 0.1,
     "maxFlights": 3,
@@ -416,17 +457,20 @@ pull against each other, and the trade search exists to find the deposit that sa
     "minCreditsLeft": 5000000
   },
   "config": {},
-  "materials": ["Iron", "Titanium"],
-  "escorts": ["Wingman"],
+  "escorts": ["Wingman", "Picket"],
+  "optionalEscorts": ["Picket"],
   "collectYields": true
 }
 ```
 
 | field | |
 |---|---|
-| `objective` | `hourly` (value per hour away), `total` (biggest value), `safest` (lowest ambush chance) |
-| `area.mode` | `ship` recentres on the craft at every check, at `size` (default: the first the captain allows) with the craft at `placement` (fractions of each side, default the centre); `fixed` takes `lower` and `upper` |
+| `priorities` | criteria in order: `hourly` (value per hour away), `total` (biggest value), `safest` (lowest ambush chance), `shortest` (least time away), `fewestFlights` (trade: least chance the customer walks), `cheapest` (smallest deposit or budget). Each breaks the ties of the one before |
+| `objective` | the first priority. Sent on its own, it replaces `priorities` with itself |
+| `area.mode` | `ship` recentres on the craft at every check, at `size` (default: the first the captain allows) with the craft at `placement` (fractions of each side, default the centre); `sweep` tries every placement at every shape, or at the shapes in `sizes` (default for trade, see [Sweeps](#sweeps)); `fixed` takes `lower` and `upper` |
+| `goods` | trade only: `prefer` goes first among the options that pass, `avoid` is never tried. Names as in the goods table, matched case-blind |
 | `config`, `materials`, `escorts` | as for a start. A searched field (a duration, a trade route and deposit) is chosen by the check, not taken from here |
+| `optionalEscorts` | escorts the craft may leave behind; the rest are required (see [Pairs](#pairs)) |
 | `collectYields` | collect waiting yields before each check |
 
 Every limit is optional. Units are the same for every mission:
@@ -448,11 +492,20 @@ default is both.
 ```json
 {
   "serverTime": 18234.5,
-  "automations": [{"ship": "Prospector", "owner": {"kind": "player"}, "rule": {}, "state": {}}],
+  "automations": [{"ship": "Prospector", "owner": {"kind": "player"}, "rule": {}, "state": {},
+                   "pairing": null, "dryRun": null}],
+  "pairs": [{"owner": {"kind": "player"}, "primary": "Hauler",
+             "escorts": [{"name": "Wingman", "required": true}, {"name": "Picket", "required": false}]}],
   "supported": ["expedition", "maintenance", "mine", "procure", "refine", "salvage", "scout", "sell", "trade"],
-  "limits": ["maxAttackChance", "maxDeposit", "maxDuration", "maxFlights", "minCreditsLeft", "minDuration", "minValue"]
+  "limits": ["maxAttackChance", "maxDeposit", "maxDuration", "maxFlights", "minCreditsLeft", "minDuration", "minValue"],
+  "criteria": ["cheapest", "fewestFlights", "hourly", "safest", "shortest", "total"]
 }
 ```
+
+`pairs` lists every enabled rule with escorts. An entry's `pairing` is, for a craft with
+escorts, `{"role": "primary", "active": true, "escorts": [{"name", "required", "ready",
+"problem"}]}` - `problem` is why an escort could not go right now - and for a craft another
+enabled rule names as escort, `{"role": "escort", "primary": "Hauler", "required": true}`.
 
 Timestamps in `state` are server runtime seconds, like `serverTime`, so compare them with it
 rather than with a wall clock. `state` is `null` until the loop has looked at the rule, and
@@ -462,7 +515,7 @@ starts empty after a server restart.
 {
   "phase": "blocked",
   "message": "Nothing within the limits: ambush chance 14% is above 10%",
-  "since": 18100.2, "nextCheckAt": 18400.2, "busy": false,
+  "since": 18100.2, "nextCheckAt": 18400.2, "busy": false, "progress": null,
   "dispatches": 6,
   "lastDispatch": {"at": 16020.0, "mission": "trade", "summary": "trade, Oil, 3 flights, 1.0h, ambush 8%, ~412000 ¢/h", "candidate": {}},
   "lastEvaluation": {"at": 18100.2, "tried": 9, "passing": 0, "chosen": null, "candidates": []},
@@ -474,7 +527,9 @@ starts empty after a server restart.
 | phase | |
 |---|---|
 | `waiting` | will be checked on a coming pass |
-| `evaluating` | an analysis is running for it |
+| `evaluating` | an analysis is running for it; during a sweep `progress` is `{"done", "total"}` areas |
+| `escort` | a required escort is not ready; `message` says which and why |
+| `paired` | the craft escorts another craft's enabled rule, so its own rule waits |
 | `starting` | the start job is with the owner's agent |
 | `running` | out on a mission the automation sent it on |
 | `busy` | out on a mission started some other way |
@@ -498,8 +553,10 @@ is the whole of switching a craft off. `limits`, when given, replaces the stored
 Pass `ifRevision` - the `rule.revision` you last read, `0` for a new rule - and a save that
 would overwrite someone else's change is refused with `409 rule_changed`, the current revision
 and rule in `details`. Alliance craft need `ManageShips` (`403 missing_privilege`). An
-unknown limit or material is `400 bad_rule`; a mission that cannot be automated is
-`422 not_automatable`.
+unknown limit, material, good, priority or escort is `400 bad_rule`; a mission that cannot be
+automated is `422 not_automatable`. An escort already in another enabled pair, a craft that
+escorts another trying to lead a pair, or an escort that leads a pair of its own is
+`409 escort_paired`, with `escort` and `primary` in `details`.
 
 ### POST /ships/{name}/mission/automation/delete
 
@@ -512,17 +569,33 @@ would not go - and nothing started. The body is merged over the stored rule with
 it, so limits can be tried before they are committed; `{}` checks the stored rule as is.
 Works with the owner offline.
 
+A check over one area answers `200` with the result below. A sweep is far longer than a
+request may wait, so it answers `202` at once with `{"evaluating": true, "dryRun": {...}}`
+and the result lands in the craft's `dryRun` (served by `GET /ships/{name}/mission/automation`
+and the list): `{"running", "done", "total", "startedAt", "finishedAt", "by", "result",
+"error"}`, `result` being the body below. A second dry run of the same craft while one runs
+is `409 evaluation_running`.
+
+Escorts are mustered as the loop would: optional escorts that are not ready are left out of
+the figures, a required one is kept in them and named in `waitingFor` (`{"escort",
+"problem"}`), in which case `wouldStart` is false.
+
 ```json
 {
   "wouldStart": true,
+  "waitingFor": null,
   "evaluation": {
-    "objective": "hourly", "tried": 6, "passing": 2,
+    "objective": "hourly", "priorities": ["hourly"], "tried": 60, "passing": 7,
+    "areas": 27, "analysed": 27,
     "area": {"lower": {"x": -324, "y": 311}, "upper": {"x": -308, "y": 327}},
+    "escorts": {"going": ["Wingman"], "left": [{"name": "Picket", "problem": "out on a mission"}]},
     "chosen": {"passes": true},
     "candidates": [{
       "passes": true,
-      "config": {"goodName": "Oil", "deposit": 34304, "escorts": []},
+      "preferred": true,
+      "config": {"goodName": "Oil", "deposit": 34304, "escorts": ["Wingman"]},
       "route": {"good": "Oil", "from": {"x": -310, "y": 318}, "to": {"x": -300, "y": 322}},
+      "area": {"lower": {"x": -324, "y": 311}, "upper": {"x": -308, "y": 327}},
       "metrics": {
         "attackChance": 0.07, "duration": 3600, "flights": 3, "expectedFlights": 3,
         "completionChance": 1, "patience": "safe", "cost": 34304,
@@ -534,6 +607,10 @@ Works with the owner offline.
   "assessment": ["We do not have to fly often. ..."]
 }
 ```
+
+`area` is the area the chosen option was found in, and each candidate names its own. A sweep
+sees the same route from several areas; `candidates` lists each route and flight count once,
+at its best-ranked area, while `tried` and `passing` count them all.
 
 `patience` follows the captain's wording thresholds: `safe` up to 3 flights, `small risk` to
 5, `real risk` to 10, `likely lost` beyond.
@@ -553,8 +630,9 @@ station, go back to step 1.
   `POST /ships/{name}/automation`, issued internally with the program's authority - so each is
   validated, refused and confirmed exactly as a client's call would be, and needs what that
   call needs (the owner online, the sector loaded, a captain). A mission step runs the craft's
-  mission automation rule once: one analysis, the best option inside its limits, the ordinary
-  start.
+  mission automation rule once: its escorts mustered (a required one not ready fails the step
+  with `escort_unavailable`), the analysis or sweep, the best option inside its limits, the
+  ordinary start.
 - **While a program runs, the craft's mission rule does not dispatch by itself** (its state
   shows phase `program`). When the program finishes or is switched off, the rule takes over
   again.

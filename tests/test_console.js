@@ -345,7 +345,16 @@ function saveAutomation(sent) {
     return automationStore[key];
 }
 
-const tradeEvaluation = () => ({
+// Set while the test wants the mod to answer as it does for a sweep: 202 at once, the
+// result later in the craft's dryRun.
+let sweepChecks = false;
+
+const tradeEvaluation = () => (sweepChecks
+    ? { status: 202, body: { ship: 'Ore Hound', evaluating: true,
+                             dryRun: { running: true, done: 0, total: 27, startedAt: 3600 } } }
+    : tradeResult());
+
+const tradeResult = () => ({
     ship: 'Ore Hound', wouldStart: true, assessment: ['That is only a few flights.'],
     evaluation: {
         at: 3600, objective: 'hourly', tried: 6, passing: 1,
@@ -510,6 +519,10 @@ const routes = {
     '/ships/Ore%20Hound/automation': houndAutomation,
     '/ships/Ore%20Hound/transfer': transferHolds,
     get '/automation/missions'() { return automationList(); },
+    get '/ships/Ore%20Hound/mission/automation'() {
+        return Object.assign({ serverTime: 3600 }, automationStore['player/Ore Hound'],
+                             { dryRun: { running: false, done: 27, total: 27, result: tradeResult() } });
+    },
     get '/automation/missions/library'() { return { missions: Object.values(libraryStore), maxName: 48 }; },
     get '/automation/programs'() {
         return { serverTime: 3600, programs: Object.values(programStore),
@@ -1273,6 +1286,15 @@ const ready = window.document.readyState === 'loading'
     ambush.value = '8';
     ambush.dispatchEvent(new window.Event('input', { bubbles: true }));
 
+    check(autoPane.querySelector('[data-auto-area="sweep"]').classList.contains('on'),
+          'a new trade rule scans around the ship');
+    click(autoPane.querySelector('[data-auto-prio-add="fewestFlights"]'));
+    await settle(50);
+    click(autoPane.querySelector('[data-auto-escort-req="Wingman"]'));
+    await settle(50);
+    check(autoPane.querySelector('[data-auto-limit="maxAttackChance"]').value === '8',
+          'editing priorities and escorts keeps the limits typed so far');
+
     posts.length = 0;
     click(autoPane.querySelector('[data-auto-act="test"]'));
     await settle(400);
@@ -1280,6 +1302,9 @@ const ready = window.document.readyState === 'loading'
     const tested = posts.filter((p) => /automation\/evaluate$/.test(p.path)).pop();
     check(tested && tested.body.limits.maxAttackChance === 0.08 && tested.body.limits.maxFlights === 3,
           'testing sends the limits in the API\'s units');
+    check(tested && tested.body.priorities.join() === 'hourly,fewestFlights'
+          && tested.body.optionalEscorts.join() === 'Wingman' && tested.body.escorts.join() === 'Wingman',
+          'with the priorities in order and the escort made optional');
     const testRows = $$('#automation-pane .auto-editor ~ .card tbody tr');
     check(testRows.length === 2 && /chosen/.test(testRows[0].textContent)
           && /ambush chance 9% is above 8%/.test(testRows[1].textContent),
@@ -1295,8 +1320,8 @@ const ready = window.document.readyState === 'loading'
           'saving a new rule switches it on, guarded by revision');
     check(saved && saved.body.config.goodName === undefined && saved.body.config.deposit === undefined,
           'without the planner\'s route and deposit, which the automation picks each time');
-    check(saved && saved.body.escorts.indexOf('Wingman') !== -1 && saved.body.area.mode === 'ship',
-          'with the planner\'s escorts, following the ship');
+    check(saved && saved.body.escorts.indexOf('Wingman') !== -1 && saved.body.area.mode === 'sweep',
+          'with the planner\'s escorts, scanning around the ship');
     check(!autoPane.querySelector('.auto-editor'), 'the editor closes');
     check(/send out automatically/.test(autoStatus().textContent)
           && autoPane.querySelector('[data-auto-toggle]').checked,
@@ -1341,6 +1366,17 @@ const ready = window.document.readyState === 'loading'
     await settle(300);
     check(autoPane.querySelector('[data-auto-toggle]').checked === true,
           'and the console reloads it rather than showing the switch it failed to flip');
+
+    // A sweep answers at once; the console follows its progress until the result lands.
+    sweepChecks = true;
+    click(autoPane.querySelector('[data-auto-act="check"]'));
+    await settle(300);
+    check(/scanning around the ship: 0 of 27 areas/.test(autoStatus().textContent),
+          'a sweeping check shows how far it has got');
+    await settle(2600);
+    check(/would send it/.test(autoStatus().textContent) && $$('#automation-pane [data-auto-status] tbody tr').length === 2,
+          'and its options once it lands');
+    sweepChecks = false;
 
     click($('#automation-rows [data-auto-ship="Wingman"]'));
     await settle(400);

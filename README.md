@@ -203,8 +203,13 @@ location from the library kept on the Automation tab, which your alliance shares
 
 The **Mission** tab's **Automation** section turns whatever the planner below it holds into a
 rule: set a ceiling on the ambush chance, a duration window, how many trade flights the
-customer should have to sit through, a deposit cap or a credit reserve, and pick whether to
-optimise for profit an hour, total yield or safety. **Test limits** runs the check without
+customer should have to sit through, a deposit cap or a credit reserve, and put what matters
+in order - profit an hour, total yield, safety, time away, fewest flights, smallest deposit.
+Trade rules scan the area around the ship every way it fits before each contract, so they
+pick from whatever routes are open near the ship at the time, can prefer or avoid goods, and
+take the deposit that keeps the ambush chance under your ceiling. Name escorts to make a
+pair: the pair goes out together, a required escort holds the ship back until it is ready,
+an optional one is left behind when it is not. **Test limits** runs the check without
 starting anything and lists every option it weighed with why each would or would not go. Once
 saved, the mod does the rest; the fleet list badges each automated craft with what its rule is
 doing, and every alliance member's console shows the same rules and state.

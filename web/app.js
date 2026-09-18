@@ -602,8 +602,9 @@
       + 'stays inside the limits. It runs on the server: closing the console stops nothing, '
       + 'but the owner &mdash; or, for alliance craft, any member &mdash; has to be logged '
       + 'in for a start to go through, exactly as for a start by hand.</p>'
-      + '<p>Each check runs one area analysis, tries every way of flying the mission that '
-      + 'is worth trying against it, and sends the best one that passes. An alliance '
+      + '<p>Each check runs an area analysis &mdash; for a rule that scans, one for every way the '
+      + 'area fits around the ship &mdash; tries every way of flying the mission that is worth '
+      + 'trying against each, and sends the best one that passes. An alliance '
       + 'craft&rsquo;s rule is shared: every member sees and edits the same one.</p>',
 
     'program-overview':
@@ -649,14 +650,36 @@
       + 'allowing for the customer walking away.',
 
     'auto-area':
-      'Following the ship recentres the area on wherever the craft is when it is checked, '
-      + 'at the same size &mdash; the right choice for trade, whose ship ends each contract '
-      + 'somewhere else. A fixed area always searches the same rectangle.',
+      '<b>Scan around the ship</b> lays the area around the craft nine ways &mdash; centred, in '
+      + 'each corner, on each side &mdash; at every shape, analyses each in turn and picks from '
+      + 'all of them. The game offers at most four trade routes per area and hides a route for '
+      + 'two hours after a contract, so this is what keeps a trader finding work; a check takes '
+      + 'a minute or so. <b>Follow the ship</b> analyses one area centred on the craft wherever '
+      + 'it is. A fixed area always searches the same rectangle.',
 
     'auto-objective':
-      '<b>Profit / hour</b> weighs yield against time away. <b>Total yield</b> takes the '
-      + 'biggest haul the limits allow. <b>Lowest ambush</b> takes the safest option that '
-      + 'still passes. Ties go to the safer option.',
+      'What decides between the options that pass, in order: each one breaks the ties of the '
+      + 'one before. <b>Profit / hour</b> weighs yield against time away, <b>total yield</b> '
+      + 'takes the biggest haul, <b>lowest ambush</b> the safest, <b>least time away</b> the '
+      + 'quickest, <b>fewest flights</b> the trade contract least likely to be lost to an '
+      + 'impatient customer, <b>smallest deposit</b> the least money tied up. Remaining ties go '
+      + 'to the safer option.',
+
+    'auto-goods':
+      'Trade only. <b>Prefer</b>: among the options that pass the limits, these goods go first '
+      + '&mdash; a preferred good that breaks a limit is still not taken. <b>Avoid</b>: never '
+      + 'traded. Names as the game spells them, separated by commas.',
+
+    'auto-pairs':
+      '<p>Escorts go out with the craft and come back with it, wherever the mission ends. '
+      + 'Their firepower and hull count into the ambush chance, so a pair often fits under a '
+      + 'ceiling the craft alone would not.</p>'
+      + '<p>A <b>required</b> escort holds the craft back until it is ready: available, within '
+      + 'one jump of the craft, on the same side of the barrier, crewed and undamaged. Nothing '
+      + 'moves it over by itself. An <b>optional</b> escort is left behind when it is not ready, '
+      + 'and the limits then judge the mission without it.</p>'
+      + '<p>An escort belongs to one pair at a time. Its own rule, if it has one, waits while the '
+      + 'pair is switched on.</p>',
 
     'auto-patience':
       'The captain&rsquo;s warnings about an impatient customer are about flights, not '
@@ -3430,14 +3453,38 @@
     missing:    { tone: 'bad',  label: 'craft missing' },
     error:      { tone: 'bad',  label: 'error' },
     program:    { tone: 'info', label: 'program drives it' },
+    escort:     { tone: 'warn', label: 'waiting for escort' },
+    paired:     { tone: 'info', label: 'escorting' },
     disabled:   { tone: '',     label: 'off' }
   };
 
-  var AUTO_OBJECTIVES = [
-    { key: 'hourly', label: 'profit / hour' },
-    { key: 'total',  label: 'total yield' },
-    { key: 'safest', label: 'lowest ambush' }
+  /* What a rule can rank by. A rule orders any of them; each breaks the ties of the one
+     before. `missions` keeps one to the missions it means anything for. */
+  var AUTO_CRITERIA = [
+    { key: 'hourly',        label: 'profit / hour' },
+    { key: 'total',         label: 'total yield' },
+    { key: 'safest',        label: 'lowest ambush' },
+    { key: 'shortest',      label: 'least time away' },
+    { key: 'fewestFlights', label: 'fewest flights', missions: ['trade'] },
+    { key: 'cheapest',      label: 'smallest deposit', missions: ['trade', 'procure', 'maintenance'] }
   ];
+
+  function criterionLabel(key) {
+    var found = AUTO_CRITERIA.filter(function (c) { return c.key === key; })[0];
+    return found ? found.label : key;
+  }
+
+  function priorityKeys(rule) {
+    return rule.priorities && rule.priorities.length ? rule.priorities : [rule.objective || 'hourly'];
+  }
+
+  function prioritiesText(rule) {
+    return priorityKeys(rule).map(criterionLabel).join(' › ');
+  }
+
+  function splitNames(text) {
+    return String(text || '').split(',').map(function (n) { return n.trim(); }).filter(Boolean);
+  }
 
   /* The editor's limit fields, in the units a player thinks in. `scale` turns the field
      into the API's unit: fractions for chances, seconds for durations. */
@@ -3481,8 +3528,16 @@
         (body.automations || []).forEach(function (entry) {
           byKey[autoKey(entry.owner && entry.owner.kind, entry.ship)] = entry;
         });
-        S.automations = { byKey: byKey, serverTime: body.serverTime, receivedAt: Date.now(),
-                          error: null, loaded: true };
+        // escort -> its primary, for every pair the owner has switched on
+        var escortOf = {};
+        (body.pairs || []).forEach(function (pair) {
+          (pair.escorts || []).forEach(function (escort) {
+            escortOf[autoKey(pair.owner && pair.owner.kind, escort.name)] =
+              { primary: pair.primary, required: escort.required };
+          });
+        });
+        S.automations = { byKey: byKey, escortOf: escortOf, serverTime: body.serverTime,
+                          receivedAt: Date.now(), error: null, loaded: true };
         renderFleet();
         refreshAutomationStatus();
       })
@@ -3507,9 +3562,19 @@
     renderFleet();
   }
 
+  function escortingFor(name) {
+    return (S.automations.escortOf || {})[autoKey(ownerKindOf(name), name)] || null;
+  }
+
   function automationBadge(ship) {
     var entry = S.automations.byKey[autoKey(ship.owner && ship.owner.kind, ship.name)];
-    if (!entry || !entry.rule) { return ''; }
+    if (!entry || !entry.rule) {
+      var escorting = escortingFor(ship.name);
+      return escorting
+        ? '<span class="badge info" title="Goes out with ' + esc(escorting.primary) + ' as its '
+          + (escorting.required ? 'required' : 'optional') + ' escort">escorts ' + esc(escorting.primary) + '</span>'
+        : '';
+    }
     if (!entry.rule.enabled) { return '<span class="badge" title="Automation is switched off">auto off</span>'; }
 
     var phase = AUTO_PHASES[(entry.state || {}).phase] || { tone: 'info', label: 'auto' };
@@ -4653,6 +4718,12 @@
   }
 
   function areaText(area) {
+    if (area && area.mode === 'sweep') {
+      return 'scans around the ship, every placement'
+        + (area.sizes && area.sizes.length
+          ? ' at ' + area.sizes.map(function (z) { return z.x + '×' + z.y; }).join(', ')
+          : ' and shape');
+    }
     if (!area || area.mode !== 'fixed') {
       return 'follows the ship' + (area && area.size ? ', ' + area.size.x + '×' + area.size.y : '');
     }
@@ -4677,7 +4748,12 @@
 
     if (!entry || !entry.rule) {
       if (S.autoForm && S.autoForm.ship === name) { return ''; }
-      return '<div class="row">'
+      var escorting = escortingFor(name);
+      return (escorting
+          ? '<div class="note" style="margin-bottom:8px">Paired: goes out with <b>' + esc(escorting.primary)
+            + '</b> as its ' + (escorting.required ? 'required' : 'optional') + ' escort. Its rule decides when.</div>'
+          : '')
+        + '<div class="row">'
         + '<span class="note">Not automated. A rule flies the mission, area, config, materials '
         + 'and escorts set up in the mission planner, so start there.</span>'
         + (S.missionForm
@@ -4711,10 +4787,14 @@
     cards.push(meterCard('Rule', kv([
       ['mission', esc(rule.mission)],
       ['area', esc(areaText(rule.area))],
-      ['optimise for', esc((AUTO_OBJECTIVES.filter(function (o) { return o.key === rule.objective; })[0] || {}).label || rule.objective)],
+      ['priorities', esc(prioritiesText(rule))],
+      rule.goods ? ['goods', esc([
+        rule.goods.prefer && rule.goods.prefer.length ? 'prefer ' + rule.goods.prefer.join(', ') : '',
+        rule.goods.avoid && rule.goods.avoid.length ? 'avoid ' + rule.goods.avoid.join(', ') : ''
+      ].filter(Boolean).join(' · '))] : null,
       ['collect yields', rule.collectYields ? 'yes' : 'no'],
       ['saved by', esc((rule.updatedBy && rule.updatedBy.name) || '—') + ' <span class="mute2">rev ' + num(rule.revision) + '</span>']
-    ]) + '<div class="note" style="margin-top:6px">' + limitsText(rule) + '</div>'));
+    ].filter(Boolean)) + '<div class="note" style="margin-top:6px">' + limitsText(rule) + '</div>'));
 
     var last = st.lastDispatch;
     cards.push(meterCard('Activity', kv([
@@ -4723,6 +4803,21 @@
       ['what', last ? esc(last.summary) : '—'],
       ['last collected', st.lastCollect ? num(st.lastCollect.collected) + ' <span class="mute2">' + esc(agoText(st.lastCollect.at)) + '</span>' : '—']
     ])));
+
+    var pairing = entry.pairing;
+    if (pairing && pairing.role === 'primary') {
+      cards.push(meterCard('Pair ' + explain('auto-pairs'), (pairing.escorts || []).map(function (escort) {
+        return '<div class="row tight" style="margin-bottom:4px">'
+          + '<span class="badge ' + (escort.ready ? 'good' : escort.required ? 'warn' : '') + '">'
+          + (escort.ready ? 'ready' : 'not ready') + '</span>'
+          + '<b>' + esc(escort.name) + '</b><span class="mute2">' + (escort.required ? 'required' : 'optional') + '</span>'
+          + (escort.problem ? '<span class="mute2">· ' + esc(escort.problem) + '</span>' : '')
+          + '</div>';
+      }).join('')));
+    } else if (pairing && pairing.role === 'escort') {
+      cards.push(meterCard('Pair ' + explain('auto-pairs'), '<div class="note">Escorts <b>' + esc(pairing.primary)
+        + '</b>. Its own rule waits while the pair is switched on.</div>'));
+    }
 
     out.push('<div class="cards" style="margin-top:10px">' + cards.join('') + '</div>');
 
@@ -4754,7 +4849,9 @@
   function candidateLabel(candidate) {
     var c = candidate.config || {};
     if (c.goodName) {
-      return '<b>' + esc(c.goodName) + '</b>'
+      return (candidate.preferred ? '<span class="badge good" title="a preferred good">★</span> ' : '')
+        + '<b' + (candidate.area ? ' title="found in the area ' + esc(coords(candidate.area.lower) + ' → ' + coords(candidate.area.upper)) + '"' : '')
+        + '>' + esc(c.goodName) + '</b>'
         + (candidate.route ? ' <span class="mute2">' + coords(candidate.route.from) + ' → ' + coords(candidate.route.to) + '</span>' : '');
     }
     if (c.duration != null) { return 'duration ' + esc(String(c.duration)); }
@@ -4771,9 +4868,18 @@
     return (m.valueUnit === 'credits' ? credits(m.hourly) : num(m.hourly)) + '/h';
   }
 
+  /* How far a sweep has got, kept in its own node so a poll can move it without redrawing
+     the editor around a field that has focus. */
+  function dryProgressText(result) {
+    var p = result.progress;
+    if (!p || !p.total || p.total <= 1) { return 'running the area analysis…'; }
+    return 'scanning around the ship: ' + num(p.done || 0) + ' of ' + num(p.total) + ' areas analysed…';
+  }
+
   function renderAutoEvaluation(title, result) {
     if (result.running) {
-      return '<div class="card" style="margin-top:10px"><h3>' + title + '</h3><div class="mute2">running the area analysis…</div></div>';
+      return '<div class="card" style="margin-top:10px"><h3>' + title + '</h3><div class="mute2" data-auto-progress>'
+        + esc(dryProgressText(result)) + '</div></div>';
     }
     if (result.error) {
       return '<div style="margin-top:10px">' + errorBox('Check failed', result.error) + '</div>';
@@ -4782,9 +4888,21 @@
     var ev = result.evaluation;
     if (!ev) { return ''; }
 
-    var verdict = ev.chosen
-      ? '<span class="badge good">would send it</span>'
-      : '<span class="badge warn">nothing within the limits</span>';
+    var waiting = result.waitingFor;
+    var verdict = waiting
+      ? '<span class="badge warn">would wait for ' + esc(waiting.escort) + '</span>'
+      : ev.chosen
+        ? '<span class="badge good">would send it</span>'
+        : '<span class="badge warn">nothing within the limits</span>';
+
+    var notes = [];
+    if (waiting) {
+      notes.push('Escort ' + esc(waiting.escort) + ' is not ready (' + esc(waiting.problem) + '); the figures are those of the pair once it is.');
+    }
+    if (ev.escorts && ev.escorts.left && ev.escorts.left.length) {
+      notes.push('Left behind: ' + ev.escorts.left.map(function (e) { return esc(e.name) + ' (' + esc(e.problem) + ')'; }).join(', ')
+        + '. The figures are without them.');
+    }
 
     var rows = (ev.candidates || []).map(function (candidate, index) {
       var m = candidate.metrics || {};
@@ -4809,8 +4927,10 @@
     return '<div class="card" style="margin-top:10px">'
       + '<h3>' + title + ' ' + explain('auto-evaluation') + '</h3>'
       + '<div class="row tight" style="margin-bottom:6px">' + verdict
-      + '<span class="mute2">' + num(ev.passing) + ' of ' + num(ev.tried) + ' options pass · area '
+      + '<span class="mute2">' + num(ev.passing) + ' of ' + num(ev.tried) + ' options pass · '
+      + (ev.areas > 1 ? num(ev.analysed) + ' of ' + num(ev.areas) + ' areas analysed · best in ' : 'area ')
       + coords(ev.area && ev.area.lower) + ' → ' + coords(ev.area && ev.area.upper) + '</span></div>'
+      + notes.map(function (n) { return '<div class="note warn" style="margin-bottom:6px">' + n + '</div>'; }).join('')
       + (rows
           ? '<div class="scan-table"><table><thead><tr>'
             + '<th>option</th><th class="num">ambush</th><th class="num">duration</th>'
@@ -4856,7 +4976,7 @@
     var rule = entry && entry.rule;
     var source = rule
       ? { mission: rule.mission, config: rule.config || {}, materials: rule.materials || null,
-          escorts: rule.escorts || [],
+          escorts: rule.escorts || [], optionalEscorts: rule.optionalEscorts || [],
           area: rule.area && rule.area.mode === 'fixed' ? { lower: rule.area.lower, upper: rule.area.upper } : null,
           size: rule.area && rule.area.size }
       : plannerSource();
@@ -4875,8 +4995,13 @@
     S.autoForm = {
       ship: name,
       source: source,
-      areaMode: rule ? (rule.area && rule.area.mode === 'fixed' ? 'fixed' : 'ship') : 'ship',
-      objective: rule ? rule.objective : 'hourly',
+      areaMode: rule ? (rule.area && rule.area.mode) || 'ship' : (source.mission === 'trade' ? 'sweep' : 'ship'),
+      priorities: rule ? priorityKeys(rule).slice() : ['hourly'],
+      goods: {
+        prefer: ((rule && rule.goods && rule.goods.prefer) || []).join(', '),
+        avoid: ((rule && rule.goods && rule.goods.avoid) || []).join(', ')
+      },
+      escorts: escortsOf(source),
       limits: limits,
       collectYields: rule ? rule.collectYields === true : false,
       revision: rule ? rule.revision : 0,
@@ -4884,6 +5009,14 @@
       dry: null
     };
     redrawAutomation();
+  }
+
+  /* A rule's escorts as the editor holds them: each with whether the craft waits for it. */
+  function escortsOf(source) {
+    var optional = source.optionalEscorts || [];
+    return (source.escorts || []).map(function (escort) {
+      return { name: escort, required: optional.indexOf(escort) === -1 };
+    });
   }
 
   function autoBody(form) {
@@ -4897,18 +5030,41 @@
     var source = form.source;
     var area = form.areaMode === 'fixed' && source.area
       ? { mode: 'fixed', lower: source.area.lower, upper: source.area.upper }
-      : { mode: 'ship', size: source.size || null };
+      : form.areaMode === 'sweep'
+        ? { mode: 'sweep' }
+        : { mode: 'ship', size: source.size || null };
 
-    return {
+    var priorities = form.priorities.filter(function (key) {
+      return AUTO_CRITERIA.some(function (c) { return c.key === key && limitApplies(c, source.mission); });
+    });
+    if (!priorities.length) { priorities = ['hourly']; }
+
+    var body = {
       mission: source.mission,
-      objective: form.objective,
+      priorities: priorities,
       area: area,
       limits: limits,
       config: source.config,
       materials: source.materials,
-      escorts: source.escorts,
+      escorts: form.escorts.map(function (e) { return e.name; }),
+      optionalEscorts: form.escorts.filter(function (e) { return !e.required; }).map(function (e) { return e.name; }),
       collectYields: form.collectYields
     };
+    if (source.mission === 'trade') {
+      body.goods = { prefer: splitNames(form.goods.prefer), avoid: splitNames(form.goods.avoid) };
+    }
+    return body;
+  }
+
+  /* Craft that could join this one as escorts: the same owner's ships, not already named. */
+  function escortChoices(form) {
+    var kind = ownerKindOf(S.selected);
+    var named = {};
+    form.escorts.forEach(function (e) { named[e.name] = true; });
+    return S.ships.filter(function (ship) {
+      return ship.name !== S.selected && !named[ship.name] && !isStation(ship)
+        && ((ship.owner && ship.owner.kind === 'alliance') ? 'alliance' : 'player') === kind;
+    }).map(function (ship) { return ship.name; }).sort();
   }
 
   function limitApplies(spec, mission) {
@@ -4945,7 +5101,6 @@
       what.push(esc(k) + ' ' + esc(typeof source.config[k] === 'object' ? JSON.stringify(source.config[k]) : String(source.config[k])));
     });
     if (source.materials) { what.push('materials ' + esc(source.materials.join(', ') || 'none')); }
-    if (source.escorts && source.escorts.length) { what.push('escorts ' + esc(source.escorts.join(', '))); }
 
     var fields = AUTO_LIMITS.filter(function (spec) { return limitApplies(spec, source.mission); }).map(function (spec) {
       var value = form.limits[spec.key];
@@ -4955,8 +5110,35 @@
         + (spec.unit ? '<span class="mute2">' + esc(spec.unit) + '</span>' : '') + '</span></label>';
     }).join('');
 
+    var applicable = AUTO_CRITERIA.filter(function (c) { return limitApplies(c, source.mission); });
+    var chosen = form.priorities.filter(function (key) {
+      return applicable.some(function (c) { return c.key === key; });
+    });
+    var priorities = chosen.map(function (key, index) {
+      return '<span class="chip on">' + (index + 1) + '. ' + esc(criterionLabel(key))
+        + (index > 0 ? ' <button class="ghost small" data-auto-prio-up="' + esc(key) + '" title="rank higher">↑</button>' : '')
+        + (chosen.length > 1 ? ' <button class="ghost small" data-auto-prio-del="' + esc(key) + '" title="drop">×</button>' : '')
+        + '</span>';
+    }).join('') + applicable.filter(function (c) { return chosen.indexOf(c.key) === -1; }).map(function (c) {
+      return '<button class="chip" data-auto-prio-add="' + esc(c.key) + '">+ ' + esc(c.label) + '</button>';
+    }).join('');
+
+    var choices = escortChoices(form);
+    var escorts = form.escorts.map(function (e) {
+      return '<span class="chip on">' + esc(e.name)
+        + ' <button class="ghost small" data-auto-escort-req="' + esc(e.name) + '" title="'
+        + (e.required ? 'The craft waits for this escort. Click to let it go without.' : 'Left behind when not ready. Click to wait for it.')
+        + '">' + (e.required ? 'required' : 'optional') + '</button>'
+        + ' <button class="ghost small" data-auto-escort-del="' + esc(e.name) + '" title="remove">×</button></span>';
+    }).join('') + (choices.length
+      ? '<select data-auto-escort-add><option value="">+ escort…</option>'
+        + choices.map(function (n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('')
+        + '</select>'
+      : '');
+
     var body = '<div class="mute2" style="margin:6px 0 10px">flies: ' + (what.join(' · ') || 'defaults') + '</div>'
       + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">area ' + explain('auto-area') + '</span>'
+      + '<button class="chip' + (form.areaMode === 'sweep' ? ' on' : '') + '" data-auto-area="sweep">scan around the ship</button>'
       + '<button class="chip' + (form.areaMode === 'ship' ? ' on' : '') + '" data-auto-area="ship">follow the ship'
       + (source.size ? ' (' + source.size.x + '×' + source.size.y + ')' : '') + '</button>'
       + (source.area
@@ -4964,11 +5146,16 @@
             + coords(source.area.lower) + ' → ' + coords(source.area.upper) + '</button>'
           : '')
       + '</div>'
-      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">optimise for ' + explain('auto-objective') + '</span>'
-      + AUTO_OBJECTIVES.map(function (o) {
-          return '<button class="chip' + (form.objective === o.key ? ' on' : '') + '" data-auto-objective="' + o.key + '">' + esc(o.label) + '</button>';
-        }).join('')
-      + '</div>'
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">priorities ' + explain('auto-objective') + '</span>'
+      + priorities + '</div>'
+      + (source.mission === 'trade'
+          ? '<div class="row tight" style="margin-bottom:8px"><span class="mute2">goods ' + explain('auto-goods') + '</span>'
+            + '<input type="text" data-auto-goods="prefer" style="width:220px" placeholder="prefer, e.g. Energy Cell, Steel" value="' + esc(form.goods.prefer) + '">'
+            + '<input type="text" data-auto-goods="avoid" style="width:220px" placeholder="avoid" value="' + esc(form.goods.avoid) + '">'
+            + '</div>'
+          : '')
+      + '<div class="row tight" style="margin-bottom:8px"><span class="mute2">escorts ' + explain('auto-pairs') + '</span>'
+      + (escorts || '<span class="mute2">none</span>') + '</div>'
       + '<div class="auto-limits">' + fields + '</div>'
       + (source.mission === 'trade'
           ? '<div class="note" style="margin-top:6px">' + explain('auto-patience') + ' Up to 3 flights the customer always waits; '
@@ -4990,6 +5177,33 @@
   }
 
   /* --------------------------------- actions --------------------------------- */
+
+  /* The editor's priority and escort buttons. True when the click was one of them. */
+  function autoFormClick(button) {
+    var form = S.autoForm;
+    var d = button.dataset;
+    var at;
+
+    if (d.autoPrioAdd) { form.priorities.push(d.autoPrioAdd); return true; }
+    if (d.autoPrioDel) {
+      form.priorities = form.priorities.filter(function (k) { return k !== d.autoPrioDel; });
+      return true;
+    }
+    if (d.autoPrioUp) {
+      at = form.priorities.indexOf(d.autoPrioUp);
+      if (at > 0) { form.priorities.splice(at - 1, 0, form.priorities.splice(at, 1)[0]); }
+      return true;
+    }
+    if (d.autoEscortReq) {
+      form.escorts.forEach(function (e) { if (e.name === d.autoEscortReq) { e.required = !e.required; } });
+      return true;
+    }
+    if (d.autoEscortDel) {
+      form.escorts = form.escorts.filter(function (e) { return e.name !== d.autoEscortDel; });
+      return true;
+    }
+    return false;
+  }
 
   function autoPath(name, suffix) {
     return '/ships/' + Api.seg(name) + '/mission/automation' + (suffix || '');
@@ -5020,6 +5234,8 @@
         S.autoForm = null;
         toast('good', 'Automation saved', name + ': ' + (result.rule.enabled ? 'the mod checks it on its next pass.' : 'switched off.'));
         redrawAutomation();
+        // escorts named or dropped change other craft's badges too
+        loadAutomations(true);
       })
       .catch(function (error) {
         if (autoConflict(error)) { return; }
@@ -5041,16 +5257,71 @@
     return guard(button, Api.post(autoPath(name, '/evaluate'), body, { owner: ownerParamFor(name) },
                                   { priority: Api.P.USER, label: 'test automation' }))
       .then(function (result) {
-        holder.running = false;
-        holder.evaluation = result.evaluation;
-        holder.assessment = result.assessment;
-        if (S.selected === name) { redrawAutomation(); }
+        // a sweep answers at once and finishes later, into the craft's dryRun
+        if (result.evaluating) {
+          holder.progress = result.dryRun;
+          showDryProgress(holder);
+          pollDryRun(name, holder);
+          return;
+        }
+        landDryRun(name, holder, result);
       })
       .catch(function (error) {
         holder.running = false;
         holder.error = error;
         if (S.selected === name) { redrawAutomation(); }
       });
+  }
+
+  function landDryRun(name, holder, result) {
+    holder.running = false;
+    holder.evaluation = result.evaluation;
+    holder.assessment = result.assessment;
+    holder.waitingFor = result.waitingFor || null;
+    if (S.selected === name) { redrawAutomation(); }
+  }
+
+  function showDryProgress(holder) {
+    var node = $('#automation-pane [data-auto-progress]');
+    if (node) { node.textContent = dryProgressText(holder); }
+  }
+
+  /* A sweep runs one area analysis after another, often for a minute or more. Its progress
+     is read off the craft's rule until it lands; only the progress line moves meanwhile. */
+  function pollDryRun(name, holder) {
+    setTimeout(function () {
+      if (!holder.running || (S.autoDry !== holder && (!S.autoForm || S.autoForm.dry !== holder))) { return; }
+
+      Api.get(autoPath(name), { owner: ownerParamFor(name) }, { priority: Api.P.POLL, label: 'check progress' })
+        .then(function (body) {
+          var dry = body.dryRun;
+          if (!dry) {
+            holder.running = false;
+            holder.error = { message: 'The check is gone - was the server restarted?', code: 'lost', status: 0 };
+            if (S.selected === name) { redrawAutomation(); }
+            return;
+          }
+          holder.progress = dry;
+          if (dry.running) {
+            showDryProgress(holder);
+            pollDryRun(name, holder);
+            return;
+          }
+          if (dry.error) {
+            holder.running = false;
+            holder.error = { message: dry.error.message, code: dry.error.code, status: 0 };
+            if (S.selected === name) { redrawAutomation(); }
+            return;
+          }
+          landDryRun(name, holder, dry.result || {});
+        })
+        .catch(function (error) {
+          if (error.code === 'cancelled') { pollDryRun(name, holder); return; }
+          holder.running = false;
+          holder.error = error;
+          if (S.selected === name) { redrawAutomation(); }
+        });
+    }, 2000);
   }
 
   function toggleAutomation(input) {
@@ -5115,7 +5386,9 @@
       var source = plannerSource();
       if (!source || !S.autoForm) { return; }
       if (source.mission === 'trade' && S.autoForm.limits.maxFlights == null) { S.autoForm.limits.maxFlights = 3; }
+      if (source.mission === 'trade' && S.autoForm.source.mission !== 'trade') { S.autoForm.areaMode = 'sweep'; }
       S.autoForm.source = source;
+      S.autoForm.escorts = escortsOf(source);
       S.autoForm.dry = null;
       redrawAutomation();
     }
@@ -10236,8 +10509,7 @@
         redrawAutomation();
         return;
       }
-      if (button.dataset.autoObjective && S.autoForm) {
-        S.autoForm.objective = button.dataset.autoObjective;
+      if (S.autoForm && autoFormClick(button)) {
         S.autoForm.dry = null;
         redrawAutomation();
         return;
@@ -10258,6 +10530,11 @@
       else if (node.dataset.autoCollect !== undefined && S.autoForm) {
         S.autoForm.collectYields = node.checked;
       }
+      else if (node.dataset.autoEscortAdd !== undefined && S.autoForm && node.value) {
+        S.autoForm.escorts.push({ name: node.value, required: true });
+        S.autoForm.dry = null;
+        redrawAutomation();
+      }
     });
 
     $('#automation-pane').addEventListener('input', function (e) {
@@ -10276,6 +10553,9 @@
       }
       if (node.dataset.autoLibname !== undefined && S.autoForm && S.autoForm.library) {
         S.autoForm.library.name = node.value;
+      }
+      if (node.dataset.autoGoods && S.autoForm) {
+        S.autoForm.goods[node.dataset.autoGoods] = node.value;
       }
       if (node.tagName === 'INPUT' && node.type !== 'checkbox' && node.closest('.program-editor')) {
         programField(node);

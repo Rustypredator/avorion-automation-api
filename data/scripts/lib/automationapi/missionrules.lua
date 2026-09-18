@@ -19,6 +19,11 @@
 --   * a bigger trade deposit means fewer flights, but past a richness-scaled threshold it
 --     lengthens the attack window from one hour towards three, so flights and ambush chance
 --     pull against each other - that is the search the trade candidates exist for
+--   * a trade area analysis offers at most four routes (TradeCommand:onAreaAnalysisFinished
+--     picks the best by profit, profit per volume and margin), and a route a contract just
+--     flew is hidden for two hours. Which stations fall inside the area decides the four, so
+--     one area around the ship often has nothing left worth flying - that is what a sweep,
+--     the same area laid around the ship nine ways at every shape, is for
 
 local Router = include("automationapi/router")
 local Json = include("automationapi/json")
@@ -27,7 +32,33 @@ local MissionRules = {}
 
 -- #### VOCABULARY #### --
 
-MissionRules.objectives = {hourly = true, total = true, safest = true}
+-- What a rule can rank by. `priorities` orders any of these, each breaking the ties of the
+-- one before it; `objective` is the first of them, and a rule that only names an objective
+-- ranks by that alone.
+MissionRules.criteria =
+{
+    hourly = true,          -- value per hour away
+    total = true,           -- the biggest value
+    safest = true,          -- the lowest ambush chance
+    shortest = true,        -- the least time away
+    fewestFlights = true,   -- trade: the fewest flights, the least chance the customer walks
+    cheapest = true,        -- the smallest deposit or budget
+}
+
+MissionRules.objectives = MissionRules.criteria
+
+MissionRules.criteriaList = {}
+for name, _ in pairs(MissionRules.criteria) do MissionRules.criteriaList[#MissionRules.criteriaList + 1] = name end
+table.sort(MissionRules.criteriaList)
+
+-- Where a sweep lays the ship inside the area, as fractions of each side: 0 is the low
+-- edge, 1 the high one. The console's trade scan tries the same nine.
+MissionRules.placements =
+{
+    {fx = 0.5, fy = 0.5},
+    {fx = 0, fy = 1}, {fx = 1, fy = 1}, {fx = 0, fy = 0}, {fx = 1, fy = 0},
+    {fx = 0.5, fy = 1}, {fx = 0.5, fy = 0}, {fx = 0, fy = 0.5}, {fx = 1, fy = 0.5},
+}
 
 -- Missions a rule may repeat. The rest cannot be automated in any meaningful sense.
 MissionRules.supported =
@@ -122,8 +153,19 @@ end
 
 -- #### VALIDATION #### --
 
-local function normalizeArea(area)
-    if area == nil or area == Json.null then return {mode = "ship"} end
+local function normalizeSize(size, field)
+    if type(size) ~= "table" or not isNumber(size.x) or not isNumber(size.y) then
+        Router.fail(400, "bad_rule", "'" .. field .. "' must be {x, y}.")
+    end
+    return {x = math.floor(size.x), y = math.floor(size.y)}
+end
+
+local function normalizeArea(area, mission)
+    if area == nil or area == Json.null then
+        -- A trade rule is only as good as the routes it gets to see, so it sweeps unless
+        -- told otherwise.
+        return {mode = mission == "trade" and "sweep" or "ship"}
+    end
 
     if type(area) ~= "table" then
         Router.fail(400, "bad_rule", "'area' must be an object.")
@@ -148,17 +190,32 @@ local function normalizeArea(area)
         }
     end
 
+    -- Every placement at every shape the captain allows, or at the shapes in `sizes`.
+    if mode == "sweep" then
+        local result = {mode = "sweep"}
+
+        if area.sizes ~= nil and area.sizes ~= Json.null then
+            if type(area.sizes) ~= "table" then
+                Router.fail(400, "bad_rule", "'area.sizes' must be an array of {x, y}.")
+            end
+            result.sizes = Json.array({})
+            for _, size in ipairs(area.sizes) do
+                result.sizes[#result.sizes + 1] = normalizeSize(size, "area.sizes[]")
+            end
+            if #result.sizes == 0 then result.sizes = nil end
+        end
+
+        return result
+    end
+
     if mode ~= "ship" then
-        Router.fail(400, "bad_rule", "'area.mode' is 'ship' or 'fixed'.")
+        Router.fail(400, "bad_rule", "'area.mode' is 'ship', 'sweep' or 'fixed'.")
     end
 
     local result = {mode = "ship"}
 
     if area.size ~= nil and area.size ~= Json.null then
-        if type(area.size) ~= "table" or not isNumber(area.size.x) or not isNumber(area.size.y) then
-            Router.fail(400, "bad_rule", "'area.size' must be {x, y}.")
-        end
-        result.size = {x = math.floor(area.size.x), y = math.floor(area.size.y)}
+        result.size = normalizeSize(area.size, "area.size")
     end
 
     -- Where the ship sits inside the area, as a fraction of each side: 0 is the low edge,
@@ -211,6 +268,54 @@ local function normalizeLimits(limits)
     return result
 end
 
+local function normalizePriorities(value)
+    if type(value) ~= "table" then
+        Router.fail(400, "bad_rule", "'priorities' must be an array of criteria.",
+                    {known = Json.array(shallow(MissionRules.criteriaList))})
+    end
+
+    local result, seen = Json.array({}), {}
+    for _, name in ipairs(value) do
+        if type(name) ~= "string" or not MissionRules.criteria[name] then
+            Router.fail(400, "bad_rule", "Unknown priority '" .. tostring(name) .. "'.",
+                        {known = Json.array(shallow(MissionRules.criteriaList))})
+        end
+        if seen[name] then
+            Router.fail(400, "bad_rule", "Priority '" .. name .. "' is listed twice.")
+        end
+        seen[name] = true
+        result[#result + 1] = name
+    end
+
+    if #result == 0 then
+        Router.fail(400, "bad_rule", "'priorities' needs at least one criterion.")
+    end
+
+    return result
+end
+
+-- {prefer, avoid}: goods names, checked against the goods table by the handler, which has it.
+local function normalizeGoods(value)
+    if value == nil or value == Json.null then return nil end
+    if type(value) ~= "table" then
+        Router.fail(400, "bad_rule", "'goods' must be {prefer: [...], avoid: [...]}.")
+    end
+
+    local prefer = stringList(value.prefer, "goods.prefer") or Json.array({})
+    local avoid = stringList(value.avoid, "goods.avoid") or Json.array({})
+
+    local avoided = {}
+    for _, name in ipairs(avoid) do avoided[string.lower(name)] = true end
+    for _, name in ipairs(prefer) do
+        if avoided[string.lower(name)] then
+            Router.fail(400, "bad_rule", "'" .. name .. "' is both preferred and avoided.")
+        end
+    end
+
+    if #prefer == 0 and #avoid == 0 then return nil end
+    return {prefer = prefer, avoid = avoid}
+end
+
 -- Merges a request body over the rule already stored, and validates the result. Fields
 -- left out of the body keep their stored value, so {"enabled": false} is a whole toggle.
 -- Raises an API error on anything it cannot accept.
@@ -251,14 +356,24 @@ function MissionRules.normalize(body, previous)
     end
     if rule.collectYields == nil then rule.collectYields = false end
 
-    if given("objective") then rule.objective = string.lower(tostring(body.objective)) end
+    -- priorities wins over objective; an objective on its own replaces the priorities with
+    -- itself, so a client that only knows `objective` still gets what it asked for
+    if given("priorities") and body.priorities ~= Json.null then
+        rule.priorities = normalizePriorities(body.priorities)
+        rule.objective = rule.priorities[1]
+    elseif given("objective") then
+        rule.objective = tostring(body.objective)
+        rule.priorities = nil
+    elseif given("priorities") then
+        rule.priorities = nil
+    end
     rule.objective = rule.objective or "hourly"
 
-    if not MissionRules.objectives[rule.objective] then
-        Router.fail(400, "bad_rule", "'objective' is one of hourly, total or safest.")
+    if not MissionRules.criteria[rule.objective] then
+        Router.fail(400, "bad_rule", "'objective' is one of " .. table.concat(MissionRules.criteriaList, ", ") .. ".")
     end
 
-    if given("area") or rule.area == nil then rule.area = normalizeArea(body.area) end
+    if given("area") or rule.area == nil then rule.area = normalizeArea(body.area, rule.mission) end
     if given("limits") or rule.limits == nil then rule.limits = normalizeLimits(body.limits) end
 
     if given("config") or rule.config == nil then
@@ -276,11 +391,59 @@ function MissionRules.normalize(body, previous)
         rule.config = config
     end
 
+    if given("goods") then rule.goods = normalizeGoods(body.goods) end
+    if rule.goods and rule.mission ~= "trade" then
+        Router.fail(400, "bad_rule", "'goods' only applies to trade.")
+    end
+
     if given("materials") then rule.materials = stringList(body.materials, "materials") end
     if given("escorts") then rule.escorts = stringList(body.escorts, "escorts") end
     rule.escorts = rule.escorts or Json.array({})
 
+    -- Escorts the craft may leave behind when they are not ready. Every other escort is
+    -- required: the craft waits for it.
+    if given("optionalEscorts") then
+        rule.optionalEscorts = stringList(body.optionalEscorts, "optionalEscorts")
+    end
+
+    local named, seen = {}, {}
+    for _, name in ipairs(rule.escorts) do
+        if seen[name] then Router.fail(400, "bad_rule", "Escort '" .. name .. "' is listed twice.") end
+        seen[name] = true
+        named[name] = true
+    end
+
+    if rule.optionalEscorts then
+        -- an escort taken off the list takes its optional flag with it
+        local kept = Json.array({})
+        for _, name in ipairs(rule.optionalEscorts) do
+            if named[name] then kept[#kept + 1] = name
+            elseif given("optionalEscorts") then
+                Router.fail(400, "bad_rule", "'" .. name .. "' is in 'optionalEscorts' but not in 'escorts'.")
+            end
+        end
+        rule.optionalEscorts = #kept > 0 and kept or nil
+    end
+
     return rule
+end
+
+-- The order a rule ranks by.
+function MissionRules.priorityList(rule)
+    if type(rule.priorities) == "table" and #rule.priorities > 0 then return rule.priorities end
+    return {rule.objective or "hourly"}
+end
+
+-- Every escort as {name, required}.
+function MissionRules.escortList(rule)
+    local optional = {}
+    for _, name in ipairs(rule.optionalEscorts or {}) do optional[name] = true end
+
+    local result = {}
+    for _, name in ipairs(rule.escorts or {}) do
+        result[#result + 1] = {name = name, required = not optional[name]}
+    end
+    return result
 end
 
 function MissionRules.supportedList()
@@ -400,10 +563,15 @@ function MissionRules.candidates(key, rule, base, env)
     end
 
     if key == "trade" then
+        local avoided = {}
+        for _, name in ipairs(rule.goods and rule.goods.avoid or {}) do avoided[string.lower(name)] = true end
+
         local result = {}
         for _, route in ipairs(env.routes or {}) do
-            for _, config in ipairs(tradeCandidates(base, route, env, limits)) do
-                result[#result + 1] = config
+            if not avoided[string.lower(tostring(route.name))] then
+                for _, config in ipairs(tradeCandidates(base, route, env, limits)) do
+                    result[#result + 1] = config
+                end
             end
         end
         return result
@@ -614,6 +782,15 @@ end
 -- #### RANKING #### --
 
 local function orNegative(v) return isNumber(v) and v or -math.huge end
+local function orHuge(v) return isNumber(v) and v or math.huge end
+
+local function lowerFirst(field)
+    return function(a, b)
+        local va, vb = orHuge(a.metrics[field]), orHuge(b.metrics[field])
+        if va ~= vb then return va < vb end
+        return nil
+    end
+end
 
 local comparators =
 {
@@ -635,15 +812,44 @@ local comparators =
         end
         return nil
     end,
+    shortest = function(a, b)
+        local da = orHuge(a.metrics.expectedDuration or a.metrics.duration)
+        local db = orHuge(b.metrics.expectedDuration or b.metrics.duration)
+        if da ~= db then return da < db end
+        return nil
+    end,
+    fewestFlights = lowerFirst("flights"),
+    cheapest = lowerFirst("cost"),
 }
 
 -- Sorts evaluated candidates in place, best first: everything that passes ahead of
--- everything that does not, then by the objective, then by the safer of the two. Among
--- failures the fewest violations lead, so the head of a blocked list is the nearest miss.
-function MissionRules.rank(evaluated, objective)
-    local primary = comparators[objective] or comparators.hourly
+-- everything that does not, then preferred goods ahead of the rest, then each priority in
+-- turn, then the safer, then the better per hour. Among failures the fewest violations
+-- lead, so the head of a blocked list is the nearest miss.
+--
+-- `priorities` is a list of criteria, or a single objective's name. opts.prefer lists goods
+-- to take first when they pass.
+function MissionRules.rank(evaluated, priorities, opts)
+    if type(priorities) ~= "table" then priorities = {priorities or "hourly"} end
 
-    for index, entry in ipairs(evaluated) do entry.order = index end
+    local chain = {}
+    for _, name in ipairs(priorities) do
+        if comparators[name] then chain[#chain + 1] = comparators[name] end
+    end
+    chain[#chain + 1] = comparators.safest
+    chain[#chain + 1] = comparators.hourly
+
+    local preferred = {}
+    for _, name in ipairs(opts and opts.prefer or {}) do preferred[string.lower(name)] = true end
+    local function isPreferred(entry)
+        local good = entry.config and entry.config.goodName
+        return good ~= nil and preferred[string.lower(tostring(good))] == true
+    end
+
+    for index, entry in ipairs(evaluated) do
+        entry.order = index
+        entry.preferred = isPreferred(entry)
+    end
 
     table.sort(evaluated, function(a, b)
         local pa, pb = #a.violations == 0, #b.violations == 0
@@ -652,14 +858,12 @@ function MissionRules.rank(evaluated, objective)
             return #a.violations < #b.violations
         end
 
-        local decided = primary(a, b)
-        if decided ~= nil then return decided end
+        if pa and a.preferred ~= b.preferred then return a.preferred end
 
-        decided = comparators.safest(a, b)
-        if decided ~= nil then return decided end
-
-        decided = comparators.hourly(a, b)
-        if decided ~= nil then return decided end
+        for _, compare in ipairs(chain) do
+            local decided = compare(a, b)
+            if decided ~= nil then return decided end
+        end
 
         return a.order < b.order
     end)

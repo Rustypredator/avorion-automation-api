@@ -114,6 +114,11 @@ Config.missionAutomationRetry = 300
 -- analysis slot not free. Nothing about the rule failed, so it is checked again soon.
 Config.missionAutomationRecheck = 30
 
+-- The longest one check may take, in seconds. A sweep analyses every placement of the area
+-- one after another - up to 27 for trade - and waits for a free slot before each; one that
+-- has not finished by then is ranked on what it has, or fails if it has nothing.
+Config.missionAutomationSweepTimeout = 600
+
 -- Recent decisions kept per rule, for the console to show why a ship did or did not go.
 Config.missionAutomationLogSize = 20
 

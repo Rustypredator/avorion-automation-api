@@ -147,6 +147,67 @@ check(toggled.enabled == false and toggled.limits.maxAttackChance == 0.2
 local tradeRule = Rules.normalize({mission = "trade", config = {goodName = "Oil", deposit = 5}})
 check(tradeRule.config.goodName == nil and tradeRule.config.deposit == nil,
       "trade route and deposit are the automation's to choose, never stored")
+check(tradeRule.area.mode == "sweep", "a trade rule sweeps the area around the ship by default")
+check(stored.area.mode == "ship", "other missions still take the one area around the ship")
+
+check(raises(function() Rules.normalize({mission = "trade", area = {mode = "sweep", sizes = {{x = 1}}}}) end,
+             "bad_rule"), "a sweep's sizes must be {x, y}")
+
+print("\npriorities")
+
+local prioritised = Rules.normalize({mission = "trade", priorities = {"fewestFlights", "hourly"}})
+check(prioritised.objective == "fewestFlights" and #prioritised.priorities == 2,
+      "priorities are stored in order and the first is the objective")
+check(raises(function() Rules.normalize({mission = "trade", priorities = {"fastest"}}) end, "bad_rule"),
+      "an unknown criterion is refused")
+check(raises(function() Rules.normalize({mission = "trade", priorities = {"safest", "safest"}}) end,
+             "bad_rule"), "a criterion listed twice is refused")
+local reset = Rules.normalize({objective = "total"}, prioritised)
+check(reset.priorities == nil and reset.objective == "total",
+      "an objective on its own replaces the priorities")
+check(#Rules.priorityList(reset) == 1 and Rules.priorityList(reset)[1] == "total",
+      "and is the whole ranking")
+
+local options =
+{
+    {config = {goodName = "Oil"}, metrics = {attackChance = 0.05, hourly = 900, flights = 5}, violations = {}},
+    {config = {goodName = "Ore"}, metrics = {attackChance = 0.05, hourly = 500, flights = 2}, violations = {}},
+    {config = {goodName = "Gold"}, metrics = {attackChance = 0.3, hourly = 2000, flights = 1}, violations = {{}}},
+}
+ranked = Rules.rank(Rules.copy(options), {"fewestFlights", "hourly"})
+check(ranked[1].config.goodName == "Ore", "fewest flights first, when that is the first priority")
+ranked = Rules.rank(Rules.copy(options), {"hourly"})
+check(ranked[1].config.goodName == "Oil", "profit per hour first, when that is")
+ranked = Rules.rank(Rules.copy(options), {"hourly"}, {prefer = {"ore", "gold"}})
+check(ranked[1].config.goodName == "Ore" and ranked[3].config.goodName == "Gold",
+      "a preferred good goes first, but only among what passes")
+
+print("\ngoods and escorts")
+
+check(raises(function() Rules.normalize({mission = "mine", goods = {avoid = {"Oil"}}}) end, "bad_rule"),
+      "goods only apply to trade")
+check(raises(function() Rules.normalize({mission = "trade", goods = {prefer = {"Oil"}, avoid = {"oil"}}}) end,
+             "bad_rule"), "a good cannot be both preferred and avoided")
+
+local avoidEnv =
+{
+    routes = {{name = "Oil", lowest = 0}, {name = "Ore", lowest = 0}},
+    goods = {Oil = {price = 100, size = 1}, Ore = {price = 10, size = 1}},
+    freeCargo = 1000,
+    probe = function() return {maxAvailable = {value = 100}} end,
+}
+local avoidedCandidates = Rules.candidates("trade", {limits = {}, goods = {avoid = {"oil"}}}, {}, avoidEnv)
+local sawOil = false
+for _, c in ipairs(avoidedCandidates) do if c.goodName == "Oil" then sawOil = true end end
+check(#avoidedCandidates > 0 and not sawOil, "an avoided good is never tried")
+
+local paired = Rules.normalize({mission = "mine", escorts = {"A", "B"}, optionalEscorts = {"B"}})
+local list = Rules.escortList(paired)
+check(list[1].required == true and list[2].required == false, "escorts are required unless optional")
+check(raises(function() Rules.normalize({mission = "mine", escorts = {"A"}, optionalEscorts = {"C"}}) end,
+             "bad_rule"), "an optional escort must be one of the escorts")
+local dropped = Rules.normalize({escorts = {"A"}}, paired)
+check(dropped.optionalEscorts == nil, "an escort taken off the list takes its optional flag with it")
 
 -- #### ENDPOINTS AND LOOP #### --
 
@@ -381,7 +442,8 @@ end
 Mock.addShip(1, "Trader", {x = -316, y = 319, range = 4.1, cargoFree = 768, captain = captain})
 
 local read = send("POST", "/ships/Trader/mission/automation/evaluate",
-                  {mission = "trade", limits = {maxFlights = 3, maxAttackChance = 0.08}})
+                  {mission = "trade", area = {mode = "ship"},
+                   limits = {maxFlights = 3, maxAttackChance = 0.08}})
 Mock.flushAsync(tradeAnalysis)
 Bridge.update(Config.pollInterval)
 local status, tradeDry = read()
@@ -394,6 +456,59 @@ check(chosen and chosen.metrics.flights == 3 and chosen.config.deposit == 134 * 
 check(chosen and chosen.metrics.attackChance <= 0.08, "keeping under the ambush ceiling")
 check(chosen and chosen.route and chosen.route.from.x == -310, "and names the route")
 
+local status = call("POST", "/ships/Trader/mission/automation",
+                    {mission = "trade", enabled = false, goods = {prefer = {"Unobtainium"}}})
+check(status == 400, "a good that does not exist is refused when saving")
+
+print("\ntrade sweep")
+
+-- Two shapes, nine placements each. Only the wide area reaching east of the ship holds the
+-- Oil route; every other placement sees only Ore.
+Mock.areaSizes = {{x = 15, y = 15}, {x = 21, y = 9}}
+local function sweepAnalysis(area)
+    local analysis = {}
+    for k, v in pairs(tradeAnalysis) do analysis[k] = v end
+    analysis.routes = area.upper.x >= -300 and {tradeAnalysis.routes[1]} or {tradeAnalysis.routes[2]}
+    return analysis
+end
+
+local status, accepted = call("POST", "/ships/Trader/mission/automation/evaluate",
+                              {mission = "trade", limits = {maxFlights = 3, maxAttackChance = 0.08}})
+check(status == 202 and accepted.evaluating == true and accepted.dryRun.total == 18,
+      "a sweep answers at once, with the areas it will analyse (got " .. tostring(status) .. ")")
+
+local status = call("POST", "/ships/Trader/mission/automation/evaluate", {mission = "trade"})
+check(status == 409, "and a second check of the same craft waits for it")
+
+run(20, sweepAnalysis)
+
+local _, swept = call("GET", "/ships/Trader/mission/automation")
+local dryRun = swept.dryRun or {}
+local sweptChosen = dryRun.result and dryRun.result.evaluation.chosen
+check(dryRun.running == false and dryRun.result ~= nil, "the result lands in the craft's dryRun")
+check(dryRun.result and dryRun.result.evaluation.areas == 18 and dryRun.result.evaluation.analysed == 18,
+      "after every area was analysed")
+check(sweptChosen and sweptChosen.config.goodName == "Oil" and sweptChosen.area.upper.x == -296,
+      "the best route anywhere is chosen, in the area that offers it")
+
+local status = call("POST", "/ships/Trader/mission/automation",
+                    {mission = "trade", enabled = true, limits = {maxFlights = 3, maxAttackChance = 0.08}})
+check(status == 200, "a sweeping trade rule is saved")
+
+Mock.simulationCalls = {}
+run(30, sweepAnalysis)
+
+local traderState = stateOf("Trader")
+check(traderState.phase == "running", "the loop sweeps and sends the trader out (phase "
+      .. tostring(traderState.phase) .. ": " .. tostring(traderState.message) .. ")")
+local sweptStart
+for _, c in ipairs(Mock.simulationCalls) do
+    if c.fn == "startAreaAnalysis" and c.args[1] == "Trader" then sweptStart = c end
+end
+check(sweptStart and sweptStart.args[3].upper.x == -296,
+      "in the area the chosen route was found in")
+
+Mock.areaSizes = nil
 Mock.predictionFor = nil
 
 print("\nalliance")
@@ -445,6 +560,71 @@ local demoted = stateOf("Alliance Miner", {owner = "alliance"})
 check(demoted.phase == "blocked" and demoted.dispatches == 1,
       "a demoted author's rule stops dispatching")
 privileges[AlliancePrivilege.ManageShips] = true
+
+print("\npairs")
+
+Mock.addShip(1, "Hauler", {x = 100, y = 100, range = 5, cargoFree = 500, captain = captain})
+Mock.addShip(1, "Wingman", {x = 102, y = 101, range = 5, captain = captain})
+Mock.addShip(1, "Picket", {x = 140, y = 100, range = 5, captain = captain})
+
+local status, pair = call("POST", "/ships/Hauler/mission/automation",
+                          {mission = "mine", escorts = {"Wingman", "Picket"}, optionalEscorts = {"Picket"},
+                           limits = {maxAttackChance = 0.5}})
+check(status == 200 and pair.pairing and pair.pairing.role == "primary",
+      "a rule with escorts makes a pair (got " .. tostring(status) .. ")")
+check(pair.pairing and pair.pairing.escorts[1].ready == true and pair.pairing.escorts[2].ready == false
+      and string.find(pair.pairing.escorts[2].problem or "", "sectors away", 1, true) ~= nil,
+      "and says which escort is ready, and why the other is not")
+
+local status, taken = call("POST", "/ships/Prospector/mission/automation", {escorts = {"Wingman"}})
+check(status == 409 and taken.error.code == "escort_paired", "an escort belongs to one pair at a time")
+
+local status = call("POST", "/ships/Hauler/mission/automation", {escorts = {"Nobody"}})
+check(status == 400, "an escort the owner does not have is refused")
+
+local status = call("POST", "/ships/Wingman/mission/automation",
+                    {mission = "mine", limits = {maxAttackChance = 0.5}})
+check(status == 200, "an escort may keep a rule of its own")
+local _, wing = call("GET", "/ships/Wingman/mission/automation")
+check(wing.pairing and wing.pairing.role == "escort" and wing.pairing.primary == "Hauler",
+      "and knows whose escort it is")
+
+local status = call("POST", "/ships/Wingman/mission/automation", {escorts = {"Picket"}})
+check(status == 409, "but cannot lead a pair while it is one")
+
+Mock.getShip(1, "Wingman").availability = ShipAvailability.InBackground
+Mock.simulationCalls = {}
+run(3)
+local hauler = stateOf("Hauler")
+check(hauler.phase == "escort" and string.find(hauler.message or "", "Wingman", 1, true) ~= nil,
+      "a required escort out elsewhere holds the pair back (phase " .. tostring(hauler.phase) .. ")")
+check(hauler.dispatches == 0, "without sending the primary")
+check(stateOf("Wingman").phase == "paired", "the escort's own rule waits while it is paired")
+
+Mock.getShip(1, "Wingman").availability = ShipAvailability.Available
+run(35)
+hauler = stateOf("Hauler")
+check(hauler.phase == "running", "once the escort is back, the pair goes out (phase "
+      .. tostring(hauler.phase) .. ": " .. tostring(hauler.message) .. ")")
+
+local pairStart
+for _, c in ipairs(Mock.simulationCalls) do
+    if c.fn == "startCommand" and c.args[1] == "Hauler" then pairStart = c end
+end
+local escortsSent = pairStart and pairStart.args[3].escorts or {}
+check(#escortsSent == 1 and escortsSent[1] == "Wingman",
+      "with the escort that was ready, leaving the optional one behind")
+local leftLogged = false
+for _, line in ipairs(hauler.log or {}) do
+    if line.detail and string.find(line.detail, "left behind: Picket", 1, true) then leftLogged = true end
+end
+check(leftLogged, "and the log says who stayed behind and why")
+
+local _, overview = call("GET", "/automation/missions")
+local listedPair
+for _, p in ipairs(overview.pairs or {}) do if p.primary == "Hauler" then listedPair = p end end
+check(listedPair and #listedPair.escorts == 2 and listedPair.escorts[2].required == false,
+      "the fleet-wide list carries the pair")
 
 print("\ndelete")
 

@@ -645,7 +645,13 @@ local function startStep(owner, index, shipName, program, run, authority)
                 dispatched(run, token, program, "Out on a mission"
                            .. (action.library and (" (" .. action.library .. ")") or "") .. ": " .. summary)
             end,
-            function(code, message) dispatchFailed(run, token, code, message) end)
+            function(code, message) dispatchFailed(run, token, code, message) end,
+            -- a sweep answers after many analyses; each one landing is a sign of life
+            function()
+                if run.token == token and run.busy then
+                    run.busyUntil = now() + Config.programDispatchTimeout
+                end
+            end)
         return
     end
 
