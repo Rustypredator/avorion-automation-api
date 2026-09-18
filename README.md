@@ -29,8 +29,10 @@ galaxy map.
   picking the duration, trade route and deposit that stay under an ambush-chance ceiling and
   inside the trade customer's patience - shared across an alliance, running with no client
 - move ships across the galaxy, or give in-sector orders, and watch what they actually do
-- plan routes that prefer gates, keep out of rifts or stay in no man's space, and have the
-  ship fight, hold or press on when enemies show up on the way
+- send a ship to a sector, to wherever another of your craft is, or to a named location from
+  a library you and your alliance share
+- plan routes that prefer gates or wormholes, take the fewest jumps, keep out of rifts or stay
+  in no man's space, and have the ship fight, hold or press on when enemies show up on the way
 - farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship; the ship recognises the boss, sends fighters for the loot and sits out the 30 minute cooldown after a kill
 - let idle ships defend themselves: aggressive while enemies are in the sector, idle after
 - query known sectors, and predict unvisited ones straight from the galaxy seed
@@ -189,7 +191,15 @@ The **Orders** tab moves cargo too: pick another craft of yours or your alliance
 sector, see both holds, and tick the goods to give or take and how many - or all of it. A
 target out of reach is docked with or flown to first. Programs on the **Automation** tab have
 the same step, with goods picked from the hold as it is now or named for what it will hold
-when the step runs, so a craft can farm or mine, fly home and unload by itself.
+when the step runs, so a craft can farm or mine, fly home and unload by itself - and a
+transfer with a craft in another sector travels there first.
+
+The **Automation** tab lists every craft set to do something by itself, stations with a
+captain included, with a search box over names, sectors and what each is set to do. A
+station's program holds only steps that keep it where it is: standing orders, orders, cargo
+and waits. Destinations on the **Travel** tab, in the mission planner and in route and
+travel steps can be a sector, another craft - flown to wherever it is at the time - or a
+location from the library kept on the Automation tab, which your alliance shares.
 
 The **Mission** tab's **Automation** section turns whatever the planner below it holds into a
 rule: set a ceiling on the ambush chance, a duration window, how many trade flights the
@@ -361,6 +371,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/mission/automation/evaluate`, `.../delete` | dry-run a rule's limits, or remove it |
 | `GET /automation/programs`, `GET`/`POST /ships/{name}/program`, `.../control`, `.../delete` | order programs: steps a craft works through until conditions are met, looping |
 | `GET /automation/missions/library`, `POST /automation/missions/library/{name}`, `.../delete` | mission library: named mission rules that program mission steps fly |
+| `GET /locations`, `POST /locations/{name}`, `.../delete` | location library: named sectors to send ships to, shared with the alliance |
 | `POST /ships/{name}/travel` | alias of the Travel captain mission's start |
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |

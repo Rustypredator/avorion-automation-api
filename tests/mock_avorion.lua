@@ -706,7 +706,11 @@ M.areaFixed = false
 function M.makeCommand(missionType, shipName, area, config)
     local c = {type = missionType, shipName = shipName, area = area, config = config or {}}
 
-    function c:getAreaSize() return M.areaSize end
+    -- TravelCommand's area is the destination sector alone, whatever the other missions use
+    function c:getAreaSize()
+        if missionType == M.commandTypes.Travel then return {x = 1, y = 1} end
+        return M.areaSize
+    end
     function c:isAreaFixed() return M.areaFixed end
     function c:isShipRequiredInArea() return true end
     function c:getConfigurableValues()

@@ -13,6 +13,8 @@
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
 local Config = include("automationapi/config")
+local Owner = include("automationapi/owner")
+local Locations = include("automationapi/locations")
 local RoutePlanner = include("automationapi/routeplanner")
 
 local Routes = {}
@@ -59,6 +61,143 @@ function Routes.destination(body)
     end
 
     return Routes.coordinates(value, "to")
+end
+
+-- #### NAMED DESTINATIONS #### --
+--
+-- Anywhere a ship is sent, the destination can be given three ways, exactly one at a time:
+--
+--   to = {x, y}               a sector
+--   target = "Hub"            wherever that craft of the caller's or their alliance's is now
+--                             (targetOwner = player or alliance when both have one)
+--   location = "Home"         a sector from the location library
+--
+-- A craft or location is looked up when the request is made, so a program step naming one
+-- goes wherever it is at the time the step starts.
+
+local function trimmed(value)
+    if type(value) ~= "string" then return nil end
+    local name = string.match(value, "^%s*(.-)%s*$")
+    return name ~= "" and name or nil
+end
+
+local function givenValue(value)
+    if value == Json.null then return nil end
+    return value
+end
+
+-- Which of the three a body uses: "to", "target", "location", or nil for none. More than one
+-- is a caller bug worth refusing rather than guessing at.
+function Routes.destinationKind(body)
+    local kinds = {}
+    if givenValue(body.to) ~= nil or givenValue(body.destination) ~= nil
+       or givenValue(body.x) ~= nil or givenValue(body.y) ~= nil then
+        kinds[#kinds + 1] = "to"
+    end
+    if givenValue(body.target) ~= nil then kinds[#kinds + 1] = "target" end
+    if givenValue(body.location) ~= nil then kinds[#kinds + 1] = "location" end
+
+    if #kinds > 1 then
+        Router.fail(400, "conflicting_destination",
+                    "Give the destination one way: 'to', 'target' or 'location', not "
+                    .. table.concat(kinds, " and ") .. ".")
+    end
+
+    return kinds[1]
+end
+
+-- The craft a destination names, among the caller's own and their alliance's. Returns the
+-- owner and the craft's position.
+function Routes.findCraft(ctx, name, ownerKind)
+    if ownerKind ~= nil and ownerKind ~= "player" and ownerKind ~= "alliance" then
+        Router.fail(400, "bad_target_owner", "'targetOwner' is player or alliance.")
+    end
+
+    for _, owner in ipairs(Owner.all(ctx)) do
+        if ownerKind == nil or owner.kind == ownerKind then
+            local ok, owns = pcall(function() return owner.faction:ownsShip(name) end)
+            if ok and owns then
+                if owner.faction:getShipAvailability(name) == ShipAvailability.InBackground then
+                    Router.fail(409, "target_in_background",
+                                "'" .. name .. "' is out on a captain mission, so it has no "
+                                .. "sector to fly to.")
+                end
+
+                local okPosition, x, y = pcall(function() return owner.faction:getShipPosition(name) end)
+                if not okPosition or type(x) ~= "number" or type(y) ~= "number" then
+                    Router.fail(404, "no_ship_position",
+                                "The game does not report a position for '" .. name .. "'.")
+                end
+
+                return owner, x, y
+            end
+        end
+    end
+
+    Router.fail(404, "no_such_target",
+                "Neither you nor your alliance own a craft named '" .. name .. "'.")
+end
+
+-- A location by name. The library of the faction owning the ship being sent is asked
+-- first, then the caller's other one: a player's craft finds the player's own "Home"
+-- before the alliance's, an alliance craft the alliance's.
+function Routes.findLocation(ctx, name, shipOwner)
+    local owners = {}
+    if shipOwner then owners[1] = shipOwner end
+    for _, owner in ipairs(Owner.all(ctx)) do
+        if not shipOwner or owner.index ~= shipOwner.index then owners[#owners + 1] = owner end
+    end
+
+    for _, owner in ipairs(owners) do
+        local entry = Locations.get(owner.index, name)
+        if entry then return owner, entry end
+    end
+
+    Router.fail(404, "no_such_location", "No location called '" .. name .. "' in your library"
+                .. (ctx.player and ctx.player.alliance and " or your alliance's" or "") .. ".")
+end
+
+-- Resolves a destination given any of the three ways. Returns x, y and a description of
+-- what was named - {kind = "sector"}, {kind = "craft", name, owner} or {kind = "location",
+-- name, owner} - for the response to echo, so a caller sees where a name led.
+function Routes.resolveDestination(ctx, body, shipOwner)
+    local kind = Routes.destinationKind(body)
+
+    if kind == "target" then
+        local name = trimmed(body.target)
+        if not name then
+            Router.fail(400, "no_target", "'target' is the name of the craft to fly to.")
+        end
+        local owner, x, y = Routes.findCraft(ctx, name, givenValue(body.targetOwner))
+        return x, y, {kind = "craft", name = name, owner = Owner.describe(owner), x = x, y = y}
+    end
+
+    if kind == "location" then
+        local name = trimmed(body.location)
+        if not name then
+            Router.fail(400, "no_location", "'location' is the name of a location in your library.")
+        end
+        local owner, entry = Routes.findLocation(ctx, name, shipOwner)
+        return entry.x, entry.y,
+               {kind = "location", name = name, owner = Owner.describe(owner), x = entry.x, y = entry.y}
+    end
+
+    local x, y = Routes.destination(body)
+    return x, y, {kind = "sector", x = x, y = y}
+end
+
+-- A request body with a named destination rewritten as plain coordinates, for code further
+-- down that only knows `to`. Returns the rewritten copy and the description.
+function Routes.withResolvedDestination(ctx, body, shipOwner)
+    local x, y, via = Routes.resolveDestination(ctx, body, shipOwner)
+
+    local copy = {}
+    for k, v in pairs(body) do copy[k] = v end
+    copy.target, copy.targetOwner, copy.location = nil, nil, nil
+    copy.destination, copy.x, copy.y = nil, nil, nil
+    copy.to = {x = x, y = y}
+
+    return copy, via
 end
 
 -- #### JUMP PATHS #### --
@@ -140,7 +279,10 @@ end
 
 -- #### PLANNED ROUTES #### --
 
-local PREFERENCES = {"preferGates", "avoidRifts", "preferUncontrolled"}
+local PREFERENCES = {"preferGates", "preferWormholes", "fewestJumps", "avoidRifts",
+                     "preferUncontrolled"}
+
+Routes.PREFERENCES = PREFERENCES
 
 local function flag(value)
     return value == true or value == "true" or value == "1" or value == 1
@@ -160,6 +302,31 @@ function Routes.preferences(source)
     end
 
     return given and result or nil
+end
+
+-- The preferences with every one set, for callers that always use the planner.
+function Routes.preferencesOrDefault(source)
+    local result = Routes.preferences(source)
+    if result then return result end
+
+    result = {}
+    for _, name in ipairs(PREFERENCES) do result[name] = false end
+    return result
+end
+
+-- The planner's spec for a ship's search: where from, where to, how far it jumps, and the
+-- preferences.
+function Routes.plannerSpec(owner, from, to, range, canPassRifts, preferences)
+    local spec =
+    {
+        owner = owner,
+        from = from,
+        to = to,
+        range = range,
+        canPassRifts = canPassRifts,
+    }
+    for _, name in ipairs(PREFERENCES) do spec[name] = preferences and preferences[name] or false end
+    return spec
 end
 
 -- A finished planner search in the shape GET /galaxy/route answers with, so a caller can
@@ -191,13 +358,14 @@ function Routes.describePlan(result, fromX, fromY, toX, toY, jumpRange, canPassR
 
     local route = Json.array({{x = fromX, y = fromY}})
     local described = Json.array({})
-    local distance, gates, controlled = 0, 0, 0
+    local distance, gates, wormholes, controlled = 0, 0, 0, 0
 
     for index, hop in ipairs(hops) do
         route[#route + 1] = {x = hop.x, y = hop.y}
         described[index] = hop
         distance = distance + hop.distance
         if hop.kind ~= "jump" then gates = gates + 1 end
+        if hop.kind == "wormhole" then wormholes = wormholes + 1 end
         if hop.controlled then controlled = controlled + 1 end
     end
 
@@ -205,7 +373,10 @@ function Routes.describePlan(result, fromX, fromY, toX, toY, jumpRange, canPassR
     body.hops = described
     -- hops of any kind, as the engine planner's `jumps` counts them
     body.jumps = #hops
+    -- gates and wormholes both, as before wormholes were counted apart; `wormholes` is the
+    -- share of them that were wormholes
     body.gates = gates
+    body.wormholes = wormholes
     body.controlledSectors = controlled
     body.distance = distance
 

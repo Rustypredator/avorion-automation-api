@@ -272,17 +272,19 @@ function Navigation.register(router)
         local body = ctx.body
         local owner = Owner.findShip(ctx, params.name)
 
-        local toX, toY = Routes.destination(body)
+        Movement.requireShip(owner, params.name, "fly a route")
+
+        local toX, toY, destination = Routes.resolveDestination(ctx, body, owner)
         local onEnemies = onEnemiesOf(body, "fight")
-        local preferences = Routes.preferences(body)
-            or {preferGates = false, avoidRifts = false, preferUncontrolled = false}
+        local preferences = Routes.preferencesOrDefault(body)
         local dryRun = body.dryRun == true
 
         local ship = shipEntry(owner, params.name)
 
         if ship.x == toX and ship.y == toY then
             Router.fail(422, "already_there",
-                        string.format("'%s' is already in (%d:%d).", params.name, toX, toY))
+                        string.format("'%s' is already in (%d:%d).", params.name, toX, toY),
+                        {sector = Serialize.vec2(toX, toY), destination = destination})
         end
 
         -- The world is checked before the plan is spent, so a ship that cannot be ordered
@@ -297,19 +299,12 @@ function Navigation.register(router)
         Routes.throttle(ctx.playerIndex)
 
         RoutePlanner.run(
-        {
-            owner = owner,
-            from = {x = ship.x, y = ship.y},
-            to = {x = toX, y = toY},
-            range = ship.range,
-            canPassRifts = ship.canPassRifts,
-            preferGates = preferences.preferGates,
-            avoidRifts = preferences.avoidRifts,
-            preferUncontrolled = preferences.preferUncontrolled,
-        },
+            Routes.plannerSpec(owner, {x = ship.x, y = ship.y}, {x = toX, y = toY},
+                               ship.range, ship.canPassRifts, preferences),
         function(result)
             local response = Routes.describePlan(result, ship.x, ship.y, toX, toY,
                                                  ship.range, ship.canPassRifts, preferences)
+            response.destination = destination
             response.ship = params.name
             response.owner = Owner.describe(owner)
             response.onEnemies = onEnemies
@@ -355,6 +350,8 @@ function Navigation.register(router)
     router:post("/ships/{name}/farm", function(ctx, params)
         local body = ctx.body
         local owner = Owner.findShip(ctx, params.name)
+
+        Movement.requireShip(owner, params.name, "farm bosses")
 
         local boss = string.lower(tostring(body.boss or "auto"))
         if boss ~= "auto" and not RoutePlanner.bossRings[boss] then

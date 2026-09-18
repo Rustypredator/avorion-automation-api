@@ -2,9 +2,10 @@
 --
 -- calculateJumpPath is the game's pathfinder and the right answer when all a caller wants
 -- is the shortest way there. It takes no preferences, though: it cannot be told to favour
--- gates, to keep a rift-capable ship out of rifts, or to stay out of faction territory. So
--- this is a search of its own, over the same facts the engine uses - jump range, rift
--- geometry, known gates and wormholes - weighted by what the caller asked for.
+-- gates or wormholes, to keep a rift-capable ship out of rifts, to stay out of faction
+-- territory, or to count hops rather than distance. So this is a search of its own, over
+-- the same facts the engine uses - jump range, rift geometry, known gates and wormholes -
+-- weighted by what the caller asked for.
 --
 -- It is a weighted A*. Neighbours are not every sector within jump range, which at a late
 -- game range of twenty is well over a thousand per step, but a fixed set of directions at
@@ -20,13 +21,22 @@ local Sectors = include("automationapi/sectors")
 
 local Planner = {}
 
+-- Above 1 the search trades a little route quality for far fewer expansions. Asking for the
+-- fewest jumps puts it back to 1, where it never overestimates what is left for a plain
+-- jump route, so the hop count found is the least the sampled neighbours allow.
 local HEURISTIC_WEIGHT = 1.25
+local HEURISTIC_WEIGHT_FEWEST = 1.0
 
--- A jump costs 1. A gate costs more than that by default, because flying to it takes
--- longer than a jump, so it is only taken when it saves jumps; asking for gates makes it
--- cheap instead.
-local GATE_COST = 1.5
-local GATE_COST_PREFERRED = 0.35
+-- A jump costs 1. A gate or wormhole costs more than that by default, because flying to it
+-- takes longer than a jump, so it is only taken when it saves jumps; asking for that kind
+-- of link makes it cheap instead.
+local LINK_COST = 1.5
+local LINK_COST_PREFERRED = 0.35
+
+-- Asking for the fewest jumps makes every hop cost 1, whatever it is, and turns the other
+-- preferences into tie-breakers: among routes of equally few hops, the one with the
+-- preferred links or the least faction space wins, but never at the price of a hop.
+local FEWEST_TIE_BREAK = 0.01
 
 -- Added to any hop that lands in faction territory when the caller prefers otherwise. One
 -- extra jump's worth: a detour of one jump that avoids one controlled sector breaks even.
@@ -221,17 +231,29 @@ local function landingCost(search, x, y)
         search.controlled[key] = cached
     end
 
-    return cached and CONTROLLED_PENALTY or 0
+    if not cached then return 0 end
+    return search.fewestJumps and FEWEST_TIE_BREAK or CONTROLLED_PENALTY
 end
 
 local function heuristic(search, x, y)
-    return distance(x, y, search.to.x, search.to.y) / search.range * HEURISTIC_WEIGHT
+    return distance(x, y, search.to.x, search.to.y) / search.range * search.heuristicWeight
 end
+
+-- What taking a known gate or wormhole costs under the search's preferences.
+local function linkCost(search, kind)
+    local preferred = kind == "gate" and search.preferGates
+                      or kind == "wormhole" and search.preferWormholes
+
+    if search.fewestJumps then return preferred and 1 - FEWEST_TIE_BREAK or 1 end
+    return preferred and LINK_COST_PREFERRED or LINK_COST
+end
+
+Planner.linkCost = linkCost
 
 -- Starts a search. Nothing is expanded until the first step().
 --
 --   spec = {owner, from = {x, y}, to = {x, y}, range, canPassRifts,
---           preferGates, avoidRifts, preferUncontrolled}
+--           preferGates, preferWormholes, fewestJumps, avoidRifts, preferUncontrolled}
 function Planner.start(spec)
     local minCoord, maxCoord = bounds()
 
@@ -243,6 +265,8 @@ function Planner.start(spec)
         range = math.max(1, tonumber(spec.range) or 1),
         canPassRifts = spec.canPassRifts == true,
         preferGates = spec.preferGates == true,
+        preferWormholes = spec.preferWormholes == true,
+        fewestJumps = spec.fewestJumps == true,
         avoidRifts = spec.avoidRifts == true,
         preferUncontrolled = spec.preferUncontrolled == true,
         minCoord = minCoord,
@@ -255,6 +279,8 @@ function Planner.start(spec)
         expansions = 0,
         done = false,
     }
+
+    search.heuristicWeight = search.fewestJumps and HEURISTIC_WEIGHT_FEWEST or HEURISTIC_WEIGHT
 
     local startKey = keyOf(search.from.x, search.from.y)
     search.best[startKey] = {g = 0, x = search.from.x, y = search.from.y}
@@ -368,8 +394,7 @@ function Planner.step(search, budget)
 
             for _, link in ipairs(connections(search.owner, x, y)) do
                 budget = budget - 1
-                consider(search, current, link.x, link.y, link.kind,
-                         search.preferGates and GATE_COST_PREFERRED or GATE_COST)
+                consider(search, current, link.x, link.y, link.kind, linkCost(search, link.kind))
             end
         end
     end

@@ -164,6 +164,13 @@ check(plain.controlledSectors > 0, "the direct route lands in faction space")
 check(avoiding.controlledSectors < plain.controlledSectors,
       "asking for uncontrolled space lands in less of it")
 check(avoiding.hops[1].controlled ~= nil, "each hop says whether it is controlled")
+
+local status, fewest = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", toX = "20", toY = "0",
+                                                          preferUncontrolled = "true", fewestJumps = "true"})
+check(fewest.reachable and fewest.jumps == 4 and avoiding.jumps > 4,
+      "fewest jumps flies the 4-jump line where avoiding faction space alone takes "
+      .. tostring(avoiding.jumps))
+check(fewest.preferences and fewest.preferences.fewestJumps == true, "and says it was asked for")
 Mock.controlledSectors = {}
 
 -- A known gate out of the origin, far across the barrier's inside.
@@ -174,6 +181,29 @@ local status, body = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", toX
 check(body.reachable == true and body.hops[1].kind == "gate",
       "a known gate is taken")
 check(body.gates == 1 and body.jumps == 2, "and counted apart from the jumps")
+
+-- A wormhole out of the same sector, landing just as close to a destination of its own.
+Mock.addKnownSector(1, 0, 0, {gates = {{x = 0, y = 100}}, wormholes = {{x = 100, y = 0}}})
+
+local status, body = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", toX = "103", toY = "3",
+                                                        preferWormholes = "true"})
+check(body.reachable == true and body.hops[1].kind == "wormhole",
+      "asked to prefer wormholes, a known wormhole is taken")
+check(body.gates == 1 and body.wormholes == 1, "and counted among the gates, and on its own")
+
+local status, body = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", toX = "3", toY = "103",
+                                                        preferWormholes = "true"})
+check(body.reachable == true and body.hops[1].kind == "gate",
+      "a gate that saves nineteen jumps is still taken when wormholes are preferred")
+
+local RoutePlanner = require("automationapi.routeplanner")
+check(RoutePlanner.linkCost({}, "gate") > 1 and RoutePlanner.linkCost({fewestJumps = true}, "gate") == 1
+      and RoutePlanner.linkCost({fewestJumps = true, preferGates = true}, "gate") > 0.9
+      and RoutePlanner.linkCost({preferWormholes = true}, "wormhole") < 1
+      and RoutePlanner.linkCost({preferWormholes = true}, "gate") > 1
+      and RoutePlanner.linkCost({preferGates = true}, "wormhole") > 1,
+      "gates and wormholes are preferred each on their own")
+Mock.addKnownSector(1, 0, 0, {gates = {{x = 0, y = 100}}})
 
 local status, body = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", toX = "200",
                                                         toY = "0", avoidRifts = "true"})
@@ -240,6 +270,41 @@ check(status == 422 and body.error.code == "plan_refused"
       and body.error.message:find("jump not possible", 1, true) ~= nil,
       "including a jump the engine would not allow")
 Mock.refusePlan = nil
+
+print("\nnamed destinations")
+
+Mock.addShip(1, "Beacon", {x = 25, y = 0, range = 5})
+Mock.addShip(1, "Outpost", {x = 0, y = 0, type = EntityType.Station})
+
+local status, body = call("POST", "/ships/Pathfinder/route", {target = "Beacon", dryRun = true})
+check(status == 200 and body.to.x == 25 and body.destination.kind == "craft"
+      and body.destination.name == "Beacon", "a route to a craft flies to its sector")
+
+local status, body = call("POST", "/ships/Pathfinder/route", {target = "Outpost", dryRun = true})
+check(status == 422 and body.error.code == "already_there",
+      "a craft in the ship's own sector is already there")
+
+local status, body = call("POST", "/ships/Pathfinder/route", {target = "Ghost", dryRun = true})
+check(status == 404 and body.error.code == "no_such_target", "an unknown craft is a 404")
+
+local status, body = call("POST", "/ships/Pathfinder/route", {to = {x = 1, y = 1}, target = "Beacon"})
+check(status == 400 and body.error.code == "conflicting_destination", "two destinations at once are refused")
+
+local status, body = call("POST", "/locations/Far Point", {x = 30, y = 5, note = "past the belt"})
+check(status == 200 and body.x == 30 and body.owner.kind == "player", "a location is saved")
+
+local status, body = call("POST", "/ships/Pathfinder/route", {location = "Far Point", dryRun = true})
+check(status == 200 and body.to.x == 30 and body.to.y == 5 and body.destination.kind == "location",
+      "a route to a library location flies to its sector")
+
+local status, body = call("GET", "/galaxy/route", nil, {ship = "Pathfinder", target = "Beacon"})
+check(status == 200 and body.to.x == 25 and body.destination.name == "Beacon",
+      "and a route can be looked up to a craft")
+
+local status, body = call("POST", "/ships/Outpost/route", {to = {x = 20, y = 0}})
+check(status == 422 and body.error.code == "station_cannot_move", "a station flies no routes")
+local status, body = call("POST", "/ships/Outpost/orders", {orders = {{type = "jump", to = {x = 3, y = 0}}}})
+check(status == 422 and body.error.code == "station_cannot_move", "nor jumps")
 
 Mock.noOrderChainExtension = true
 local status, body = call("POST", "/ships/Pathfinder/route", {to = {x = 20, y = 0}})

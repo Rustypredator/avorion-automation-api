@@ -167,6 +167,30 @@ local status, body = call("POST", "/ships/Prospector/travel",
                           {to = {x = 90, y = 0}, swiftness = 9})
 check(status == 400 and body.error.code == "bad_swiftness", "swiftness is range checked")
 
+print("\nPOST /ships/{name}/travel - to a craft")
+
+-- the Travel mission just started took the Prospector into the background
+Mock.getShip(1, "Prospector").availability = ShipAvailability.Available
+Mock.addShip(1, "Depot", {x = 0, y = 0, type = EntityType.Station})
+
+local read = send("POST", "/ships/Deep Runner/travel", {target = "Depot", swiftness = 1})
+Mock.flushAsync({route = {{x = 200, y = 200}, {x = 100, y = 100}, {x = 0, y = 0}},
+                 sectors = 1, reachableCoordinates = {}})
+Bridge.update(Config.pollInterval)
+for _ = 1, 8 do tick(0.6) end
+local status, body = read()
+check(status == 200 and body.started == true and body.area.lower.x == 0 and body.area.lower.y == 0
+      and body.destination.kind == "craft" and body.destination.name == "Depot",
+      "a Travel mission to a craft flies to the craft's sector")
+-- back from it, where the orders below expect it
+Mock.getShip(1, "Deep Runner").availability = ShipAvailability.Available
+
+local status, body = call("POST", "/ships/Prospector/travel", {target = "Depot"})
+check(status == 422 and body.error.code == "already_there", "one already there is told so")
+
+local status, body = call("POST", "/ships/Depot/travel", {to = {x = 60, y = 0}})
+check(status == 422 and body.error.code == "station_cannot_move", "a station does not travel")
+
 -- #### ORDERS #### --
 
 print("\nPOST /ships/{name}/orders")

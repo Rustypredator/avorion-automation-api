@@ -278,20 +278,28 @@ function saveStanding(sent) {
     return { ship: 'Ore Hound', confirmed: true, requested: sent, automation: automation };
 }
 
-const flownRoute = (sent) => ({
-    ship: 'Ore Hound', confirmed: true, planId: 'p2', reachable: true, planner: 'automation',
-    jumps: 2, gates: 1, controlledSectors: 0, distance: 30.4,
-    from: { x: 3, y: 0 }, to: sent.to,
-    hops: [{ x: 5, y: 0, kind: 'jump', controlled: false },
-           { x: sent.to.x, y: sent.to.y, kind: 'gate', controlled: false }],
-    route: [{ x: 3, y: 0 }, { x: 5, y: 0 }, sent.to],
-    automation: {
-        autoAggressive: true, attackCivilians: false, enemies: false,
-        standing: houndAutomation.automation.standing,
-        plan: { id: 'p2', kind: 'route', phase: 'running', hops: 2, hop: 1, loopFrom: 0,
-                jumps: 0, fights: 0, onEnemies: sent.onEnemies, target: sent.to }
-    }
-});
+// A craft or a location is resolved by the mod; here, to where Far Scout and Home are.
+const namedSectors = { 'Far Scout': { x: 40, y: 40 }, Home: { x: 5, y: 5 } };
+
+const flownRoute = (sent) => {
+    const to = sent.to || namedSectors[sent.target || sent.location];
+    return {
+        ship: 'Ore Hound', confirmed: true, planId: 'p2', reachable: true, planner: 'automation',
+        jumps: 2, gates: 1, controlledSectors: 0, distance: 30.4,
+        from: { x: 3, y: 0 }, to: to,
+        destination: sent.to ? { kind: 'sector', x: to.x, y: to.y }
+            : { kind: sent.target ? 'craft' : 'location', name: sent.target || sent.location, x: to.x, y: to.y },
+        hops: [{ x: 5, y: 0, kind: 'jump', controlled: false },
+               { x: to.x, y: to.y, kind: 'gate', controlled: false }],
+        route: [{ x: 3, y: 0 }, { x: 5, y: 0 }, to],
+        automation: {
+            autoAggressive: true, attackCivilians: false, enemies: false,
+            standing: houndAutomation.automation.standing,
+            plan: { id: 'p2', kind: 'route', phase: 'running', hops: 2, hop: 1, loopFrom: 0,
+                    jumps: 0, fights: 0, onEnemies: sent.onEnemies, target: to }
+        }
+    };
+};
 
 /*
  * Mission automation as the mod reports it. Wingman already has a rule, held back by its
@@ -431,7 +439,36 @@ function sendTransfer(sent) {
     };
 }
 
+/* A station with a captain, which the Automation tab lists; the refinery has none. */
+const guardPost = {
+    name: 'Guard Post', type: 'Station', owner: { kind: 'player', index: 1, name: 'Rusty' },
+    position: { x: 3, y: 3 }, availability: 'Available', hasCaptain: true,
+    usable: { ok: false, code: 'NotAShip', message: 'This is not a ship.' },
+    cargo: { capacity: 1000, free: 1000, used: 0, goods: [] },
+    durability: { max: 1, percentage: 1 }, shields: {}, energy: {}, turrets: [], systems: [],
+    hangar: { squads: [], fighters: 0 }, crew: { size: 0, maxSize: 0, byProfession: [], ideal: [] }
+};
+
+/* The location library as the mod keeps it: one of the player's own to start with. */
+const locationStore = {
+    'player|Home': { name: 'Home', owner: { kind: 'player', index: 1, name: 'Rusty' }, x: 5, y: 5,
+                     revision: 1, usedBy: [] }
+};
+
+function saveLocation(name) {
+    return function (sent) {
+        const key = 'player|' + name;
+        const previous = locationStore[key];
+        locationStore[key] = { name: name, owner: { kind: 'player', index: 1, name: 'Rusty' },
+                               x: sent.x, y: sent.y, note: sent.note || undefined,
+                               revision: (previous ? previous.revision : 0) + 1, usedBy: [] };
+        return locationStore[key];
+    };
+}
+
 const dynamic = {
+    '/locations/Rendezvous': saveLocation('Rendezvous'),
+    '/locations/Belt': saveLocation('Belt'),
     '/ships/Ore%20Hound/transfer': sendTransfer,
     '/automation/missions/library/Trade%20run': saveLibraryMission('Trade run'),
     '/ships/Ore%20Hound/program': saveProgram,
@@ -447,7 +484,20 @@ const dynamic = {
 const routes = {
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
-    '/ships': { ships: [refinery, hound, wingman, farScout], count: 4 },
+    // The type filter is not applied, as the checks above the Industry tab have always
+    // relied on; asking for stations adds the one with a captain, for the Automation tab.
+    '/ships': (query) => (query.get('type') === 'station'
+        ? { ships: [refinery, hound, wingman, farScout, guardPost], count: 5 }
+        : { ships: [refinery, hound, wingman, farScout], count: 4 }),
+    '/ships/Guard%20Post': guardPost,
+    '/ships/Guard%20Post/automation': {
+        ship: 'Guard Post', owner: { kind: 'player' }, source: 'live', reported: true,
+        automation: { standing: { enemies: { enabled: true, mode: 'idle' }, loot: { enabled: false, mode: 'idle' } } }
+    },
+    '/ships/Guard%20Post/events': {
+        ship: 'Guard Post', owner: { kind: 'player' }, events: [], cursor: 0, dropped: 0, recording: true, watchers: 1
+    },
+    get '/locations'() { return { locations: Object.values(locationStore), maxName: 48, maxLocations: 200 }; },
     '/ships/Ore%20Hound/missions': tradeCatalog,
     '/ships/Rusty%20Refinery': refinery,
     '/ships/Ore%20Hound': hound,
@@ -1267,7 +1317,7 @@ const ready = window.document.readyState === 'loading'
     click($('#automation-filter [data-v="all"]'));
     await settle(50);
     check(autoRows().includes('Far Scout') && !autoRows().includes('Rusty Refinery'),
-          'All ships lists the rest too, stations still aside');
+          'All lists the rest too, stations without a captain still aside');
     click($('#automation-filter [data-v="automated"]'));
     await settle(50);
     check(/auto · waiting/.test($('[data-ship="Ore Hound"]').textContent),
@@ -1606,6 +1656,182 @@ const ready = window.document.readyState === 'loading'
     click(missionPane.querySelector('[data-list-remove="routes.1"]'));
     await settle(50);
     check(missionPane.querySelectorAll('[data-list-remove]').length === 1, 'a line can be removed');
+
+
+    console.log('\nthe centre of a mission area, from a craft or a location');
+
+    const centerPick = missionPane.querySelector('[data-center-pick]');
+    const centerValues = centerPick ? Array.from(centerPick.options).map((o) => o.value) : [];
+    check(centerValues.includes('loc|player|Home') && centerValues.includes('craft|Far Scout')
+          && !centerValues.includes('craft|Ore Hound'),
+          'the planner offers locations and other craft to centre the area on');
+    change(centerPick, 'craft|Far Scout');
+    await settle(50);
+    check(missionPane.querySelector('[data-form="cx"]').value === '40'
+          && missionPane.querySelector('[data-form="cy"]').value === '40',
+          'picking a craft centres the area on its sector');
+
+    console.log('\nroutes to a craft or a location');
+
+    tab('travel').click();
+    await settle(600);
+    check(travel().querySelector('[data-pref="preferWormholes"]') && travel().querySelector('[data-pref="fewestJumps"]'),
+          'the travel tab offers wormholes and fewest jumps');
+    click(travel().querySelector('[data-pref="fewestJumps"]'));
+    await settle(50);
+    click(travel().querySelector('[data-dest-kind="target"]'));
+    await settle(50);
+    const craftPick = $('#travel-target');
+    const targetValues = craftPick ? Array.from(craftPick.options).map((o) => o.value) : [];
+    check(targetValues.includes('player|Far Scout') && targetValues.includes('player|Guard Post')
+          && !targetValues.includes('player|Ore Hound'),
+          'a route can go to any other craft, stations included');
+    change(craftPick, 'player|Far Scout');
+    await settle(50);
+
+    posts.length = 0;
+    click(travel().querySelector('[data-act="fly"]'));
+    await settle(700);
+    const toCraft = posts.filter((p) => p.path === '/ships/Ore%20Hound/route').pop();
+    check(toCraft && toCraft.body.target === 'Far Scout' && toCraft.body.targetOwner === 'player'
+          && toCraft.body.to === undefined && toCraft.body.fewestJumps === true,
+          'flying there names the craft rather than its coordinates, with the preferences');
+    check(/to Far Scout \(40:40\)/.test(travel().textContent), 'and the result says where the craft was');
+
+    click(travel().querySelector('[data-dest-kind="location"]'));
+    await settle(50);
+    change($('#travel-location'), 'player|Home');
+    await settle(50);
+    posts.length = 0;
+    click(travel().querySelector('[data-act="fly"]'));
+    await settle(700);
+    const toLocation = posts.filter((p) => p.path === '/ships/Ore%20Hound/route').pop();
+    check(toLocation && toLocation.body.location === 'Home' && toLocation.body.to === undefined,
+          'and a location by its name');
+
+    click(travel().querySelector('[data-dest-kind="to"]'));
+    await settle(50);
+    $('#travel-x').value = '7';
+    $('#travel-y').value = '8';
+    $('#travel-save-name').value = 'Rendezvous';
+    posts.length = 0;
+    click(travel().querySelector('[data-act="travel-save-location"]'));
+    await settle(400);
+    const keptSector = posts.filter((p) => p.path === '/locations/Rendezvous').pop();
+    check(keptSector && keptSector.body.x === 7 && keptSector.body.y === 8,
+          'a sector typed in can be kept as a location');
+
+    console.log('\nthe location library');
+
+    $('[data-view="automation"]').click();
+    await settle(400);
+    const locationList = () => $('#automation-pane [data-locations]');
+    check(locationList() && /Home/.test(locationList().textContent) && /Rendezvous/.test(locationList().textContent),
+          'the Automation tab lists the library');
+    click(locationList().querySelector('[data-loc-act="new"]'));
+    await settle(50);
+    const locEditor = () => $('#automation-pane .location-editor');
+    typed(locEditor().querySelector('[data-loc-field="name"]'), 'Belt');
+    change(locEditor().querySelector('[data-loc-from]'), 'craft|Far Scout');
+    await settle(50);
+    check(locEditor().querySelector('[data-loc-field="x"]').value === '40',
+          'a new location can take a craft\'s sector');
+    posts.length = 0;
+    click(locEditor().querySelector('[data-loc-act="save"]'));
+    await settle(400);
+    const newLocation = posts.filter((p) => p.path === '/locations/Belt').pop();
+    check(newLocation && newLocation.body.x === 40 && newLocation.body.y === 40 && !locEditor(),
+          'and is saved with it');
+
+    console.log('\nroute, travel and transfer steps');
+
+    click(progStatus().querySelector('[data-prog-act="edit"]'));
+    await settle(50);
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.5.action.type"]'), 'route');
+    await settle(50);
+    change(editor().querySelector('[data-pf-dest-kind="5"]'), 'location');
+    await settle(50);
+    const stepLocation = editor().querySelector('[data-pf="steps.5.action.location"]');
+    check(stepLocation && Array.from(stepLocation.options).some((o) => o.value === 'Belt'),
+          'a route step can go to a library location');
+    change(stepLocation, 'Home');
+    await settle(50);
+    const fewest = editor().querySelector('[data-pf="steps.5.action.fewestJumps"]');
+    fewest.checked = true;
+    change(fewest);
+
+    click(editor().querySelector('[data-prog-act="add-step"]'));
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.6.action.type"]'), 'travel');
+    await settle(50);
+    change(editor().querySelector('[data-pf-dest-kind="6"]'), 'target');
+    await settle(50);
+    change(editor().querySelector('[data-pf="steps.6.action.target"]'), 'Guard Post');
+    await settle(50);
+
+    const travelFirst = editor().querySelector('[data-pf="steps.4.action.travelToTarget"]');
+    check(travelFirst && travelFirst.checked, 'a transfer step travels to its target first unless told not to');
+    travelFirst.checked = false;
+    change(travelFirst);
+
+    posts.length = 0;
+    click(editor().querySelector('[data-prog-act="save"]'));
+    await settle(400);
+    const namedSteps = (posts.filter((p) => p.path === '/ships/Ore%20Hound/program').pop() || { body: {} }).body.steps;
+    check(namedSteps && namedSteps[5].action.location === 'Home' && namedSteps[5].action.to === undefined
+          && namedSteps[5].action.fewestJumps === true && namedSteps[5].action.preferGates === undefined,
+          'the route step is saved naming the location, with the preference ticked');
+    check(namedSteps && namedSteps[6].action.target === 'Guard Post' && namedSteps[6].action.targetOwner === 'player'
+          && namedSteps[6].action.to === undefined,
+          'the travel step naming the craft');
+    check(namedSteps && namedSteps[4].action.travelToTarget === false && namedSteps[3].action.travelToTarget === undefined,
+          'and the transfer step that stays put');
+    const namedRows = $$('#automation-pane .program-step');
+    check(/fly to Home/.test(namedRows[5].textContent) && /fewest jumps/.test(namedRows[5].textContent)
+          && /travel to Guard Post/.test(namedRows[6].textContent),
+          'the step list says where each goes');
+
+    console.log('\nstations and search in the Automation tab');
+
+    click($('#automation-filter [data-v="all"]'));
+    await settle(50);
+    check(autoRows().includes('Guard Post') && !autoRows().includes('Rusty Refinery'),
+          'a station with a captain is listed, one without is not');
+
+    typed($('#automation-search'), 'station');
+    await settle(50);
+    check(autoRows().join() === 'Guard Post', 'the search box narrows the list');
+    typed($('#automation-search'), 'guard');
+    await settle(50);
+    check(autoRows().join() === 'Guard Post,Ore Hound',
+          'to the craft named, and those whose programs name it');
+    typed($('#automation-search'), 'rendezvous');
+    await settle(50);
+    check(autoRows().length === 0 && /Nothing matches/.test($('#automation-rows').textContent),
+          'and says when nothing matches');
+    typed($('#automation-search'), 'home');
+    await settle(50);
+    check(autoRows().join() === 'Ore Hound', 'it looks through what a craft is set to do, too');
+    typed($('#automation-search'), '');
+    await settle(50);
+
+    click($('#automation-rows [data-auto-ship="Guard Post"]'));
+    await settle(600);
+    check(/Guard Post/.test(autoPane.querySelector('h1').textContent) && /station/.test(autoPane.textContent)
+          && !autoPane.querySelector('[data-auto-status]') && !libraryList(),
+          'a station gets no mission automation or library');
+    check(autoPane.querySelector('[data-standing-on="enemies"]')
+          && autoPane.querySelector('[data-standing-on="enemies"]').checked,
+          'but its standing orders, as it reported them');
+    click(progStatus().querySelector('[data-prog-act="new"]'));
+    await settle(50);
+    const stationActions = Array.from(editor().querySelector('[data-pf="steps.0.action.type"]').options).map((o) => o.value);
+    check(stationActions.join() === 'orders,standing,transfer,wait',
+          'and a program of only the steps that leave it where it is');
+    click(editor().querySelector('[data-prog-act="cancel"]'));
+    await settle(50);
 
     console.log('');
     if (failures === 0) {

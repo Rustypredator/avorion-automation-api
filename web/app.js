@@ -66,6 +66,15 @@
     expectEnd: {},      // ship name -> true while a stop sent from here is on its way
     standingSaving: null, // ship name whose standing orders are being saved
     autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
+    autoSearch: '',     // the Automation tab's search box, lower-cased
+    /* Stations, read apart from the fleet listing so the Automation tab can list those with
+       a captain whatever the Fleet tab's type filter shows. Merged into `byName` too, so a
+       station picked there resolves like any listed craft. */
+    autoStations: [],
+    /* The location library, off /locations: the player's own and the alliance's. `locForm`
+       is the location being added or edited. */
+    locations: { list: [], loaded: false, error: null },
+    locForm: null,
     /* Order programs, off /automation/programs, shaped like `automations`. `progForm` is the
        program editor open for the selected craft. */
     programs: { byKey: {}, loaded: false, error: null, serverTime: null, receivedAt: 0 },
@@ -84,7 +93,10 @@
     /* The Travel tab. Preferences and enemy handling stick across craft, since they
        describe how the player likes to fly; results and the automation read do not. */
     nav: {
-      preferGates: false, avoidRifts: false, preferUncontrolled: false,
+      preferGates: false, preferWormholes: false, fewestJumps: false,
+      avoidRifts: false, preferUncontrolled: false,
+      /* where a route goes: a sector, a craft by name, or a library location */
+      destKind: 'to', destTarget: '', destTargetOwner: '', destLocation: '',
       onEnemies: 'fight', attackCivilians: false, boss: 'auto',
       collectLoot: true, cooldownMinutes: 30,
       result: null, farm: null, automation: null, automationError: null
@@ -608,9 +620,14 @@
       + '<p>Mission steps fly a mission from the library, or the craft&rsquo;s own mission rule, '
       + 'under its limits; while a program runs, the rule does not send the craft out on its '
       + 'own. Travel steps start a Travel mission, which crosses any distance without loading '
-      + 'sectors, and end when the craft arrives. Conditions read the ship '
+      + 'sectors, and end when the craft arrives. Route and travel steps can go to a sector, a '
+      + 'craft &mdash; wherever it is when the step starts &mdash; or a library location; a '
+      + 'ship already there has arrived. A transfer with a craft in another sector flies there '
+      + 'first unless told not to. Conditions read the ship '
       + 'database and what the ship last reported, so cargo is as fresh as the game keeps '
-      + 'that row. A failed step is retried every minute.</p>',
+      + 'that row. A failed step is retried every minute.</p>'
+      + '<p>Stations with a captain run programs too, of the steps that leave them where they '
+      + 'are: standing orders, orders, cargo transfers and waits.</p>',
 
     'mission-library':
       '<p>Missions kept under a name &mdash; &ldquo;Refine, safe&rdquo;, &ldquo;Mine 2h&rdquo; &mdash; '
@@ -672,10 +689,24 @@
       + 'again inside the window. The event log below shows what actually happened.',
 
     'nav-route':
-      'The route is planned by the mod, not the game\'s pathfinder, so it can prefer gates, '
-      + 'keep a rift-capable ship out of rifts and stay in no man\'s space. The ship flies it '
-      + 'as an ordinary order chain &mdash; the Orders tab and the map show the jumps. Its '
-      + 'sector has to be loaded, and it needs a captain or you at the controls.',
+      '<p>The route is planned by the mod, not the game\'s pathfinder, so it can prefer gates '
+      + 'or wormholes, keep a rift-capable ship out of rifts and stay in no man\'s space. The '
+      + 'ship flies it as an ordinary order chain &mdash; the Orders tab and the map show the '
+      + 'jumps. Its sector has to be loaded, and it needs a captain or you at the controls.</p>'
+      + '<p>The destination can be a sector, one of your or your alliance\'s craft &mdash; the '
+      + 'route goes to wherever it is when you send it &mdash; or a location from the library. '
+      + '<b>fewest jumps</b> counts every hop the same, jump, gate or wormhole, and takes the '
+      + 'route with the fewest; the other preferences then only choose between routes of '
+      + 'equally few hops.</p>',
+
+    'locations':
+      '<p>Sectors kept under a name &mdash; &ldquo;Home&rdquo;, &ldquo;Iron belt&rdquo; &mdash; '
+      + 'to pick as a destination instead of typing coordinates: on the Travel tab, in the '
+      + 'mission planner and in route and travel steps.</p>'
+      + '<p>Your own locations are yours; the alliance&rsquo;s are shared, and any member can '
+      + 'add to them. A program step naming a location flies to it as it is when the step '
+      + 'starts, so moving a location moves the programs with it, and one a program still '
+      + 'names cannot be deleted.</p>',
 
     'nav-enemies':
       '<p>The ship checks its sector every second while it flies a plan.</p>'
@@ -1010,6 +1041,8 @@
         startLoops();
         refreshFleet();
         loadAutomations(true);
+        loadAutoStations();
+        loadLocations();
         loadGalaxy();
         loadHistory(true);
       })
@@ -1091,6 +1124,8 @@
     loop('automations', EVERY.automations, loadAutomations);
     loop('programs', EVERY.automations, loadPrograms);
     loop('library', EVERY.automations, loadLibrary);
+    loop('stations', EVERY.fleet, loadAutoStations);
+    loop('locations', EVERY.automations * 3, loadLocations);
     loop('mission', EVERY.mission, function () {
       if (!S.selected) { return; }
       var ship = S.byName[S.selected];
@@ -1167,6 +1202,8 @@
         loadAutomations(true);
         loadPrograms(true);
         loadLibrary(true);
+        loadAutoStations(true);
+        loadLocations(true);
         if (S.selected) { loadAutomation(); }
       }
     }
@@ -1234,6 +1271,30 @@
 
   /* ================================= FLEET ================================= */
 
+  /* The stations the Automation tab lists, whatever type the Fleet tab filters on. Read with
+     the Fleet tab's owner filter, as the fleet is. */
+  function loadAutoStations(userInitiated) {
+    var owner = S.filters.owner;
+    return Api.get('/ships', { type: 'station', owner: owner },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'stations' })
+      .then(function (body) {
+        if (S.filters.owner !== owner) { return; }
+        S.autoStations = (body.ships || []).filter(isStation);
+        mergeAutoStations();
+        renderAutomationList();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.autoStations = [];
+      });
+  }
+
+  function mergeAutoStations() {
+    S.autoStations.forEach(function (station) {
+      if (!S.byName[station.name]) { S.byName[station.name] = station; }
+    });
+  }
+
   function refreshFleet(userInitiated) {
     return Api.get('/ships', { type: S.filters.type, owner: S.filters.owner },
                    { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'ships' })
@@ -1241,6 +1302,7 @@
         S.ships = body.ships || [];
         S.byName = {};
         S.ships.forEach(function (s) { S.byName[s.name] = s; });
+        mergeAutoStations();
 
         S.fleetCount = body.count;
         renderFleet();
@@ -2297,6 +2359,7 @@
       + '<input type="number" data-form="cy" value="' + form.center.y + '" style="width:88px">'
       + '<button class="ghost small" data-act="center-ship">on ship</button>'
       + '<button class="ghost small" data-act="center-map">pick on map</button>'
+      + destinationPicker('data-center-pick', S.selected, form.mission === 'travel' ? 'to a craft or location…' : 'on a craft or location…')
       + '</div>');
 
     if ((entry.areaSizes || []).length > 1) {
@@ -3559,15 +3622,54 @@
     return out.join('');
   }
 
+  /* Everything the Automation tab can automate: ships, and stations with a captain. A
+     station takes no order that moves it, but standing orders, cargo and programs of those
+     work as they do on a ship. */
+  function automatableCraft() {
+    var seen = {};
+    var craft = [];
+    S.ships.concat(S.autoStations).forEach(function (c) {
+      if (seen[c.name]) { return; }
+      seen[c.name] = true;
+      if (!isStation(c) || c.hasCaptain === true) { craft.push(c); }
+    });
+    craft.sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+    return craft;
+  }
+
+  /* What the search box looks through: the name, the sector, and what the craft is set to do. */
+  function automationHaystack(ship) {
+    var parts = [ship.name, coords(ship.position), isStation(ship) ? 'station' : 'ship'];
+    var entry = automationFor(ship.name);
+    if (entry && entry.rule) { parts.push(entry.rule.mission, (entry.state || {}).message); }
+    var program = programFor(ship.name);
+    if (program && program.program) {
+      parts.push('program', program.program.name, (program.state || {}).message);
+      (program.program.steps || []).forEach(function (step) {
+        parts.push(step.name, step.action.type, step.action.target, step.action.location, step.action.library);
+      });
+    }
+    var automation = shipAutomation(ship.name);
+    if (automation) {
+      if (automation.plan) { parts.push(automation.plan.kind, automation.plan.phase); }
+      standingOn(automation).forEach(function (key) { parts.push('standing', standingLabel(key)); });
+    }
+    return parts.filter(function (p) { return p != null && p !== ''; }).join(' ').toLowerCase();
+  }
+
   function renderAutomationList() {
     var rows = $('#automation-rows');
     if (!rows) { return; }
 
-    var ships = S.ships.filter(function (ship) { return !isStation(ship); });
-    var automated = ships.filter(isAutomated);
-    var shown = S.autoFilter === 'all' ? ships : automated;
+    var craft = automatableCraft();
+    var automated = craft.filter(isAutomated);
+    var shown = S.autoFilter === 'all' ? craft : automated;
+    if (S.autoSearch) {
+      shown = shown.filter(function (ship) { return automationHaystack(ship).indexOf(S.autoSearch) !== -1; });
+    }
 
-    $('#automation-count').textContent = numText(automated.length) + ' of ' + numText(ships.length) + ' ships automated';
+    $('#automation-count').textContent = numText(automated.length) + ' of ' + numText(craft.length) + ' craft automated'
+      + (S.autoSearch ? ' · ' + numText(shown.length) + ' shown' : '');
 
     rows.innerHTML = shown.map(function (ship) {
       var entry = automationFor(ship.name);
@@ -3578,15 +3680,15 @@
       if (!sub.length) { sub.push(esc(coords(ship.position))); }
 
       return '<div class="ship-row' + (ship.name === S.selected ? ' sel' : '') + '" data-auto-ship="' + esc(ship.name) + '">'
-        + '<div class="n">' + esc(ship.name) + '</div>'
+        + '<div class="n">' + esc(ship.name) + (isStation(ship) ? ' <span class="badge">station</span>' : '') + '</div>'
         + '<div class="badges">' + (isAutomated(ship) ? shipAutomationBadges(ship) : '<span class="badge">manual</span>') + '</div>'
         + '<div class="s">' + sub.join(' · ') + '</div>'
         + '</div>';
     }).join('')
-      || '<div class="empty muted">' + (S.connected
-        ? (S.autoFilter === 'all' ? 'No ships listed. The Fleet tab\'s owner filter applies here too.'
-          : 'No ship is automated yet. Pick one under All ships.')
-        : 'Connect first.') + '</div>';
+      || '<div class="empty muted">' + (!S.connected ? 'Connect first.'
+        : S.autoSearch ? 'Nothing matches &ldquo;' + esc(S.autoSearch) + '&rdquo;.'
+        : S.autoFilter === 'all' ? 'No craft listed. The Fleet tab\'s owner filter applies here too; stations are listed once they have a captain.'
+        : 'No craft is automated yet. Pick one under All.') + '</div>';
   }
 
   function renderAutomationPane() {
@@ -3600,23 +3702,29 @@
       pane.innerHTML = '<div class="empty muted">Select a ship.</div>';
       return;
     }
-    if (isStation(ship)) {
-      pane.innerHTML = '<div class="empty muted">' + esc(name) + ' is a station, which has no automation to set here.</div>';
+    // A station has no missions to automate, and without a captain it takes no orders at
+    // all unless its owner is in the sector.
+    var station = isStation(ship);
+    if (station && ship.hasCaptain !== true) {
+      pane.innerHTML = '<div class="empty muted">' + esc(name) + ' is a station without a captain. '
+        + 'Hire one for it to take standing orders and run a program.</div>'
+        + renderLocations();
       return;
     }
 
     pane.innerHTML = '<div class="ship-head" style="padding:0 0 10px">'
       + '<div><h1>' + esc(name) + '</h1><div class="muted">'
-      + esc(ship ? coords(ship.position) + (ship.owner && ship.owner.kind === 'alliance' ? ' · alliance craft' : '') : '')
+      + esc(ship ? coords(ship.position) + (station ? ' · station' : '')
+        + (ship.owner && ship.owner.kind === 'alliance' ? ' · alliance craft' : '') : '')
       + '</div></div>'
       + '<div class="badges">' + (ship ? availabilityBadge(ship) : '') + '</div>'
       + '<span class="spacer"></span>'
       + '<button class="ghost small" data-act="open-fleet">open in Fleet</button>'
       + '</div>'
       + renderProgram()
-      + renderAutomation()
-      + renderLibrary()
-      + '<div data-standing-orders></div>';
+      + (station ? '' : renderAutomation() + renderLibrary())
+      + '<div data-standing-orders></div>'
+      + renderLocations();
 
     renderStanding();
   }
@@ -3678,6 +3786,21 @@
 
   var PROGRAM_ORDER_TYPES = ['patrol', 'repair', 'aggressive', 'mine', 'salvage', 'refine', 'jump'];
 
+  /* What a station's program may hold: nothing that moves it. */
+  var STATION_ACTIONS = { orders: true, standing: true, transfer: true, wait: true };
+  var STATION_ORDER_TYPES = ['aggressive', 'patrol', 'repair', 'refine'];
+
+  /* The planner's preferences a route step can carry, as the Travel tab offers them. */
+  var ROUTE_PREFS = [['preferGates', 'prefer gates'], ['preferWormholes', 'prefer wormholes'],
+                     ['fewestJumps', 'fewest jumps']];
+
+  var DEST_KINDS = [['to', 'sector'], ['target', 'craft'], ['location', 'location']];
+
+  function programActionsFor(name) {
+    if (!isStation(S.byName[name])) { return PROGRAM_ACTIONS; }
+    return PROGRAM_ACTIONS.filter(function (a) { return STATION_ACTIONS[a[0]]; });
+  }
+
   function programKey(name) {
     var ship = S.byName[name];
     return autoKey(ship && ship.owner && ship.owner.kind, name);
@@ -3738,7 +3861,9 @@
   function actionText(action) {
     if (!action) { return '—'; }
     if (action.type === 'route') {
-      return 'fly to ' + coords(action.to) + (action.onEnemies ? ', on enemies ' + esc(action.onEnemies) : '');
+      var prefs = ROUTE_PREFS.filter(function (p) { return action[p[0]]; }).map(function (p) { return p[1]; });
+      return 'fly to ' + destinationText(action) + (action.onEnemies ? ', on enemies ' + esc(action.onEnemies) : '')
+        + (prefs.length ? ', ' + esc(prefs.join(', ')) : '');
     }
     if (action.type === 'farm') {
       return 'farm ' + esc(BOSS_NAMES[action.boss] || 'the nearest boss ring')
@@ -3755,7 +3880,7 @@
     }
     if (action.type === 'travel') {
       var swift = SWIFTNESS.filter(function (s) { return Number(s[0]) === (action.swiftness == null ? 2 : action.swiftness); })[0];
-      return 'travel to ' + coords(action.to) + (swift ? ', ' + swift[1] : '');
+      return 'travel to ' + destinationText(action) + (swift ? ', ' + swift[1] : '');
     }
     if (action.type === 'standing') {
       var parts = [];
@@ -3768,9 +3893,20 @@
       return 'standing orders: ' + esc(parts.join(', ') || 'unchanged');
     }
     if (action.type === 'transfer') {
-      return transferText(action);
+      return transferText(action) + (action.travelToTarget === false ? ' <span class="mute2">(only when already there)</span>' : '');
     }
     return 'wait';
+  }
+
+  /* Where a route or travel step goes, as the step names it. */
+  function destinationText(action) {
+    if (action.target) { return '<b>' + esc(action.target) + '</b> <span class="mute2">wherever it is</span>'; }
+    if (action.location) {
+      var location = locationFor(action.location, S.selected);
+      return '<b>' + esc(action.location) + '</b>' + (location ? ' <span class="mute2">' + esc(location.x + ':' + location.y) + '</span>'
+        : ' <span class="badge warn">not in the library</span>');
+    }
+    return esc(coords(action.to));
   }
 
   function conditionText(c) {
@@ -3939,7 +4075,8 @@
     S.progForm = {
       ship: S.selected,
       name: program ? program.name : 'Program',
-      steps: program ? JSON.parse(JSON.stringify(program.steps)) : [blankStep('route')],
+      steps: program ? JSON.parse(JSON.stringify(program.steps))
+        : [blankStep(isStation(S.byName[S.selected]) ? 'standing' : 'route')],
       revision: program ? program.revision : 0,
       existing: !!program,
       error: null
@@ -3957,15 +4094,52 @@
     }).join('') + '</select>';
   }
 
+  /* A route or travel step's destination: a sector, a craft wherever it is when the step
+     starts, or a library location. */
+  function destinationFields(a, i) {
+    var p = 'steps.' + i + '.action.';
+    var kind = a.target != null ? 'target' : a.location != null ? 'location' : 'to';
+    var out = '<span class="mute2">to</span>'
+      + '<select data-pf-dest-kind="' + i + '">' + DEST_KINDS.map(function (k) {
+          return '<option value="' + k[0] + '"' + (kind === k[0] ? ' selected' : '') + '>' + k[1] + '</option>';
+        }).join('') + '</select>';
+
+    if (kind === 'target') {
+      var craft = destinationCraft(S.selected);
+      var options = [['', 'pick a craft…']].concat(craft.map(function (c) { return [c.name, craftLabel(c)]; }));
+      if (a.target && !craft.some(function (c) { return c.name === a.target; })) { options.push([a.target, a.target]); }
+      return out + pfSelect(p + 'target', a.target || '', options, 'data-pf-dest-target');
+    }
+    if (kind === 'location') {
+      var names = {};
+      var locationOptions = [['', S.locations.list.length ? 'pick a location…' : 'no locations yet']];
+      S.locations.list.forEach(function (l) {
+        if (names[l.name]) { return; }
+        names[l.name] = true;
+        var shown = locationFor(l.name, S.selected);
+        locationOptions.push([l.name, locationLabel(shown)]);
+      });
+      if (a.location && !names[a.location]) { locationOptions.push([a.location, a.location + ' (missing)']); }
+      return out + pfSelect(p + 'location', a.location || '', locationOptions, 'data-pf-rerender');
+    }
+    var to = a.to || { x: 0, y: 0 };
+    return out + pfInput(p + 'to.x', to.x, 'type="number" data-pf-num style="width:78px"')
+      + '<span class="mute2">:</span>' + pfInput(p + 'to.y', to.y, 'type="number" data-pf-num style="width:78px"')
+      + destinationPicker('data-pf-dest-fill="' + i + '"', S.selected, 'set from…');
+  }
+
   function actionFields(step, i) {
     var a = step.action;
     var p = 'steps.' + i + '.action.';
 
     if (a.type === 'route') {
-      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
-        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+      return destinationFields(a, i)
         + '<span class="mute2">on enemies</span>'
-        + pfSelect(p + 'onEnemies', a.onEnemies || 'fight', ON_ENEMIES);
+        + pfSelect(p + 'onEnemies', a.onEnemies || 'fight', ON_ENEMIES)
+        + ROUTE_PREFS.map(function (pref) {
+            return '<label class="check"><input type="checkbox" data-pf="' + p + pref[0] + '" data-pf-bool'
+              + (a[pref[0]] ? ' checked' : '') + '><span>' + esc(pref[1]) + '</span></label>';
+          }).join('');
     }
     if (a.type === 'farm') {
       return pfSelect(p + 'boss', a.boss || 'auto', BOSSES)
@@ -3974,7 +4148,8 @@
     }
     if (a.type === 'orders') {
       var order = (a.orders && a.orders[0]) || { type: 'patrol' };
-      return pfSelect(p + 'orders.0.type', order.type, PROGRAM_ORDER_TYPES.map(function (t) { return [t, t]; }), 'data-pf-rerender')
+      var orderTypes = isStation(S.byName[S.selected]) ? STATION_ORDER_TYPES : PROGRAM_ORDER_TYPES;
+      return pfSelect(p + 'orders.0.type', order.type, orderTypes.map(function (t) { return [t, t]; }), 'data-pf-rerender')
         + (order.type === 'jump'
           ? '<span class="mute2">to</span>' + pfInput(p + 'orders.0.to.x', (order.to || {}).x || 0, 'type="number" data-pf-num style="width:78px"')
             + '<span class="mute2">:</span>' + pfInput(p + 'orders.0.to.y', (order.to || {}).y || 0, 'type="number" data-pf-num style="width:78px"')
@@ -3990,8 +4165,7 @@
           : names.length ? 'under its limits' : 'under its limits &mdash; add missions to the library below to pick others') + '</span>';
     }
     if (a.type === 'travel') {
-      return '<span class="mute2">to</span>' + pfInput(p + 'to.x', a.to.x, 'type="number" data-pf-num style="width:78px"')
-        + '<span class="mute2">:</span>' + pfInput(p + 'to.y', a.to.y, 'type="number" data-pf-num style="width:78px"')
+      return destinationFields(a, i)
         + pfSelect(p + 'swiftness', a.swiftness == null ? 2 : a.swiftness, SWIFTNESS, 'data-pf-num');
     }
     if (a.type === 'transfer') {
@@ -4008,7 +4182,11 @@
         + '<label class="check"><input type="checkbox" data-pf="' + p + 'all" data-pf-bool data-pf-rerender'
         + (a.all ? ' checked' : '') + '><span>everything</span></label>'
         + '<label class="check" title="Dock at a station, or fly alongside a ship, when it is out of reach"><input type="checkbox" data-pf="'
-        + p + 'approach" data-pf-bool' + (a.approach === false ? '' : ' checked') + '><span>approach</span></label>';
+        + p + 'approach" data-pf-bool' + (a.approach === false ? '' : ' checked') + '><span>approach</span></label>'
+        + (isStation(S.byName[S.selected]) ? ''
+          : '<label class="check" title="When the craft is in another sector as the step starts, travel there first: a Travel mission, or a route when it is too close for one">'
+            + '<input type="checkbox" data-pf="' + p + 'travelToTarget" data-pf-bool'
+            + (a.travelToTarget === false ? '' : ' checked') + '><span>travel there first</span></label>');
     }
     if (a.type === 'standing') {
       return STANDING.map(function (spec) {
@@ -4114,7 +4292,7 @@
       return '<div class="card program-edit-step" style="margin-top:8px">'
         + '<div class="row tight"><span class="idx"><b>' + (i + 1) + '</b></span>'
         + pfInput('steps.' + i + '.name', step.name, 'type="text" placeholder="name (optional)" style="width:140px"')
-        + pfSelect('steps.' + i + '.action.type', step.action.type, PROGRAM_ACTIONS, 'data-pf-action-type')
+        + pfSelect('steps.' + i + '.action.type', step.action.type, programActionsFor(S.selected), 'data-pf-action-type')
         + actionFields(step, i)
         + '<span class="spacer"></span>'
         + '<button class="ghost small" data-prog-step-up="' + i + '"' + (i ? '' : ' disabled') + '>↑</button>'
@@ -4184,10 +4362,34 @@
       return false;
     }
 
+    // a route or travel step switching between a sector, a craft and a location
+    if (node.dataset.pfDestKind !== undefined) {
+      var destAction = form.steps[Number(node.dataset.pfDestKind)].action;
+      var ship = S.byName[S.selected] || {};
+      delete destAction.to; delete destAction.target; delete destAction.targetOwner; delete destAction.location;
+      if (node.value === 'target') { destAction.target = ''; }
+      else if (node.value === 'location') { destAction.location = ''; }
+      else { destAction.to = { x: (ship.position || {}).x || 0, y: (ship.position || {}).y || 0 }; }
+      return true;
+    }
+    // a sector filled in from a craft's position or a location
+    if (node.dataset.pfDestFill !== undefined) {
+      var at = pickedSector(node.value);
+      if (at) { form.steps[Number(node.dataset.pfDestFill)].action.to = at; }
+      return true;
+    }
+
     var path = node.dataset.pf;
     if (!path) { return false; }
 
     var value = node.value;
+    if (node.dataset.pfDestTarget !== undefined) {
+      var targetAction = form.steps[Number(path.split('.')[1])].action;
+      var chosen = destinationCraft(S.selected).filter(function (c) { return c.name === value; })[0];
+      targetAction.target = value;
+      if (chosen && chosen.owner) { targetAction.targetOwner = chosen.owner.kind; } else { delete targetAction.targetOwner; }
+      return true;
+    }
     if (node.dataset.pfOptnum !== undefined) {
       var parent = path.split('.');
       var leaf = parent.pop();
@@ -4270,6 +4472,12 @@
           });
         }
         if (!copy.action.targetOwner) { delete copy.action.targetOwner; }
+        if (copy.action.travelToTarget !== false) { delete copy.action.travelToTarget; }
+      }
+      if (copy.action.type === 'route' || copy.action.type === 'travel') {
+        if (copy.action.target != null || copy.action.location != null) { delete copy.action.to; }
+        if (copy.action.target == null || !copy.action.targetOwner) { delete copy.action.targetOwner; }
+        ROUTE_PREFS.forEach(function (pref) { if (!copy.action[pref[0]]) { delete copy.action[pref[0]]; } });
       }
       if (!copy['until'].conditions.length) { copy['repeat'] = false; }
       return copy;
@@ -4947,6 +5155,262 @@
         S.library.loaded = true;
         refreshLibrary();
       });
+  }
+
+  /* ============================== LOCATIONS ==============================
+   *
+   * Named sectors, off /locations: the player's own library and the alliance's, which every
+   * member shares. Anywhere a destination is picked - the Travel tab, the mission planner,
+   * route and travel steps - a location or a craft can be picked instead of typing
+   * coordinates.
+   */
+
+  function loadLocations(userInitiated) {
+    return Api.get('/locations', { owner: 'all' },
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'locations' })
+      .then(function (body) {
+        S.locations = { list: body.locations || [], loaded: true, error: null, max: body.maxLocations };
+        refreshLocations();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.locations.error = error;
+        S.locations.loaded = true;
+        refreshLocations();
+      });
+  }
+
+  function locationKey(location) {
+    return (location.owner && location.owner.kind === 'alliance' ? 'alliance' : 'player') + '|' + location.name;
+  }
+
+  function findLocation(key) {
+    return S.locations.list.filter(function (l) { return locationKey(l) === key; })[0] || null;
+  }
+
+  /* The location a craft would fly to under a name: its own faction's first, as the mod
+     resolves it. */
+  function locationFor(name, craftName) {
+    var kind = ownerKindOf(craftName);
+    var matches = S.locations.list.filter(function (l) { return l.name === name; });
+    return matches.filter(function (l) { return (l.owner && l.owner.kind) === kind; })[0] || matches[0] || null;
+  }
+
+  function locationLabel(location) {
+    return location.name + (location.owner && location.owner.kind === 'alliance' ? ' (alliance)' : '')
+      + ' · ' + location.x + ':' + location.y;
+  }
+
+  /* Every craft a destination can name, stations included, but not `exclude` itself. */
+  function destinationCraft(exclude) {
+    var seen = {};
+    return S.ships.concat(S.autoStations).filter(function (c) {
+      if (seen[c.name] || c.name === exclude) { return false; }
+      seen[c.name] = true;
+      return true;
+    }).sort(function (a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0; });
+  }
+
+  function craftLabel(craft) {
+    return craft.name + (isStation(craft) ? ' (station)' : '')
+      + (craft.owner && craft.owner.kind === 'alliance' ? ' (alliance)' : '')
+      + ' · ' + coords(craft.position);
+  }
+
+  /* One <select> of craft and locations, for picking a destination's coordinates. Values
+     are "craft|name" and "loc|owner|name". */
+  function destinationPicker(attrs, exclude, placeholder) {
+    var craft = destinationCraft(exclude);
+    var locations = S.locations.list;
+    return '<select ' + attrs + '><option value="">' + esc(placeholder || 'set from…') + '</option>'
+      + (locations.length ? '<optgroup label="Locations">' + locations.map(function (l) {
+          return '<option value="loc|' + esc(locationKey(l)) + '">' + esc(locationLabel(l)) + '</option>';
+        }).join('') + '</optgroup>' : '')
+      + (craft.length ? '<optgroup label="Craft">' + craft.map(function (c) {
+          return '<option value="craft|' + esc(c.name) + '">' + esc(craftLabel(c)) + '</option>';
+        }).join('') + '</optgroup>' : '')
+      + '</select>';
+  }
+
+  /* The sector a destinationPicker value stands for, or null. */
+  function pickedSector(value) {
+    if (!value) { return null; }
+    if (value.indexOf('loc|') === 0) {
+      var location = findLocation(value.slice(4));
+      return location ? { x: location.x, y: location.y } : null;
+    }
+    if (value.indexOf('craft|') === 0) {
+      var craft = S.byName[value.slice(6)] || destinationCraft().filter(function (c) {
+        return c.name === value.slice(6);
+      })[0];
+      return craft && craft.position ? { x: craft.position.x, y: craft.position.y } : null;
+    }
+    return null;
+  }
+
+  function renderLocations() {
+    return '<div class="section auto-section"><h2>Locations ' + explain('locations') + '</h2>'
+      + '<div data-locations>' + renderLocationList() + '</div></div>';
+  }
+
+  function refreshLocations() {
+    var node = $('#automation-pane [data-locations]');
+    if (node) { node.innerHTML = renderLocationList(); }
+    if (S.sub === 'travel' && S.selected && S.nav.destKind !== 'to') { renderTravel(); }
+  }
+
+  function renderLocationList() {
+    var failed = S.locations.error;
+    if (failed && failed.status === 404) {
+      return '<div class="note warn">This server runs a mod version without a location library.</div>';
+    }
+    if (failed) { return errorBox('Locations unavailable', failed); }
+    if (!S.locations.loaded) { return '<p class="muted">loading…</p>'; }
+
+    var form = S.locForm;
+    var rows = S.locations.list.map(function (l) {
+      var key = locationKey(l);
+      var used = l.usedBy && l.usedBy.length;
+      return '<div class="order-row library-row">'
+        + '<div class="program-step-body"><div><b>' + esc(l.name) + '</b> '
+        + '<span class="badge">' + (l.owner && l.owner.kind === 'alliance' ? 'alliance' : 'yours') + '</span> '
+        + '<span class="mute2">' + esc(l.x + ':' + l.y) + '</span></div>'
+        + (l.note ? '<div class="mute2">' + esc(l.note) + '</div>' : '')
+        + (used ? '<div class="mute2">flown to by ' + esc(l.usedBy.join(', ')) + '</div>' : '')
+        + '</div>'
+        + '<span class="spacer"></span>'
+        + (form && form.original === key ? ''
+          : '<button class="ghost small" data-loc-edit="' + esc(key) + '">edit</button>')
+        + '<button class="ghost small danger" data-loc-del="' + esc(key) + '"'
+        + (used ? ' disabled title="A program still flies there"' : '') + '>delete</button>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="row"><span class="note">Named sectors to pick as destinations. Your own, and your '
+      + 'alliance&rsquo;s, which every member shares.</span><span class="spacer"></span>'
+      + (form ? '' : '<button class="ghost small" data-loc-act="new">New location…</button>') + '</div>'
+      + (form ? renderLocationForm(form) : '')
+      + (rows || '<div class="mute2" style="margin-top:6px">No locations yet.</div>');
+  }
+
+  function renderLocationForm(form) {
+    var inAlliance = S.ships.concat(S.autoStations).some(function (c) { return c.owner && c.owner.kind === 'alliance'; })
+      || S.locations.list.some(function (l) { return l.owner && l.owner.kind === 'alliance'; })
+      || S.filters.owner !== 'player';
+    return '<div class="card auto-editor location-editor" style="margin:8px 0">'
+      + '<div class="row tight">'
+      + '<input type="text" data-loc-field="name" value="' + esc(form.name) + '" placeholder="name, e.g. Home" style="width:160px">'
+      + '<input type="number" data-loc-field="x" value="' + esc(String(form.x)) + '" style="width:78px">'
+      + '<span class="mute2">:</span>'
+      + '<input type="number" data-loc-field="y" value="' + esc(String(form.y)) + '" style="width:78px">'
+      + destinationPicker('data-loc-from', null, 'from a craft or location…')
+      + (form.original ? '<span class="badge">' + (form.owner === 'alliance' ? 'alliance' : 'yours') + '</span>'
+        : inAlliance ? '<select data-loc-field="owner"><option value="player"' + (form.owner === 'alliance' ? '' : ' selected')
+          + '>yours</option><option value="alliance"' + (form.owner === 'alliance' ? ' selected' : '') + '>alliance</option></select>'
+        : '')
+      + '</div>'
+      + '<div class="row tight" style="margin-top:6px">'
+      + '<input type="text" data-loc-field="note" value="' + esc(form.note || '') + '" placeholder="note (optional)" style="flex:1;min-width:160px">'
+      + '<button class="primary small" data-loc-act="save">Save</button>'
+      + '<button class="ghost small" data-loc-act="cancel">Cancel</button>'
+      + '</div>'
+      + (form.error ? '<div style="margin-top:8px">' + errorBox('Not saved', form.error) + '</div>' : '')
+      + '</div>';
+  }
+
+  function openLocationForm(location, preset) {
+    var ship = S.byName[S.selected] || {};
+    var at = preset || (location ? { x: location.x, y: location.y } : ship.position) || { x: 0, y: 0 };
+    S.locForm = {
+      original: location ? locationKey(location) : null,
+      name: location ? location.name : (preset && preset.name) || '',
+      owner: location ? location.owner.kind : S.selected ? ownerKindOf(S.selected) : 'player',
+      x: at.x || 0,
+      y: at.y || 0,
+      note: location ? location.note || '' : '',
+      revision: location ? location.revision : 0,
+      error: null
+    };
+    refreshLocations();
+  }
+
+  function saveLocation(button, form) {
+    form = form || S.locForm;
+    if (!form) { return Promise.resolve(); }
+    var wanted = (form.name || '').trim();
+    if (!wanted) {
+      toast('warn', 'Name it first', 'A location is picked by its name.');
+      return Promise.resolve();
+    }
+
+    var original = form.original ? findLocation(form.original) : null;
+    var body = { x: Math.round(Number(form.x)) || 0, y: Math.round(Number(form.y)) || 0,
+                 note: form.note ? form.note : null };
+    if (original) {
+      body.ifRevision = original.revision;
+      if (original.name !== wanted) { body.rename = wanted; }
+    }
+
+    var path = '/locations/' + Api.seg(original ? original.name : wanted);
+    return guard(button, Api.post(path, body, { owner: form.owner === 'alliance' ? 'alliance' : 'player' },
+                                  { priority: Api.P.USER, label: 'save location' }))
+      .then(function (result) {
+        if (S.locForm === form) { S.locForm = null; }
+        toast('good', 'Location saved', result.name + ' · ' + result.x + ':' + result.y
+          + (result.usedBy && result.usedBy.length ? ' — programs fly there from their next start.' : ''));
+        return Promise.all([loadLocations(true), body.rename ? loadPrograms(true) : null]);
+      })
+      .then(function () { redrawProgram(); })
+      .catch(function (error) {
+        if (error.code === 'location_changed') {
+          toast('warn', 'Location changed elsewhere', 'It has been reloaded; apply your change again.');
+          S.locForm = null;
+          loadLocations(true);
+          return;
+        }
+        form.error = error;
+        refreshLocations();
+        if (S.locForm !== form) { apiFailed(error, 'Location not saved'); }
+      });
+  }
+
+  function deleteLocation(button, key) {
+    var location = findLocation(key);
+    if (!location) { return; }
+    if (!window.confirm('Delete the location "' + location.name + '"?')) { return; }
+
+    guard(button, Api.post('/locations/' + Api.seg(location.name) + '/delete', {},
+                           { owner: location.owner.kind }, { priority: Api.P.USER, label: 'delete location' }))
+      .then(function () {
+        toast('good', 'Location deleted', location.name);
+        return loadLocations(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Location not deleted'); });
+  }
+
+  function locationClick(button) {
+    var act = button.dataset.locAct;
+    if (act === 'new') { openLocationForm(null); return true; }
+    if (act === 'cancel') { S.locForm = null; refreshLocations(); return true; }
+    if (act === 'save') { saveLocation(button); return true; }
+    if (button.dataset.locEdit) { openLocationForm(findLocation(button.dataset.locEdit)); return true; }
+    if (button.dataset.locDel) { deleteLocation(button, button.dataset.locDel); return true; }
+    return false;
+  }
+
+  /* Reads a location form field. Returns true when it handled the node. */
+  function locationField(node) {
+    var form = S.locForm;
+    if (!form) { return false; }
+    if (node.dataset.locFrom !== undefined) {
+      var at = pickedSector(node.value);
+      if (at) { form.x = at.x; form.y = at.y; refreshLocations(); }
+      return true;
+    }
+    var field = node.dataset.locField;
+    if (!field) { return false; }
+    form[field] = field === 'x' || field === 'y' ? Math.round(Number(node.value)) || 0 : node.value;
+    return true;
   }
 
   function renderLibrary() {
@@ -6073,17 +6537,46 @@
     /* --- route --- */
     out.push('<div class="section"><h2>Planned route ' + explain('nav-route') + '</h2>');
 
+    var destination;
+    if (nav.destKind === 'target') {
+      var craft = destinationCraft(S.selected);
+      destination = '<select id="travel-target">'
+        + '<option value="">pick a craft…</option>' + craft.map(function (c) {
+            var value = (c.owner ? c.owner.kind : 'player') + '|' + c.name;
+            return '<option value="' + esc(value) + '"' + (nav.destTarget === c.name && (nav.destTargetOwner || 'player') === (c.owner ? c.owner.kind : 'player') ? ' selected' : '')
+              + '>' + esc(craftLabel(c)) + '</option>';
+          }).join('') + '</select>'
+        + '<span class="mute2">wherever it is when the route is planned</span>';
+    } else if (nav.destKind === 'location') {
+      destination = '<select id="travel-location">'
+        + '<option value="">' + (S.locations.list.length ? 'pick a location…' : 'no locations yet &mdash; add some on the Automation tab') + '</option>'
+        + S.locations.list.map(function (l) {
+            var key = locationKey(l);
+            return '<option value="' + esc(key) + '"' + (nav.destLocation === key ? ' selected' : '') + '>' + esc(locationLabel(l)) + '</option>';
+          }).join('') + '</select>';
+    } else {
+      destination = '<input type="number" id="travel-x" value="' + target.x + '" style="width:96px">'
+        + '<span class="mute2">:</span>'
+        + '<input type="number" id="travel-y" value="' + target.y + '" style="width:96px">'
+        + '<button class="ghost small" data-act="travel-map">pick on map</button>'
+        + destinationPicker('id="travel-fill"', S.selected, 'set from…')
+        + '<input type="text" id="travel-save-name" placeholder="name" style="width:110px">'
+        + '<button class="ghost small" data-act="travel-save-location" title="Keep this sector in your location library">save as location</button>';
+    }
+
     out.push('<div class="row" style="margin-bottom:10px">'
       + '<span class="mute2">from</span><b>' + coords(position) + '</b>'
       + '<span class="mute2">to</span>'
-      + '<input type="number" id="travel-x" value="' + target.x + '" style="width:96px">'
-      + '<span class="mute2">:</span>'
-      + '<input type="number" id="travel-y" value="' + target.y + '" style="width:96px">'
-      + '<button class="ghost small" data-act="travel-map">pick on map</button>'
+      + '<div class="chips">' + DEST_KINDS.map(function (k) {
+          return '<button class="chip' + (nav.destKind === k[0] ? ' on' : '') + '" data-dest-kind="' + k[0] + '">' + k[1] + '</button>';
+        }).join('') + '</div>'
+      + destination
       + '</div>');
 
     out.push('<div class="chips" style="margin-bottom:10px">'
       + prefChip('preferGates', 'prefer gates')
+      + prefChip('preferWormholes', 'prefer wormholes')
+      + prefChip('fewestJumps', 'fewest jumps')
       + prefChip('avoidRifts', riftCapable ? 'avoid rifts' : 'avoid rifts (always, no rift drive)')
       + prefChip('preferUncontrolled', 'prefer no man\'s space')
       + '</div>');
@@ -6250,8 +6743,14 @@
     var head = result.planner === 'engine'
       ? num(result.jumps) + ' jumps (game pathfinder)'
       : num(result.jumps) + ' hops'
-        + (result.gates ? ' · ' + num(result.gates) + ' through gates' : '')
+        + (result.gates ? ' · ' + num(result.gates - (result.wormholes || 0)) + ' through gates' : '')
+        + (result.wormholes ? ' · ' + num(result.wormholes) + ' through wormholes' : '')
         + ' · ' + num(result.controlledSectors || 0) + ' in faction space';
+
+    var dest = result.destination;
+    if (dest && dest.kind !== 'sector') {
+      head = 'to ' + esc(dest.name) + ' (' + esc(coords(result.to || dest)) + ') · ' + head;
+    }
 
     var sent = result.planId
       ? '<div class="mute2">' + (result.confirmed ? 'the ship took the plan up' : 'dispatched, not confirmed '
@@ -6283,27 +6782,60 @@
   }
 
   function readTravelTarget() {
-    var x = Number($('#travel-x').value);
-    var y = Number($('#travel-y').value);
-    S.travelTarget = { x: Math.round(x) || 0, y: Math.round(y) || 0 };
+    var xNode = $('#travel-x');
+    var yNode = $('#travel-y');
+    // the coordinate fields only exist while the destination is a sector
+    if (!xNode || !yNode) { return S.travelTarget || { x: 0, y: 0 }; }
+    S.travelTarget = { x: Math.round(Number(xNode.value)) || 0, y: Math.round(Number(yNode.value)) || 0 };
     return S.travelTarget;
   }
 
   function navOptions() {
     return {
       preferGates: S.nav.preferGates,
+      preferWormholes: S.nav.preferWormholes,
+      fewestJumps: S.nav.fewestJumps,
       avoidRifts: S.nav.avoidRifts,
       preferUncontrolled: S.nav.preferUncontrolled
     };
+  }
+
+  /* The Travel tab's destination as a request names it - {to}, {target, targetOwner} or
+     {location} - or null with a toast when the picker is empty. `label` is for toasts. */
+  function travelDestination() {
+    var nav = S.nav;
+    if (nav.destKind === 'target') {
+      if (!nav.destTarget) { toast('warn', 'Pick a craft', 'Choose the craft to fly to.'); return null; }
+      return { body: { target: nav.destTarget, targetOwner: nav.destTargetOwner || undefined }, label: nav.destTarget };
+    }
+    if (nav.destKind === 'location') {
+      var location = findLocation(nav.destLocation);
+      if (!location) { toast('warn', 'Pick a location', 'Choose a location from the library.'); return null; }
+      // A location name is resolved in the ship owner's library first; one of the same name
+      // in the other library is sent as coordinates, so the pick is what gets flown to.
+      var resolved = locationFor(location.name, S.selected);
+      if (resolved !== location) {
+        return { body: { to: { x: location.x, y: location.y } }, label: location.name };
+      }
+      return { body: { location: location.name }, label: location.name };
+    }
+    var to = readTravelTarget();
+    return { body: { to: to }, label: coords(to) };
   }
 
   function planRoute(button) {
     var name = S.selected;
     if (!name) { return; }
 
-    var to = readTravelTarget();
-    var query = Object.assign({ ship: name, toX: to.x, toY: to.y, owner: ownerParamFor(name) },
+    var destination = travelDestination();
+    if (!destination) { return; }
+    var named = destination.body;
+    var query = Object.assign({ ship: name, owner: ownerParamFor(name) },
+                              named.to ? { toX: named.to.x, toY: named.to.y }
+                                : named.target ? { target: named.target, targetOwner: named.targetOwner }
+                                : { location: named.location },
                               navOptions());
+    Object.keys(query).forEach(function (k) { if (query[k] === undefined) { delete query[k]; } });
 
     $('#travel-result').innerHTML = '<p class="muted">planning…</p>';
 
@@ -6325,12 +6857,12 @@
     var name = S.selected;
     if (!name) { return; }
 
-    var to = readTravelTarget();
+    var destination = travelDestination();
+    if (!destination) { return; }
     var body = Object.assign({
-      to: to,
       onEnemies: S.nav.onEnemies,
       attackCivilians: S.nav.attackCivilians
-    }, navOptions());
+    }, destination.body, navOptions());
 
     $('#travel-result').innerHTML = '<p class="muted">planning, then waiting for the ship to '
       + 'take the plan up…</p>';
@@ -6345,7 +6877,7 @@
         $('#travel-result').innerHTML = navResultHtml(result);
         tookAutomation(name, result);
         toast(result.confirmed ? 'good' : 'warn', result.confirmed ? 'Route flying' : 'Route dispatched',
-              name + ' → ' + coords(to) + ', ' + result.jumps + ' hops.');
+              name + ' → ' + destination.label + ', ' + result.jumps + ' hops.');
       })
       .catch(function (error) {
         S.nav.result = error.body && error.body.hops && error.body.reachable === false
@@ -6412,7 +6944,7 @@
 
   function loadAutomation(background) {
     var name = S.selected;
-    if (!name || isStation(S.byName[name])) { return Promise.resolve(); }
+    if (!name) { return Promise.resolve(); }
 
     return Api.get('/ships/' + Api.seg(name) + '/automation', { owner: ownerParamFor(name) },
                    { priority: background ? Api.P.POLL : Api.P.DETAIL, label: 'automation' })
@@ -9483,7 +10015,9 @@
       setSeg('#filter-owner', value);
       setSeg('#industry-owner', value);
       localStorage.setItem(LS.filters, JSON.stringify(S.filters));
+      S.autoStations = [];
       refreshFleet(true);
+      loadAutoStations(true);
       if (S.view === 'industry') { loadIndustry(true); }
     };
 
@@ -9667,10 +10201,17 @@
     /* --- automation tab ----------------------------------------------- */
     bindSeg('#automation-filter', function (value) { S.autoFilter = value; renderAutomationList(); });
 
+    $('#automation-search').addEventListener('input', function (e) {
+      S.autoSearch = e.target.value.trim().toLowerCase();
+      renderAutomationList();
+    });
+
     $('#automation-refresh').addEventListener('click', function () {
       loadAutomations(true);
       loadPrograms(true);
       loadLibrary(true);
+      loadAutoStations(true);
+      loadLocations(true);
       refreshFleet(true);
       if (S.selected) { loadAutomation(); }
     });
@@ -9687,6 +10228,7 @@
       if (standingClick(button)) { return; }
       if (programClick(button)) { return; }
       if (libraryClick(button)) { return; }
+      if (locationClick(button)) { return; }
       if (button.dataset.autoAct) { automationAction(button.dataset.autoAct, button); return; }
       if (button.dataset.autoArea && S.autoForm) {
         S.autoForm.areaMode = button.dataset.autoArea;
@@ -9705,6 +10247,7 @@
 
     $('#automation-pane').addEventListener('change', function (e) {
       var node = e.target;
+      if (node.closest('.location-editor')) { locationField(node); return; }
       if (standingChange(node)) { return; }
       if (node.dataset.progToggle !== undefined) { toggleProgram(node); return; }
       if (node.closest('.program-editor')) {
@@ -9719,6 +10262,13 @@
 
     $('#automation-pane').addEventListener('input', function (e) {
       var node = e.target;
+
+      // typed values are kept without a redraw, so the field keeps focus
+      if (node.dataset.locField && node.tagName === 'INPUT' && S.locForm) {
+        S.locForm[node.dataset.locField] = node.type === 'number'
+          ? Math.round(Number(node.value)) || 0 : node.value;
+        return;
+      }
 
       // Kept on the form as typed and never redrawn from here, so the field keeps focus.
       if (node.dataset.autoLimit && S.autoForm) {
@@ -9771,7 +10321,17 @@
     $('#sv-mission').addEventListener('change', function (e) {
       var node = e.target;
       var form = S.missionForm;
-      if (!form || !node.dataset.list) { return; }
+      if (!form) { return; }
+      // the area centred on a craft's sector or a library location
+      if (node.dataset.centerPick !== undefined) {
+        var at = pickedSector(node.value);
+        if (at) {
+          form.center = at;
+          renderMission();
+        }
+        return;
+      }
+      if (!node.dataset.list) { return; }
       if (setListValue(form, node)) { renderMission(); }
     });
 
@@ -9865,6 +10425,12 @@
         renderTravel();
         return;
       }
+      if (button.dataset.destKind) {
+        readTravelTarget();
+        S.nav.destKind = button.dataset.destKind;
+        renderTravel();
+        return;
+      }
 
       var act = button.dataset.act;
       if (act === 'route') { planRoute(button); }
@@ -9878,10 +10444,30 @@
         showView('map');
         toast('info', 'Click a sector', 'It becomes the route destination.');
       }
+      else if (act === 'travel-save-location') {
+        var at = readTravelTarget();
+        var nameNode = $('#travel-save-name');
+        var wanted = nameNode ? nameNode.value.trim() : '';
+        if (!wanted) { toast('warn', 'Name it first', 'Type a name for the location next to the button.'); return; }
+        saveLocation(button, { original: null, name: wanted, owner: ownerKindOf(S.selected),
+                               x: at.x, y: at.y, note: '' });
+      }
     });
 
     $('#sv-travel').addEventListener('change', function (e) {
       var node = e.target;
+      if (node.id === 'travel-target') {
+        var split = node.value.indexOf('|');
+        S.nav.destTargetOwner = split > 0 ? node.value.slice(0, split) : '';
+        S.nav.destTarget = split > 0 ? node.value.slice(split + 1) : '';
+        return;
+      }
+      if (node.id === 'travel-location') { S.nav.destLocation = node.value; return; }
+      if (node.id === 'travel-fill') {
+        var picked = pickedSector(node.value);
+        if (picked) { S.travelTarget = picked; renderTravel(); }
+        return;
+      }
       if (node.id === 'nav-civilians') { S.nav.attackCivilians = node.checked; }
       else if (node.id === 'nav-collect-loot') { S.nav.collectLoot = node.checked; }
       else if (node.id === 'nav-cooldown') {
@@ -10003,6 +10589,7 @@
       if (S.pickTarget === 'travel') {
         S.pickTarget = null;
         S.travelTarget = { x: x, y: y };
+        S.nav.destKind = 'to';
         showView('fleet');
         showSub('travel');
         renderTravel();

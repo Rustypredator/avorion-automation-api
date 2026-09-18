@@ -324,6 +324,16 @@ Movement.isPilotedByPlayer = isPilotedByPlayer
 -- needsCaptain lists {name, rule} for orders stricter than the universal gate; rule is
 -- true (a captain, always) or "unless_piloted" (a captain or a player aboard). Pass
 -- {skipCaptain = true} in options for calls that give the ship no order at all.
+-- Stations take orders that keep them where they are, and the order chain would refuse the
+-- rest by chat message, which an API caller never sees. So anything that moves a craft
+-- asks this first.
+function Movement.requireShip(owner, shipName, what)
+    if ShipData.isStation(owner, shipName) then
+        Router.fail(422, "station_cannot_move",
+                    "'" .. shipName .. "' is a station, and stations cannot " .. (what or "move") .. ".")
+    end
+end
+
 function Movement.requireOrderable(ctx, owner, shipName, needsCaptain, options)
     options = options or {}
 
@@ -407,10 +417,13 @@ function Movement.register(router)
     -- itself - destination checks included - is POST /ships/{name}/missions/travel/start;
     -- all this adds is `swiftness` at the top level of the body.
     router:post("/ships/{name}/travel", function(ctx, params)
-        local toX, toY = Routes.destination(ctx.body)
-
-        -- rewritten into the shape the travel mission's area builder expects
-        ctx.body.to = {x = toX, y = toY}
+        -- A craft or location is resolved by the start itself; plain coordinates are
+        -- rewritten into the shape the travel mission's area builder expects.
+        local kind = Routes.destinationKind(ctx.body)
+        if kind == nil or kind == "to" then
+            local toX, toY = Routes.destination(ctx.body)
+            ctx.body.to = {x = toX, y = toY}
+        end
         ctx.body.config = ctx.body.config or {}
 
         if ctx.body.swiftness ~= nil then
@@ -435,6 +448,10 @@ function Movement.register(router)
         -- Validate the request before checking the world: a caller working on its payload
         -- should be told what is wrong with it, not that nobody is logged in.
         local calls, needsCaptain, oneShot = buildOrders(ctx.body)
+
+        for _, call in ipairs(calls) do
+            if call.order == "jump" then Movement.requireShip(owner, params.name, "jump") end
+        end
 
         local x, y = Movement.requireOrderable(ctx, owner, params.name, needsCaptain)
 
@@ -526,12 +543,19 @@ function Movement.register(router)
             canPassRifts = query.rifts == "true" or query.rifts == true
         end
 
-        local toX, toY = Routes.integer(query.toX), Routes.integer(query.toY)
-        if toX == nil or toY == nil then
-            Router.fail(400, "no_destination", "Provide 'toX' and 'toY'.")
-        end
-
         owner = owner or Owner.resolve(ctx)
+
+        -- or a craft or library location by name, as a movement order takes it
+        local toX, toY, destination
+        if query.target ~= nil or query.location ~= nil then
+            toX, toY, destination = Routes.resolveDestination(ctx,
+                {target = query.target, targetOwner = query.targetOwner, location = query.location}, owner)
+        else
+            toX, toY = Routes.integer(query.toX), Routes.integer(query.toY)
+            if toX == nil or toY == nil then
+                Router.fail(400, "no_destination", "Provide 'toX' and 'toY', 'target' or 'location'.")
+            end
+        end
 
         -- Any preference means this mod's own planner, since calculateJumpPath takes
         -- none. It is sliced across ticks, so the answer is deferred.
@@ -541,19 +565,13 @@ function Movement.register(router)
 
         if preferences then
             RoutePlanner.run(
-            {
-                owner = owner,
-                from = {x = fromX, y = fromY},
-                to = {x = toX, y = toY},
-                range = jumpRange,
-                canPassRifts = canPassRifts,
-                preferGates = preferences.preferGates,
-                avoidRifts = preferences.avoidRifts,
-                preferUncontrolled = preferences.preferUncontrolled,
-            },
+                Routes.plannerSpec(owner, {x = fromX, y = fromY}, {x = toX, y = toY},
+                                   jumpRange, canPassRifts, preferences),
             function(result)
-                ctx.complete(200, Routes.describePlan(result, fromX, fromY, toX, toY,
-                                                      jumpRange, canPassRifts, preferences))
+                local body = Routes.describePlan(result, fromX, fromY, toX, toY,
+                                                 jumpRange, canPassRifts, preferences)
+                body.destination = destination
+                ctx.complete(200, body)
             end,
             ctx.complete)
 
@@ -568,6 +586,7 @@ function Movement.register(router)
             {
                 from = Serialize.vec2(fromX, fromY),
                 to = Serialize.vec2(toX, toY),
+                destination = destination,
                 reachable = false,
                 route = Json.array({}),
                 jumps = 0,
@@ -582,6 +601,7 @@ function Movement.register(router)
         {
             from = Serialize.vec2(fromX, fromY),
             to = Serialize.vec2(toX, toY),
+            destination = destination,
             -- a path that stops short means the pathfinder gave up; say so rather than
             -- letting the caller assume the last sector is the destination
             reachable = last.x == toX and last.y == toY,

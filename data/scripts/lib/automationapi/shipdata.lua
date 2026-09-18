@@ -73,6 +73,13 @@ function ShipData.hasCaptain(ownerIndex, name)
     return safe(function() return entry:getCaptain() end) ~= nil
 end
 
+-- Whether a craft is a station. Stations take orders that keep them where they are -
+-- standing orders, patrols, cargo - but never one that moves them.
+function ShipData.isStation(owner, name)
+    local ok, entityType = pcall(function() return owner.faction:getShipType(name) end)
+    return ok and entityType == EntityType.Station
+end
+
 -- #### COMPONENTS #### --
 
 local function describeCaptain(captain)
@@ -410,6 +417,10 @@ function ShipData.summary(owner, name)
         availability = enumName(Enums.shipAvailability, availability),
         status = Serialize.string(safe(function() return faction:getShipStatus(name) end)),
         usable = ShipData.usable(owner.index, name),
+        -- for stations above all, whose `usable` is always NotAShip: a captain is what
+        -- lets a craft be automated without its owner in the sector. Not `captain`, which
+        -- the detail read below fills with the captain's details.
+        hasCaptain = ShipData.hasCaptain(owner.index, name),
     }
 end
 

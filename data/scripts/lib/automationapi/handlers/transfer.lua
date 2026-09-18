@@ -113,10 +113,7 @@ local function findTarget(ctx, name, ownerKind)
                 "Neither you nor your alliance own a craft named '" .. name .. "'.")
 end
 
-local function isStation(owner, name)
-    local ok, entityType = pcall(function() return owner.faction:getShipType(name) end)
-    return ok and entityType == EntityType.Station
-end
+local isStation = ShipData.isStation
 
 local function automationOf(event)
     return type(event) == "table" and type(event.automation) == "table" and event.automation

@@ -62,6 +62,59 @@ local function coordinates(value, what)
     return {x = integer(value.x, what .. ".x"), y = integer(value.y, what .. ".y")}
 end
 
+local function trimmedName(value)
+    if type(value) ~= "string" then return nil end
+    local name = string.match(value, "^%s*(.-)%s*$")
+    return name ~= "" and name or nil
+end
+
+-- Where a route or travel step goes: a sector, a craft by name (wherever it is when the step
+-- starts), or a location from the library - exactly one of them. Which craft or location a
+-- name means is looked up when the step runs, as the endpoints do.
+local function destination(spec, action)
+    local given = {}
+    if spec.to ~= nil then given[#given + 1] = "to" end
+    if spec.target ~= nil then given[#given + 1] = "target" end
+    if spec.location ~= nil then given[#given + 1] = "location" end
+
+    if #given == 0 then
+        fail("A " .. action.type .. " step needs 'action.to', 'action.target' or 'action.location'.")
+    end
+    if #given > 1 then
+        fail("A " .. action.type .. " step goes to one of 'to', 'target' or 'location', not "
+             .. table.concat(given, " and ") .. ".")
+    end
+
+    if spec.to ~= nil then
+        action.to = coordinates(spec.to, "'action.to'")
+    elseif spec.target ~= nil then
+        action.target = trimmedName(spec.target)
+        if not action.target then fail("'action.target' is the name of the craft to fly to.") end
+        if spec.targetOwner ~= nil then
+            action.targetOwner = string.lower(tostring(spec.targetOwner))
+            if action.targetOwner ~= "player" and action.targetOwner ~= "alliance" then
+                fail("'action.targetOwner' is player or alliance.")
+            end
+        end
+    else
+        action.location = trimmedName(spec.location)
+        if not action.location then fail("'action.location' is the name of a library location.") end
+    end
+
+    return action
+end
+
+-- "(12:-4)", "Hub" or "location Home", for logs.
+function ProgramRules.describeDestination(action)
+    if action.target then return action.target end
+    if action.location then return "location " .. action.location end
+    if action.to then return string.format("(%d:%d)", action.to.x, action.to.y) end
+    return "?"
+end
+
+-- Actions that move the craft, which a station's program may not hold.
+ProgramRules.MOVING = {route = true, farm = true, travel = true, mission = true}
+
 local function sortedNames(t)
     local names = {}
     for name, _ in pairs(t) do names[#names + 1] = name end
@@ -82,6 +135,7 @@ end
 --   travel    the craft is back from the Travel mission: at its destination, available again
 --   standing  at once - the ship keeps the orders after the step
 --   transfer  the ship reports the transfer over: moved, refused, or given up on the way
+--             (after flying to the target first, when it is in another sector)
 --   wait      never: it needs an elapsed condition, or another that ends it
 
 local ON_ENEMIES = {fight = true, hold = true, continue = true}
@@ -93,14 +147,15 @@ ProgramRules.actions =
     {
         naturalEnd = "plan",
         normalize = function(spec)
-            local action = {type = "route", to = coordinates(spec.to, "'action.to'")}
+            local action = destination(spec, {type = "route"})
             if spec.onEnemies ~= nil then
                 action.onEnemies = string.lower(tostring(spec.onEnemies))
                 if not ON_ENEMIES[action.onEnemies] then
                     fail("'action.onEnemies' is one of fight, hold or continue.")
                 end
             end
-            for _, name in ipairs({"attackCivilians", "preferGates", "avoidRifts", "preferUncontrolled"}) do
+            for _, name in ipairs({"attackCivilians", "preferGates", "preferWormholes", "fewestJumps",
+                                   "avoidRifts", "preferUncontrolled"}) do
                 action[name] = boolean(spec[name], "'action." .. name .. "'")
             end
             return action
@@ -174,7 +229,7 @@ ProgramRules.actions =
     {
         naturalEnd = "returned",
         normalize = function(spec)
-            local action = {type = "travel", to = coordinates(spec.to, "'action.to'")}
+            local action = destination(spec, {type = "travel"})
             if spec.swiftness ~= nil then
                 action.swiftness = integer(spec.swiftness, "'action.swiftness'")
                 if action.swiftness < 0 or action.swiftness > 3 then
@@ -201,8 +256,10 @@ ProgramRules.actions =
         end,
     },
     -- POST /ships/{name}/transfer: goods into or out of another craft in the ship's sector.
-    -- The target is named, as a craft is everywhere else; whether it is in the sector is
-    -- the endpoint's check when the step runs, so a program can fly the ship there first.
+    -- The target is named, as a craft is everywhere else. When it is in another sector as
+    -- the step starts, the ship flies there first - a Travel mission, or a planned route
+    -- when the target is too close for one - unless `travelToTarget` is false, in which
+    -- case the step waits for the endpoint to find the two together.
     transfer =
     {
         naturalEnd = "transfer",
@@ -210,7 +267,7 @@ ProgramRules.actions =
             local function transferFail(_, message) fail(message) end
             local target, targetOwner = TransferRules.target(spec, transferFail, "action.")
             local transfer = TransferRules.normalize(spec, transferFail, "action.")
-            return
+            local action =
             {
                 type = "transfer",
                 target = target,
@@ -220,6 +277,11 @@ ProgramRules.actions =
                 goods = transfer.goods,
                 approach = transfer.approach,
             }
+            -- stored only when switched off, so older programs read as they always did
+            if boolean(spec.travelToTarget, "'action.travelToTarget'") == false then
+                action.travelToTarget = false
+            end
+            return action
         end,
     },
     wait =

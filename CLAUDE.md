@@ -66,7 +66,9 @@ data/scripts/                   everything the game loads
     transferrules.lua cargo transfer request vocabulary, shared by /transfer and program steps
     analysis.lua      background area analysis runner (async, deferred responses)
     factionscope.lua  fakes getParentFaction() while vanilla command code runs
-    routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates
+    routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates,
+                      named destinations (to / target craft / library location)
+    locations.lua     location library store (Server values per faction), program hooks
     routeplanner.lua  own weighted A* with preferences, boss-farm loop picker
     sectors.lua       known sectors + seed-based prediction (SectorSpecifics)
     devsetup.lua      NOT loaded; console helpers: spawn a test ship, spawnBoss, bossLab
@@ -78,6 +80,7 @@ data/scripts/                   everything the game loads
                             Missions.enqueue (job queue) + Missions.tick
       missionautomation.lua per-craft automation rules (Server values) + loop (.tick)
       missionlibrary.lua    named mission rules per faction that program mission steps fly
+      locations.lua         /locations: the location library's endpoints
       programs.lua          order programs (Server values) + runner (.tick); steps run as
                             internal router:dispatch requests to the real endpoints
       movement.lua          /travel (mission alias), /orders (in-sector order chain)

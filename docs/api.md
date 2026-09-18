@@ -42,13 +42,19 @@ and while the owning player is offline.
       "position": {"x": -134, "y": 88},
       "availability": "Available",
       "status": "Idle",
-      "usable": {"ok": true}
+      "usable": {"ok": true},
+      "hasCaptain": true
     }
   ]
 }
 ```
 
 `availability` is `Available`, `InBackground` (out on a captain mission) or `Destroyed`.
+
+`hasCaptain` says whether the craft has a captain in command. For a station, whose `usable`
+is always `NotAShip`, it is what decides whether it can be automated: a station with a
+captain takes standing orders, orders that keep it where it is, cargo transfers and
+programs of those, exactly as a ship does.
 
 `usable` is the check every captain mission runs first, so it is the field to filter on
 when picking ships for work:
@@ -552,7 +558,12 @@ station, go back to step 1.
 - **While a program runs, the craft's mission rule does not dispatch by itself** (its state
   shows phase `program`). When the program finishes or is switched off, the rule takes over
   again.
-- **A refused step is retried** every minute (`status: retrying`, `message` says why).
+- **A refused step is retried** every minute (`status: retrying`, `message` says why). A route
+  or travel step refused with `already_there` is not refused: the ship is where it was sent,
+  so the step's action counts as over and arrived (the `arrived` condition holds).
+- **Stations with a captain run programs too**, of the steps that leave them where they are:
+  `orders`, `standing`, `transfer` and `wait`. A station's program with a `route`, `farm`,
+  `travel` or `mission` step is `400 bad_program`.
 - **After a restart the current step starts over.** Where a program has got to is kept apart
   from the program, so moving on does not change its revision.
 
@@ -570,13 +581,13 @@ station, go back to step 1.
 
 | action | fields | ends by itself |
 |---|---|---|
-| `route` | `to {x, y}`, and optionally `onEnemies`, `attackCivilians`, `preferGates`, `avoidRifts`, `preferUncontrolled` as for `/route` | when the plan ends (arrived, or stopped) |
+| `route` | a [destination](#destinations): `to {x, y}`, `target` (+ `targetOwner`) or `location`; optionally `onEnemies`, `attackCivilians`, `preferGates`, `preferWormholes`, `fewestJumps`, `avoidRifts`, `preferUncontrolled` as for `/route` | when the plan ends (arrived, or stopped) |
 | `farm` | `boss`, `onEnemies`, `attackCivilians`, `collectLoot`, `bossCooldown` as for `/farm` | never - needs a condition |
 | `orders` | `orders`, `clear` as for `/orders` | when the chain runs out |
 | `mission` | optionally `library`, the name of a [library mission](#mission-library), or `rule`, a mission automation rule of its own; with neither, the craft's stored rule | when the craft is back |
-| `travel` | `to {x, y}`, optionally `swiftness` (0-3) as for `/travel` | when the craft is back, at the destination |
+| `travel` | a [destination](#destinations) as for `route`, optionally `swiftness` (0-3) as for `/travel` | when the craft is back, at the destination |
 | `standing` | `standing`, `attackCivilians` as for `POST /ships/{name}/automation` | at once |
-| `transfer` | `target`, `targetOwner`, `direction`, `goods` or `all`, `approach` as for [`/transfer`](#post-shipsnametransfer) | when the ship reports the transfer over - moved, refused on the way, or given up. A target that is not in the sector yet is retried, so a route step before it can fly the ship there |
+| `transfer` | `target`, `targetOwner`, `direction`, `goods` or `all`, `approach` as for [`/transfer`](#post-shipsnametransfer); optionally `travelToTarget` (default true) | when the ship reports the transfer over - moved, refused on the way, or given up. A target in another sector is travelled to first, see below |
 | `wait` | - | never - needs a condition |
 
 A step with no conditions ends with its action. One with conditions ends when `any` (the
@@ -600,6 +611,20 @@ stopped first.
 Cargo and position come from the ship database; enemies, plans and boss kills from what the
 ship last reported. A condition whose facts are not known yet counts as not met.
 
+A route or travel step naming a `target` craft or a `location` resolves it when the step
+starts, so it flies to wherever the craft is then, or to the location as the library has it
+then. A location a program names cannot be deleted, and renaming it renames it in the
+faction's programs.
+
+**A transfer with a craft in another sector.** When the step starts, the ship is first sent
+to the target: a Travel mission (`POST /ships/{name}/travel` with `target`), or, when the game
+refuses one as `destination_too_close`, a planned route (`POST /ships/{name}/route`). The
+state's `leg` is `travel` or `route` meanwhile. Once the leg is over the step starts again: a
+target found in the sector gets its cargo moved, one that moved on meanwhile is flown after
+again. Conditions are checked throughout, and a step that ends mid-leg stops a leg route still
+flying. `travelToTarget: false` skips the leg, and the step is retried until the two craft
+meet some other way (`not_same_sector`). A station's transfer never travels.
+
 ### GET /automation/programs
 
 Every program the caller can see (`?owner=player|alliance|all`, default all), with what each
@@ -615,7 +640,7 @@ is doing, and the vocabulary.
     "state": {
       "status": "running", "message": "Farming bosses.", "since": 7290,
       "step": 1, "stepSince": 7010, "phase": "active", "attempts": 0,
-      "planId": "p4-7011", "bossKills": 1,
+      "planId": "p4-7011", "leg": null, "bossKills": 1,
       "conditions": [{"text": "cargo >= 80%", "met": false}],
       "log": [{"at": 7010, "status": "running", "step": 1, "message": "Farming bosses."}]
     }
@@ -702,14 +727,75 @@ without a new revision. `ifRevision` as for rules. Errors: `400 bad_name`, `400 
 Removes it: `{"deleted": true}` if there was one. A mission a program still names is
 `409 mission_in_use`, with the craft in `details.usedBy`.
 
+## Locations
+
+The location library: sectors a faction keeps under a name - `Home`, `Iron belt` - to give
+as a destination instead of coordinates. A player has their own library and sees their
+alliance's, which every member shares and any member may add to.
+
+### GET /locations
+
+`?owner=player|alliance|all` (default all).
+
+```json
+{
+  "locations": [{
+    "name": "Home", "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+    "x": 10, "y": -4, "note": "the shipyard",
+    "revision": 2, "updatedBy": {"index": 1, "name": "Rusty"}, "updatedAt": 1757940000,
+    "usedBy": ["Ore Hound"]
+  }],
+  "maxName": 48,
+  "maxLocations": 200
+}
+```
+
+`usedBy` lists the craft of the same faction whose programs name the location.
+
+### POST /locations/{name}
+
+Creates or updates the location called `name` in the caller's library, or the alliance's with
+`?owner=alliance`: `{"x", "y", "note"}`, merged over the stored one - a new location needs `x`
+and `y`, a `null` note clears it. `rename` moves it to a new name, and the programs naming it
+follow without a new revision. `ifRevision` as for rules. Errors: `400 bad_name`,
+`400 bad_coordinates`, `400 bad_note`, `409 location_changed`, `409 name_taken`,
+`409 too_many_locations` (200 per library).
+
+### POST /locations/{name}/delete
+
+Removes it: `{"deleted": true}` if there was one. A location a program still names is
+`409 location_in_use`, with the craft in `details.usedBy`.
+
+### Destinations
+
+Everything that sends a ship somewhere - `/travel`, the travel mission's `preview` and
+`start`, `/route`, `GET /galaxy/route` and route and travel program steps - takes the
+destination one of three ways, exactly one at a time:
+
+| field | goes to |
+|---|---|
+| `to {x, y}` | that sector |
+| `target`, optionally `targetOwner` (`player`/`alliance`) | the sector a craft of the caller or their alliance is in when the request is made; stations included |
+| `location` | a location from the library - the one of the ship's owner first, then the caller's other one |
+
+The answer carries `destination`: `{"kind": "sector"|"craft"|"location", "name", "owner",
+"x", "y"}`. Errors: `400 conflicting_destination` (more than one given), `404 no_such_target`,
+`409 target_in_background` (the craft is out on a captain mission and has no sector),
+`404 no_such_location`.
+
 ## POST /ships/{name}/travel
 
 An alias of `POST /ships/{name}/missions/travel/start`, kept for existing callers. It takes
-the destination at the top level and `swiftness` alongside it, and returns the same body:
+the [destination](#destinations) at the top level and `swiftness` alongside it, and returns
+the same body:
 
 ```jsonc
 {"to": {"x": -300, "y": 310}, "swiftness": 2}
+{"target": "Trade Hub", "swiftness": 2}
+{"location": "Home"}
 ```
+
+A station is `422 station_cannot_move`.
 
 `swiftness` is 0 (careful, slow, unlikely to be attacked) to 3 (reckless, fast, risky) and
 defaults to 2.
@@ -840,8 +926,10 @@ rather than the game's `calculateJumpPath`, which takes no preferences:
 
 ```jsonc
 {
-  "to": {"x": -120, "y": 88},
-  "preferGates": true,          // take known gates and wormholes whenever they save time
+  "to": {"x": -120, "y": 88},   // or "target": "Trade Hub", or "location": "Home"
+  "preferGates": true,          // take known gates whenever they save time
+  "preferWormholes": false,     // take known wormholes whenever they save time
+  "fewestJumps": false,         // the fewest hops of any kind; the others only break ties
   "avoidRifts": false,          // keep a rift-capable ship out of rifts, as if it were not
   "preferUncontrolled": true,   // stay in no man's space where a detour allows
   "onEnemies": "fight",         // fight | hold | continue
@@ -850,6 +938,13 @@ rather than the game's `calculateJumpPath`, which takes no preferences:
 }
 ```
 
+The destination is any of the three [destinations](#destinations). Gates and wormholes cost
+more than a jump by default, since flying to one takes longer, so they are only taken when
+they save jumps; `preferGates` and `preferWormholes` each make their own kind cheap
+(`preferGates` used to cover wormholes as well). `fewestJumps` counts every hop as one - jump,
+gate or wormhole - and searches for the fewest; with it, the other preferences only choose
+between routes of equally few hops, never add one.
+
 The response is the plan in [`GET /galaxy/route`](#get-galaxyroute)'s planner shape, plus the
 dispatch:
 
@@ -857,7 +952,8 @@ dispatch:
 {
   "ship": "Ore Hound", "planId": "p4-7310", "confirmed": true,
   "reachable": true, "planner": "automation",
-  "jumps": 9, "gates": 1, "controlledSectors": 0, "distance": 61.2,
+  "jumps": 9, "gates": 1, "wormholes": 0, "controlledSectors": 0, "distance": 61.2,
+  "destination": {"kind": "sector", "x": -120, "y": 88},
   "hops": [{"x": -5, "y": 3, "kind": "jump", "distance": 5.8, "controlled": false, "rift": false}],
   "route": [{"x": 0, "y": 0}, {"x": -5, "y": 3}],
   "onEnemies": "fight", "attackCivilians": false, "dryRun": false,
@@ -887,6 +983,7 @@ said nothing inside the window - which is what a server where another mod replac
 | error | when |
 |---|---|
 | `422 already_there` | the ship is in that sector |
+| `422 station_cannot_move` | the craft is a station (so for `/farm`, and a `jump` in `/orders`) |
 | `422 no_route` | the planner found none; `reason` is `no_route`, `destination_in_rift`, `barrier`, `search_limit` or `timeout` |
 | `422 needs_captain` | no captain and nobody at the controls |
 | `422 plan_refused` | the ship refused a hop the engine would not allow; the message names it |
@@ -1599,8 +1696,8 @@ this mod's planner, which is what [`POST /ships/{name}/route`](#post-shipsnamero
 |---|---|
 | `ship` | take origin, jump range and rift capability from a ship |
 | `fromX`, `fromY`, `range`, `rifts` | or give them explicitly |
-| `toX`, `toY` | required |
-| `preferGates`, `avoidRifts`, `preferUncontrolled` | `true`/`false`; giving any of them selects the mod's planner |
+| `toX`, `toY` | the destination; or `target` (+ `targetOwner`), or `location`, as [destinations](#destinations) take them |
+| `preferGates`, `preferWormholes`, `fewestJumps`, `avoidRifts`, `preferUncontrolled` | `true`/`false`; giving any of them selects the mod's planner. See [`/route`](#post-shipsnameroute) for what each does |
 
 ```json
 {
@@ -1616,7 +1713,8 @@ than assuming the last sector in `route` is where you asked to go.
 
 The mod's planner (`"planner": "automation"`) answers in the same shape and adds `hops` - each
 with `kind` (`jump`, `gate`, `wormhole`), `distance`, `controlled` (faction space) and `rift` -
-along with `gates`, `controlledSectors`, `preferences`, and `reason` when unreachable. It
+along with `gates` (gates and wormholes), `wormholes`, `controlledSectors`, `preferences`,
+and `reason` when unreachable. A named destination adds `destination`. It
 works from the same facts the engine does: jump range, rift geometry, the barrier, and the
 gates and wormholes the player or their alliance know about. It is not an exhaustive search:
 each step considers a fixed set of directions at full and two-thirds range rather than every

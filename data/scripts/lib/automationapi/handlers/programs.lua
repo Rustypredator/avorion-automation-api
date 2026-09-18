@@ -28,6 +28,9 @@
 --
 --   * Where a program has got to is kept in memory and, on every step change, in a cursor
 --     value of its own. After a restart the current step starts over.
+--
+--   * A station's program holds only steps that leave it where it is: standing orders,
+--     orders, cargo transfers and waits. A station's transfer never flies anywhere first.
 
 local Json = include("automationapi/json")
 local Router = include("automationapi/router")
@@ -39,6 +42,8 @@ local ProgramRules = include("automationapi/programrules")
 local MissionAutomation = include("automationapi/handlers/missionautomation")
 local MissionLibrary = include("automationapi/handlers/missionlibrary")
 local TransferRules = include("automationapi/transferrules")
+local ShipData = include("automationapi/shipdata")
+local Locations = include("automationapi/locations")
 
 local Programs = {}
 
@@ -200,6 +205,7 @@ local function resetTracking(run)
     run.transferShip = nil
     run.transferEnded = false
     run.transferOutcome = nil
+    run.leg = nil
 end
 
 local function enterStep(index, shipName, run, stepIndex)
@@ -286,7 +292,10 @@ local function requestFor(shipName, action)
     if action.type == "orders" then return base .. "/orders", body end
     if action.type == "standing" then return base .. "/automation", body end
     if action.type == "travel" then return base .. "/travel", body end
-    if action.type == "transfer" then return base .. "/transfer", body end
+    if action.type == "transfer" then
+        body.travelToTarget = nil
+        return base .. "/transfer", body
+    end
 
     return nil
 end
@@ -418,6 +427,25 @@ local function conditionsText(step)
     return table.concat(parts, step["until"].match == "all" and " and " or " or ")
 end
 
+-- The error a refused request answered with. A mission start the game would refuse answers
+-- with its assessment's `errors` instead of an `error`, and the first of those is the reason.
+local function errorOf(status, response)
+    local e = type(response.error) == "table" and response.error or nil
+    if e then return e.code or ("http_" .. tostring(status)), e.message end
+
+    if type(response.errors) == "table" then
+        for _, field in ipairs({"usable", "start", "command", "config", "prediction"}) do
+            local reason = response.errors[field]
+            if type(reason) == "table" then
+                return field == "usable" and (reason.code or "not_usable") or "cannot_start",
+                       reason.message or reason.text
+            end
+        end
+    end
+
+    return "http_" .. tostring(status), nil
+end
+
 local function dispatchFailed(run, token, code, message)
     if run.token ~= token then return end
 
@@ -439,6 +467,140 @@ local function dispatched(run, token, program, message)
 
     local waiting = conditionsText(program.steps[run.step])
     note(run, "running", message, waiting and ("until " .. waiting) or nil)
+end
+
+-- Sends a step's action through its endpoint, and settles the step's tracking with the answer.
+local function dispatchAction(owner, shipName, program, run, authority, token, action)
+    local path, body = requestFor(shipName, action)
+    internalRequest(owner, authority, "POST", path, body, function(status, response)
+        response = type(response) == "table" and response or {}
+
+        if type(status) ~= "number" or status >= 300 then
+            local code, message = errorOf(status, response)
+
+            -- A ship sent where it already is has arrived: the step's action is over before
+            -- it began, and retrying it would be refused the same way for ever.
+            if code == "already_there" and (action.type == "route" or action.type == "travel") then
+                if run.token ~= token then return end
+                run.planEnded = true
+                run.arrived = true
+                run.returned = true
+                dispatched(run, token, program, "Already at " .. ProgramRules.describeDestination(action)
+                           .. ", so there is nowhere to fly.")
+                return
+            end
+
+            dispatchFailed(run, token, code, message)
+            return
+        end
+
+        if run.token ~= token then return end
+        run.planId = response.planId
+        run.transferId = response.transferId
+        local by = type(response.carriedOutBy) == "table" and response.carriedOutBy or nil
+        if by and by.name ~= shipName and type(by.owner) == "table" then
+            run.transferShip = {index = by.owner.index, name = by.name}
+        end
+
+        -- a target in reach is served inside the confirmation window
+        if action.type == "transfer" and type(response.result) == "table" then
+            run.transferEnded = true
+            run.transferOutcome = response.result.outcome
+        end
+
+        -- where a named destination led, as the endpoint resolved it
+        local where = ProgramRules.describeDestination(action)
+        local resolved = type(response.to) == "table" and response.to
+                         or type(response.destination) == "table" and response.destination or nil
+        if not action.to and resolved and type(resolved.x) == "number" then
+            where = string.format("%s at (%d:%d)", where, resolved.x, resolved.y)
+        end
+
+        local what = action.type == "route" and "Flying to " .. where .. "."
+                     or action.type == "farm" and "Farming bosses."
+                     or action.type == "orders" and "Orders dispatched."
+                     or action.type == "travel" and "Travelling to " .. where .. "."
+                     or action.type == "transfer" and (function()
+                            local text = "Cargo: " .. TransferRules.describe(action, action.target) .. "."
+                            local result = response.result
+                            if type(result) == "table" then
+                                text = text .. string.format(" %s, %d units moved.", tostring(result.outcome),
+                                                             Serialize.number(result.total, 0))
+                            elseif response.phase then
+                                text = text .. " The target is out of reach; the ship is "
+                                       .. tostring(response.phase) .. "."
+                            end
+                            return text
+                        end)()
+                     or "Standing orders set."
+        if status == 202 then what = what .. " The ship did not confirm it yet." end
+
+        dispatched(run, token, program, what)
+    end)
+end
+
+-- #### TRAVEL LEGS #### --
+--
+-- A transfer step whose target is in another sector flies there first. The leg is a Travel
+-- mission to the target, as a travel step starts one, and when the game refuses those for a
+-- target within a jump or behind a gate, a planned route instead. Either request finds the
+-- target where it is now, and answers already_there when it is in the ship's sector - which
+-- is how a leg that is not needed costs nothing but that answer.
+--
+-- Once the leg is over the step starts from the top again. A target that moved meanwhile is
+-- flown after again; one found in the sector gets its cargo moved.
+
+local function legStarted(run, token, program, kind, action, response)
+    if run.token ~= token then return end
+
+    run.leg = {kind = kind}
+    if kind == "route" then run.planId = response.planId end
+
+    local where = action.target
+    local resolved = type(response.destination) == "table" and response.destination or nil
+    if resolved and type(resolved.x) == "number" then
+        where = string.format("%s, in (%d:%d)", where, resolved.x, resolved.y)
+    end
+
+    dispatched(run, token, program, string.format("Going to %s before the transfer: %s.", where,
+               kind == "travel" and "a Travel mission" or "a planned route, as it is too close for a Travel mission"))
+end
+
+local function startLeg(owner, shipName, program, run, authority, token, action)
+    local base = "/ships/" .. encodeSegment(shipName)
+    local destination = {target = action.target, targetOwner = action.targetOwner}
+
+    local function answered(kind, status, response, onRefused)
+        if run.token ~= token then return end
+        response = type(response) == "table" and response or {}
+
+        if type(status) == "number" and status < 300 then
+            legStarted(run, token, program, kind, action, response)
+            return
+        end
+
+        local code, message = errorOf(status, response)
+        if code == "already_there" then
+            dispatchAction(owner, shipName, program, run, authority, token, action)
+        elseif onRefused and onRefused(code) then
+            return
+        else
+            dispatchFailed(run, token, code, message)
+        end
+    end
+
+    internalRequest(owner, authority, "POST", base .. "/travel", ProgramRules.copy(destination),
+        function(status, response)
+            answered("travel", status, response, function(code)
+                if code ~= "destination_too_close" then return false end
+
+                internalRequest(owner, authority, "POST", base .. "/route", ProgramRules.copy(destination),
+                    function(routeStatus, routeResponse)
+                        answered("route", routeStatus, routeResponse)
+                    end)
+                return true
+            end)
+        end)
 end
 
 local function startStep(owner, index, shipName, program, run, authority)
@@ -487,51 +649,13 @@ local function startStep(owner, index, shipName, program, run, authority)
         return
     end
 
-    local path, body = requestFor(shipName, action)
-    internalRequest(owner, authority, "POST", path, body, function(status, response)
-        response = type(response) == "table" and response or {}
+    if action.type == "transfer" and action.travelToTarget ~= false
+       and not ShipData.isStation(owner, shipName) then
+        startLeg(owner, shipName, program, run, authority, token, action)
+        return
+    end
 
-        if type(status) ~= "number" or status >= 300 then
-            local e = type(response.error) == "table" and response.error or {}
-            dispatchFailed(run, token, e.code or ("http_" .. tostring(status)), e.message)
-            return
-        end
-
-        if run.token ~= token then return end
-        run.planId = response.planId
-        run.transferId = response.transferId
-        local by = type(response.carriedOutBy) == "table" and response.carriedOutBy or nil
-        if by and by.name ~= shipName and type(by.owner) == "table" then
-            run.transferShip = {index = by.owner.index, name = by.name}
-        end
-
-        -- a target in reach is served inside the confirmation window
-        if action.type == "transfer" and type(response.result) == "table" then
-            run.transferEnded = true
-            run.transferOutcome = response.result.outcome
-        end
-
-        local what = action.type == "route" and string.format("Flying to (%d:%d).", action.to.x, action.to.y)
-                     or action.type == "farm" and "Farming bosses."
-                     or action.type == "orders" and "Orders dispatched."
-                     or action.type == "travel" and string.format("Travelling to (%d:%d).", action.to.x, action.to.y)
-                     or action.type == "transfer" and (function()
-                            local text = "Cargo: " .. TransferRules.describe(action, action.target) .. "."
-                            local result = response.result
-                            if type(result) == "table" then
-                                text = text .. string.format(" %s, %d units moved.", tostring(result.outcome),
-                                                             Serialize.number(result.total, 0))
-                            elseif response.phase then
-                                text = text .. " The target is out of reach; the ship is "
-                                       .. tostring(response.phase) .. "."
-                            end
-                            return text
-                        end)()
-                     or "Standing orders set."
-        if status == 202 then what = what .. " The ship did not confirm it yet." end
-
-        dispatched(run, token, program, what)
-    end)
+    dispatchAction(owner, shipName, program, run, authority, token, action)
 end
 
 local function leaveStep(owner, index, shipName, program, run, authority, reason)
@@ -555,9 +679,10 @@ local function leaveStep(owner, index, shipName, program, run, authority, reason
     end
 
     -- A route or farm still flying would carry on underneath whatever comes next, and so
-    -- would a transfer still on its way to the target.
+    -- would a transfer still on its way to the target, or the route flying the ship to it.
     if ((step.action.type == "route" or step.action.type == "farm") and run.planId and not run.planEnded)
-       or (step.action.type == "transfer" and run.transferId and not run.transferEnded) then
+       or (step.action.type == "transfer" and run.transferId and not run.transferEnded)
+       or (run.leg and run.leg.kind == "route" and run.planId and not run.planEnded) then
         local token = run.token
         local stopping = run.transferShip and run.transferShip.name or shipName
         run.busy = true
@@ -622,6 +747,18 @@ local function consider(owner, index, shipName, program, run)
     if result.done then
         leaveStep(owner, index, shipName, program, run, authority,
                   conditionsText(step) or "its action is over")
+        return
+    end
+
+    -- On the way to a transfer's target: once there, the step starts again from the top,
+    -- which finds the target in the sector and moves the cargo.
+    if run.leg then
+        local over = run.leg.kind == "route" and run.planEnded or run.leg.kind == "travel" and run.returned
+        if over then
+            note(run, "running", "The flight to " .. tostring(step.action.target) .. " is over; the "
+                 .. "transfer is next.")
+            run.phase = "start"
+        end
         return
     end
 
@@ -725,6 +862,37 @@ MissionLibrary.renamed = function(index, oldName, newName)
     if changed then saveFaction(index, data) end
 end
 
+-- The location library asks the same two questions of route and travel steps.
+local function eachLocationStep(index, name, fn)
+    local data = loadFaction(index)
+    for _, shipName in ipairs(sortedKeys(data.ships)) do
+        for _, step in ipairs(data.ships[shipName].steps) do
+            if step.action.location == name then fn(shipName, step) end
+        end
+    end
+    return data
+end
+
+Locations.usersOf = function(index, name)
+    local users, seen = {}, {}
+    eachLocationStep(index, name, function(shipName)
+        if not seen[shipName] then
+            seen[shipName] = true
+            users[#users + 1] = shipName
+        end
+    end)
+    return users
+end
+
+Locations.renamed = function(index, oldName, newName)
+    local changed = false
+    local data = eachLocationStep(index, oldName, function(_, step)
+        step.action.location = newName
+        changed = true
+    end)
+    if changed then saveFaction(index, data) end
+end
+
 -- #### DESCRIPTIONS #### --
 
 local function describeRun(run, program)
@@ -758,6 +926,8 @@ local function describeRun(run, program)
         attempts = run.attempts or 0,
         nextCheckAt = run.nextAt,
         planId = run.planId,
+        -- a transfer step's flight to its target: travel or route
+        leg = run.leg and run.leg.kind or nil,
         bossKills = (run.killsBefore or 0) + (run.planKills or 0),
         conditions = conditions,
         log = log,
@@ -842,8 +1012,17 @@ function Programs.register(r)
         end
 
         local program = ProgramRules.normalize(ctx.body, previous)
+        local station = ShipData.isStation(owner, params.name)
 
         for stepIndex, step in ipairs(program.steps) do
+            if station and ProgramRules.MOVING[step.action.type] then
+                Router.fail(400, "bad_program", string.format(
+                            "Step %d: '%s' is a station, which cannot %s. A station's program "
+                            .. "sets standing orders, gives orders, moves cargo and waits.", stepIndex,
+                            params.name, step.action.type == "mission" and "go on missions"
+                            or step.action.type == "farm" and "farm bosses" or "fly anywhere"))
+            end
+
             local library = step.action.type == "mission" and step.action.library
             if library and not MissionLibrary.get(owner.index, library) then
                 Router.fail(400, "bad_program", string.format(

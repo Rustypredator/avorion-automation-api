@@ -130,6 +130,16 @@ Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
 -- rules that programs' mission steps fly.
 Config.missionLibraryValuePrefix = "automationapi_missionlib_"
 
+-- #### LOCATIONS #### --
+
+-- Server value key prefix of the location library, one document per owning faction: named
+-- sectors a destination can be given as.
+Config.locationValuePrefix = "automationapi_locations_"
+
+-- Locations one faction may keep. The whole library is one Server value, read on every
+-- destination that names one.
+Config.maxLocations = 200
+
 -- #### ORDER PROGRAMS #### --
 
 -- How often the program runner looks at each running program, in seconds. A look reads the

@@ -289,16 +289,43 @@ check(state.status == "finished", "and 'stop' ends the program (" .. tostring(st
 run(3)
 check(called("automationApiRunPlan") == 1, "a finished program sends nothing more")
 
-print("\nrefusals are retried")
+print("\nalready there")
 
 Mock.entityCalls = {}
 call("POST", "/ships/Hauler/program", {steps =
 {
     {action = {type = "route", to = {x = 0, y = 0}}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+run(3)
+state = stateOf("Hauler")
+check(state.step == 2 and called("automationApiRunPlan") == 0,
+      "a route to where the ship already is counts as arrived, not as a refusal (step "
+      .. tostring(state.step) .. ", " .. tostring(state.status) .. ")")
+local sawAlready = false
+for _, line in ipairs(state.log) do
+    if line.message:find("Already at (0:0)", 1, true) then sawAlready = true end
+end
+check(sawAlready, "and the log says so")
+
+call("POST", "/ships/Hauler/program", {steps =
+{
+    {action = {type = "route", to = {x = 0, y = 0}}, ["until"] = {conditions = {{type = "arrived"}}}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+run(3)
+check(stateOf("Hauler").step == 2, "an 'arrived' condition is met by it too")
+
+print("\nrefusals are retried")
+
+Mock.entityCalls = {}
+call("POST", "/ships/Hauler/program", {steps =
+{
+    {action = {type = "route", target = "Nobody"}},
 }})
 run(2)
 state = stateOf("Hauler")
-check(state.status == "retrying" and state.message:find("already_there", 1, true) ~= nil,
+check(state.status == "retrying" and state.message:find("no_such_target", 1, true) ~= nil,
       "a step the endpoint refuses says why (" .. tostring(state.message) .. ")")
 
 Mock.setOffline(1)
@@ -514,6 +541,141 @@ Bridge.pushShipEvent(1, "Unloader", "order", {chain = {}, activeIndex = 0, finis
 run(2)
 check(stateOf("Unloader").step == 2, "and moves on once the ship reports the cargo moved")
 Mock.transferApproach = nil
+
+print("\ntransfer steps fly to the target first")
+
+Mock.addShip(1, "Far Depot", {x = 60, y = 0, type = EntityType.Station, cargoCapacity = 5000, cargoFree = 5000})
+unloader.x, unloader.y = 0, 0
+Mock.entityCalls = {}
+Mock.simulationCalls = {}
+status = call("POST", "/ships/Unloader/program", {steps =
+{
+    {action = {type = "transfer", target = "Far Depot", all = true}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+check(status == 200, "(saved)")
+
+for _ = 1, 8 do
+    tick(0.25)
+    Mock.flushAsync({route = {{x = 0, y = 0}, {x = 30, y = 0}, {x = 60, y = 0}},
+                     sectors = 1, reachableCoordinates = {}})
+end
+run(3)
+state = stateOf("Unloader")
+check(unloader.availability == ShipAvailability.InBackground and state.leg == "travel"
+      and state.step == 1 and called("automationApiTransfer") == 0,
+      "a target in another sector is travelled to first (" .. tostring(state.message) .. ")")
+check(state.message:find("Far Depot, in (60:0)", 1, true) ~= nil, "and the log says where")
+
+unloader.availability = ShipAvailability.Available
+unloader.x, unloader.y = 60, 0
+run(4)
+state = stateOf("Unloader")
+check(called("automationApiTransfer") == 1 and state.step == 2,
+      "once there, the cargo is moved (" .. tostring(state.message) .. ")")
+
+-- Four sectors away is inside the jump range: no Travel mission, a planned route instead.
+Mock.addShip(1, "Near Depot", {x = 64, y = 0, type = EntityType.Station, cargoCapacity = 5000, cargoFree = 5000})
+Mock.entityCalls = {}
+call("POST", "/ships/Unloader/program", {steps =
+{
+    {action = {type = "transfer", target = "Near Depot", all = true}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+run(4)
+state = stateOf("Unloader")
+check(state.leg == "route" and called("automationApiRunPlan") == 1 and called("automationApiTransfer") == 0,
+      "a target too close for a Travel mission is flown to by route (" .. tostring(state.message) .. ")")
+
+arrive("Unloader", 64, 0)
+run(4)
+state = stateOf("Unloader")
+check(called("automationApiTransfer") == 1 and state.step == 2, "and the cargo moves on arrival")
+
+unloader.x, unloader.y = 0, 0
+Mock.entityCalls = {}
+call("POST", "/ships/Unloader/program", {steps =
+{
+    {action = {type = "transfer", target = "Near Depot", all = true, travelToTarget = false}},
+}})
+run(3)
+state = stateOf("Unloader")
+check(state.status == "retrying" and state.message:find("not_same_sector", 1, true) ~= nil
+      and called("automationApiRunPlan") == 0,
+      "with travelToTarget off, the step waits for the two to meet (" .. tostring(state.message) .. ")")
+call("POST", "/ships/Unloader/program/delete")
+
+print("\nroute and travel steps to a craft or a location")
+
+local normalized = Rules.normalize({steps = {{action = {type = "route", target = "Depot", fewestJumps = true,
+                                                         preferWormholes = true}}}})
+check(normalized.steps[1].action.target == "Depot" and normalized.steps[1].action.to == nil
+      and normalized.steps[1].action.fewestJumps == true and normalized.steps[1].action.preferWormholes == true,
+      "a route step can name a craft, with the new preferences")
+check(raises(function() Rules.normalize({steps = {{action = {type = "route", target = "A", location = "B"}}}}) end,
+             "bad_program"), "but only one destination")
+check(raises(function() Rules.normalize({steps = {{action = {type = "travel"}}}}) end, "bad_program"),
+      "and at least one")
+
+Mock.addShip(1, "Scout", {x = 0, y = 0, range = 5, captain = captain, cargoCapacity = 10, cargoFree = 10})
+call("POST", "/locations/Belt", {x = 12, y = 0})
+Mock.entityCalls = {}
+status, body = call("POST", "/ships/Scout/program", {steps =
+{
+    {action = {type = "route", location = "Belt"}},
+    {action = {type = "route", target = "Depot"}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+check(status == 200, "(saved)")
+run(4)
+state = stateOf("Scout")
+check(called("automationApiRunPlan") == 1 and state.message:find("location Belt at (12:0)", 1, true) ~= nil,
+      "a location step flies to the location's sector (" .. tostring(state.message) .. ")")
+
+local _, listedLocations = call("GET", "/locations")
+check(listedLocations.locations[1].usedBy[1] == "Scout", "the library knows which programs name it")
+status, body = call("POST", "/locations/Belt/delete")
+check(status == 409 and body.error.code == "location_in_use", "so it cannot be deleted from under them")
+status, body = call("POST", "/locations/Belt", {rename = "Outer Belt"})
+local _, scoutProgram = call("GET", "/ships/Scout/program")
+check(status == 200 and scoutProgram.program.steps[1].action.location == "Outer Belt"
+      and scoutProgram.program.revision == 1,
+      "a rename carries the programs along, without a new revision")
+
+arrive("Scout", 12, 0)
+run(4)
+state = stateOf("Scout")
+check(state.step == 2 and called("automationApiRunPlan") == 2
+      and state.message:find("Depot at (0:0)", 1, true) ~= nil,
+      "a craft step flies to where the craft is (" .. tostring(state.message) .. ")")
+call("POST", "/ships/Scout/program/delete")
+
+print("\nstation programs")
+
+status, body = call("POST", "/ships/Depot/program", {steps = {{action = {type = "route", to = {x = 5, y = 0}}}}})
+check(status == 400 and body.error.code == "bad_program" and body.error.message:find("station", 1, true) ~= nil,
+      "a station's program cannot fly anywhere")
+status, body = call("POST", "/ships/Depot/program", {steps = {{action = {type = "mission"}}}})
+check(status == 400, "nor go on missions")
+
+Mock.getShip(1, "Depot").captain = captain
+Mock.entityCalls = {}
+status, body = call("POST", "/ships/Depot/program", {steps =
+{
+    {action = {type = "standing", standing = {enemies = {enabled = true, mode = "idle"}}}},
+    {action = {type = "wait"}, ["until"] = {conditions = {{type = "elapsed", seconds = 30}}}, ["then"] = "stop"},
+}})
+check(status == 200, "standing orders and waits are a station's to keep")
+run(4)
+state = stateOf("Depot")
+check(called("automationApiConfigure") == 1 and state.step == 2,
+      "and they reach the station (" .. tostring(state.message) .. ")")
+
+local _, listing = call("GET", "/ships", nil, {type = "station"})
+local depotRow
+for _, row in ipairs(listing.ships) do if row.name == "Depot" then depotRow = row end end
+check(depotRow and depotRow.hasCaptain == true, "the listing says a station has a captain")
+call("POST", "/ships/Depot/program/delete")
 
 print("")
 if failures > 0 then print(failures .. " check(s) failed"); os.exit(1) end

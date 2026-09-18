@@ -443,6 +443,21 @@ local function withAssessment(ctx, params, onAssessed)
     local owner = Owner.findShip(ctx, params.name)
     local shipName = params.name
 
+    -- A travel can be sent to a craft or a library location by name. Resolved to its sector
+    -- here, once, so the preview and the start fly to the same place.
+    local destination
+    if key == "travel" then
+        if ShipData.isStation(owner, shipName) then
+            Router.fail(422, "station_cannot_move",
+                        "'" .. shipName .. "' is a station, and stations do not travel.")
+        end
+
+        local kind = Routes.destinationKind(ctx.body)
+        if kind == "target" or kind == "location" then
+            ctx.body, destination = Routes.withResolvedDestination(ctx, ctx.body, owner)
+        end
+    end
+
     local command = MissionTypes.make(missionType, shipName, nil, {})
     local config = MissionTypes.buildConfig(key, ctx.body)
     local area = MissionTypes.buildArea(command, owner.index, shipName, ctx.body)
@@ -458,6 +473,7 @@ local function withAssessment(ctx, params, onAssessed)
         function(analyzedArea, results)
             local ok, err = pcall(function()
                 local assessed = assess(owner, shipName, key, missionType, analyzedArea, results, config)
+                if destination then assessed.body.destination = destination end
                 onAssessed(assessed, analyzedArea, results, owner, shipName, key, missionType)
             end)
 
