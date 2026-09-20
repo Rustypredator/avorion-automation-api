@@ -1636,6 +1636,17 @@ world.hull = 0.4
 tick()
 check(actions() == "J4:3", "'sector' jumps to the coordinates it was given")
 
+newWorld()
+loadOrderChain()
+world.x, world.y = 4, 3
+world.known[1] = {{x = 4, y = 3}, {x = 6, y = 3}}
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "sector", x = 4, y = 3}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J6:3",
+      "a craft attacked in the sector it was told to run to still leaves")
+
 print("\nfleeing: walking to somewhere out of reach")
 
 newWorld()

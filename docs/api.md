@@ -1302,6 +1302,9 @@ the same request, and the answer reports the fraction.
 | `location` | towards a sector from the [location library](#locations), as `"name"`. Checked when the order is set, so a typo is `404 no_such_location` rather than a craft running somewhere unexpected mid-fight |
 | `sector` | towards fixed `x` and `y` |
 
+A craft attacked in the very sector it was told to run to leaves anyway, by the `known`
+rule: getting out is the point, and anywhere else beats dying at home.
+
 The last three can be further than one jump, and are walked towards a hop at a time rather
 than routed: the route planner is a galaxy-side search sliced across ticks and a craft being
 shot at cannot wait for one, and a greedy step towards the destination is out of this sector

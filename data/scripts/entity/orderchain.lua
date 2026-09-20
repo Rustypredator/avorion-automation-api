@@ -1930,9 +1930,10 @@ local function automationApiFleeTarget(flee)
     local to = type(flee.to) == "table" and flee.to or {kind = "known"}
     local wanted = automationApiFleeDestination(to, x, y)
 
-    if wanted and wanted.x == x and wanted.y == y then
-        return nil, "already_there"
-    end
+    -- The craft is being shot at in the very sector it was told to run to. Getting out is
+    -- still the point, so the destination is dropped and this falls through to the search
+    -- below - anywhere else beats staying and dying at home.
+    if wanted and wanted.x == x and wanted.y == y then wanted = nil end
 
     if wanted and automationApiFleeSquared(x, y, wanted.x, wanted.y) <= reach * reach
        and automationApiJumpValid(x, y, wanted.x, wanted.y) then
