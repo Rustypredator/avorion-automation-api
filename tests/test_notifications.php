@@ -584,6 +584,8 @@ if ($port === 0) {
 
     $lines = array_values(array_filter(explode("\n", (string) @file_get_contents($log))));
     check(count($lines) === 1, 'to the one channel the rule named, not to all three');
+    check(!str_contains((string) ($lines[0] ?? ''), 'channels'),
+          'and the payload does not tell it which channels were tried');
 
     check($me->deliver()['sent'] === 0, 'and is not delivered twice');
 }

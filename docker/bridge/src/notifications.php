@@ -717,6 +717,13 @@ final class Notifications
             $player = (int) $row['player'];
             $channels[$player] ??= $this->sendable($player);
 
+            $data = $this->decode((string) $row['data']);
+
+            // Which channels to try is routing, not content. It stays on the row and out
+            // of the payload: a webhook has no business being told what else was sent to.
+            $wanted = $data['channels'] ?? [];
+            unset($data['channels']);
+
             $note = [
                 'rule' => (string) $row['rule'],
                 'kind' => (string) $row['kind'],
@@ -724,10 +731,8 @@ final class Notifications
                 'title' => (string) $row['title'],
                 'body' => (string) $row['body'],
                 'priority' => (int) $row['priority'],
-                'data' => $this->decode((string) $row['data']),
+                'data' => $data,
             ];
-
-            $wanted = $this->decode((string) $row['data'])['channels'] ?? [];
             $errors = [];
             $delivered = false;
             $tried = false;
