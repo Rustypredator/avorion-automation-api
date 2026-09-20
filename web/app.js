@@ -75,8 +75,16 @@
     notifications: { data: null, loaded: false, error: null },
     channelForm: null,
     ruleForm: null,
-    /* Which of this player's API keys the bridge's background services may use, off
-       /services. `enrolForm` is the editor for adding one. */
+    /* This player's own API keys, off /keys: the Keys tab names and revokes them.
+       `keyEdit` is the rename box open on one, `keyRevoke` the fingerprint of the one
+       being asked about before it goes. Making a key is not here - that is /apikey new
+       in the game, deliberately; see the Keys tab's explainer. */
+    keys: { data: null, loaded: false, error: null },
+    keyEdit: null,
+    keyRevoke: null,
+    /* Which of those keys the bridge's background services may use, off /services. Drawn
+       on the Keys tab under the list; the Alerts tab reads it too, to know whether any
+       alert can be delivered at all. `enrolForm` is the editor for adding one. */
     services: { data: null, loaded: false, error: null },
     enrolForm: null,
     autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
@@ -554,7 +562,7 @@
     'economy-no-samples':
       'The bridge records a station when something asks for /stations, which the poller '
       + 'service does on a timer &mdash; enrol a key under Background services on the '
-      + 'Alerts tab if nothing is polling.',
+      + 'Keys tab if nothing is polling.',
 
     'economy-observed':
       'Rates are per <em>observed</em> hour. Nothing in the mod pushes, so a stretch with '
@@ -570,7 +578,7 @@
       'The bridge builds the history out of the calls made to it, so with only this page '
       + 'looking it fills in while a tab is open and stops when you close it. To have it '
       + 'kept while you are away, enrol a key under <b>Background services</b> on the '
-      + 'Alerts tab.',
+      + 'Keys tab.',
 
     'history-shared':
       'Alliance craft are recorded once for the whole alliance, whichever member\'s '
@@ -818,7 +826,22 @@
       + 'sent to your channels alone.</p>'
       + '<p>An alert is only as quick and as complete as the bridge\u2019s poller. A craft '
       + 'records nothing while its owner is logged out, and nothing is sent at all until '
-      + 'you enrol a key under <b>Background services</b> below.</p>',
+      + 'you enrol a key under <b>Background services</b> on the <b>Keys</b> tab.</p>',
+
+    'keys':
+      '<p>An API key is what this page, and anything else you point at this API, signs in '
+      + 'with. It is not a password: it is the whole account, and anyone holding it can do '
+      + 'everything to your craft that you can.</p>'
+      + '<p>New ones come from <code>/apikey new</code> in the game\u2019s chat, and nowhere '
+      + 'else \u2014 on purpose. A key that could make another key could never be fully '
+      + 'revoked, because whoever took it would simply make a second one while you deleted '
+      + 'the first. The chat window is the one place a stolen key cannot reach.</p>'
+      + '<p>The eight characters beside each key are its fingerprint, which is how it is '
+      + 'named everywhere: here, in <code>/apikey list</code>, and in the file the mod '
+      + 'writes the key to when it is made (the chat window cannot be copied from).</p>'
+      + '<p><b>Revoke</b> is immediate and cannot be undone. The key is not stored anywhere '
+      + 'you can read it back, so if you revoke the one you are using, make a new one in '
+      + 'game. Keys are listed oldest first; the mod has no clock to date them with.</p>',
 
     'services':
       '<p>The poller and the notifier are ordinary clients: they call the API the way this '
@@ -826,9 +849,9 @@
       + 'one and stores it, encrypted, in its database.</p>'
       + '<p>That is a real thing to agree to, so nothing here is on by default and you can '
       + 'take it back at any moment \u2014 <b>forget</b> deletes the stored key outright. '
-      + 'Revoking the key in game with <code>/apikey revoke</code> also stops it dead.</p>'
+      + 'Revoking the key above also stops it dead.</p>'
       + '<p>If you would rather not enrol the key you use here, make a second one with '
-      + '<code>/apikey new</code> and paste that instead. It can be revoked on its own.</p>'
+      + '<code>/apikey new</code> and enrol that instead. It can be revoked on its own.</p>'
       + '<p><b>Record my fleet</b> covers your alliance\u2019s craft too, so one member is '
       + 'enough for a shared fleet. <b>Send me alerts</b> is not: a rule is yours and goes '
       + 'to your channels, so each player who wants telling enrols themselves.</p>',
@@ -1116,6 +1139,9 @@
         S.notifications = { data: null, loaded: false, error: null };
         S.channelForm = null;
         S.ruleForm = null;
+        S.keys = { data: null, loaded: false, error: null };
+        S.keyEdit = null;
+        S.keyRevoke = null;
         S.services = { data: null, loaded: false, error: null };
         S.enrolForm = null;
         manifestsAt = 0;
@@ -1127,6 +1153,7 @@
         loadGalaxy();
         loadHistory(true);
         if (S.view === 'notify') { loadNotifications(true); }
+        if (S.view === 'keys') { loadKeys(true); }
       })
       .catch(function (error) {
         S.connected = false;
@@ -1239,8 +1266,16 @@
       // The bridge's own, not the mod's, so this costs the game server nothing - but
       // there is still no point reading a log nobody is looking at. An editor left open
       // is left alone: a redraw underneath it would throw away what is being typed.
-      if (S.view === 'notify' && !S.channelForm && !S.ruleForm && !S.enrolForm) {
+      if (S.view === 'notify' && !S.channelForm && !S.ruleForm) {
         return loadNotifications(false);
+      }
+    });
+    loop('keys', EVERY.mission, function () {
+      // Same reasoning as the alerts loop, and the same care around an open editor: a
+      // redraw under the rename box would throw away what is being typed, and one under
+      // the revoke confirmation would move the button out from under the pointer.
+      if (S.view === 'keys' && !S.enrolForm && !S.keyEdit && !S.keyRevoke) {
+        return loadKeys(false);
       }
     });
   }
@@ -1304,6 +1339,10 @@
     if (name === 'notify') {
       renderNotifications();
       if (S.connected) { loadNotifications(true); }
+    }
+    if (name === 'keys') {
+      renderKeys();
+      if (S.connected) { loadKeys(true); }
     }
   }
 
@@ -10508,6 +10547,451 @@
     $('#galaxy-body').innerHTML = '<div class="cards">' + cards.join('') + '</div>';
   }
 
+  /* ================================== KEYS =================================
+   *
+   * A player's own credentials, in two halves that only mean anything together: the API
+   * keys the mod issued them, and which of those the bridge's background services are
+   * allowed to call the API with.
+   *
+   * Making a key is deliberately not here. It stays /apikey new in the game's chat,
+   * because a key that could mint another would outlive its own revocation - whoever
+   * took it simply makes a second while you are deleting the first. So this tab is where
+   * a key spends the rest of its life: named, watched, lent to the bridge, taken away.
+   */
+
+  function loadKeys(userInitiated) {
+    if (!S.connected) { return Promise.resolve(); }
+
+    var priority = userInitiated ? Api.P.USER : Api.P.POLL;
+
+    var keys = Api.get('/keys', null, { priority: priority, label: 'keys' })
+      .then(function (body) {
+        S.keys = { data: body, loaded: true, error: null };
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.keys = { data: null, loaded: true, error: error };
+      });
+
+    return Promise.all([keys, loadServices(priority)]).then(renderKeys);
+  }
+
+  /* Read by both tabs: this one to say what each key is being used for, the Alerts tab to
+     say whether anything will ever be sent at all. It is allowed to fail on its own - a
+     deployment with no enrolment secret answers 503 - and neither tab treats that as the
+     page having failed. */
+  function loadServices(priority) {
+    return Api.get('/services', null, { priority: priority, label: 'services' })
+      .then(function (body) {
+        S.services = { data: body, loaded: true, error: null };
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.services = { data: null, loaded: true, error: error };
+      });
+  }
+
+  function renderKeys() {
+    var host = $('#keys-body');
+    if (!host) { return; }
+
+    if (!S.connected) {
+      host.innerHTML = '<div class="empty"><p>Connect first.</p></div>';
+      return;
+    }
+
+    host.innerHTML = keyList() + servicesSection();
+  }
+
+  /* Which enrolment, if any, is this key. The bridge hands back the mod's own fingerprint
+     for every enrolled row precisely so the two lists here can be matched up: the id it
+     works in is a hash of the key, which the game never shows anybody. */
+  function enrolmentFor(fingerprint) {
+    var rows = ((S.services.data || {}).enrolled) || [];
+
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].fingerprint && rows[i].fingerprint === fingerprint) { return rows[i]; }
+    }
+
+    return null;
+  }
+
+  function keyList() {
+    var state = S.keys;
+    var head = '<div class="section"><h2>Your API keys ' + explain('keys') + '</h2>';
+
+    if (state.error) {
+      return head + errorBox('Could not read your keys', state.error)
+        // 404 from the mod's own router: the endpoint is newer than the mod running on
+        // this server, which is worth saying plainly rather than as a bare "not found".
+        + (state.error.status === 404
+          ? '<div class="note">This server runs a version of the mod without <code>/keys</code>. '
+            + 'Manage them in the game with <code>/apikey</code> instead.</div>'
+          : '')
+        + '</div>';
+    }
+
+    if (!state.loaded) { return head + '<p class="muted">loading…</p></div>'; }
+
+    var rows = ((state.data || {}).keys || []).map(keyRow).join('');
+
+    return head
+      + '<p class="mute2">Each of these opens this API as you, with everything it can do. '
+      + 'New ones are made in the game with <code>/apikey new</code>, which is also the only '
+      + 'place a key is ever shown — nothing here can hand one back out. Naming them, '
+      + 'seeing what uses them and revoking them is this page’s job.</p>'
+      + (rows || '<p class="muted">No keys yet. Run <code>/apikey new</code> in the game’s '
+                 + 'chat; the key it prints is also written to a file on the server, because '
+                 + 'the chat window cannot be copied from.</p>')
+      + '</div>';
+  }
+
+  function keyRow(entry) {
+    if (S.keyEdit && S.keyEdit.fingerprint === entry.fingerprint) { return keyEditor(S.keyEdit); }
+
+    var enrolled = enrolmentFor(entry.fingerprint);
+
+    var badges = [];
+    if (entry.current) { badges.push('<span class="badge info">this console</span>'); }
+    if (enrolled && enrolled.poll) { badges.push('<span class="badge good">recording</span>'); }
+    if (enrolled && enrolled.notify) { badges.push('<span class="badge good">alerts</span>'); }
+
+    /* Revoking cannot be undone and the key is not shown again anywhere, so it asks
+       first - and says what else is about to stop working, which the badges above are
+       exactly the list of. */
+    if (S.keyRevoke === entry.fingerprint) {
+      var loses = [];
+      if (entry.current) { loses.push('disconnect this console'); }
+      if (enrolled && enrolled.poll) { loses.push('stop recording your fleet'); }
+      if (enrolled && enrolled.notify) { loses.push('stop your alerts'); }
+
+      return '<div class="order-row enrol-row">'
+        + '<span><b>' + esc(keyName(entry)) + '</b> <code>' + esc(entry.fingerprint) + '</code></span>'
+        + '<span class="spacer"></span>'
+        + '<button class="danger small" data-key-revoke-sure="' + esc(entry.fingerprint)
+        + '">revoke for good</button>'
+        + '<button class="ghost small" data-act="key-revoke-cancel">cancel</button>'
+        + '<div class="mute2 bad">This cannot be undone'
+        + (loses.length ? ', and will ' + esc(loses.join(' and ')) : '')
+        + '. Anything still holding this key gets 401 from now on.</div>'
+        + '</div>';
+    }
+
+    return '<div class="order-row enrol-row">'
+      + '<span><b>' + esc(keyName(entry)) + '</b></span>'
+      + '<code>' + esc(entry.fingerprint) + '</code>'
+      + (badges.length ? '<span class="badges">' + badges.join('') + '</span>' : '')
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-key-rename="' + esc(entry.fingerprint) + '">rename</button>'
+      + '<button class="ghost small" data-key-revoke="' + esc(entry.fingerprint) + '">revoke</button>'
+      + '</div>';
+  }
+
+  function keyName(entry) {
+    return entry.label || 'key ' + entry.fingerprint;
+  }
+
+  function keyEditor(form) {
+    return '<div class="editor" style="margin-bottom:6px">'
+      + '<div class="row">'
+      + '<label class="field" style="flex:1"><span>Name</span>'
+      + '<input type="text" data-key-label value="' + esc(form.label) + '"'
+      + ' placeholder="what holds this key" maxlength="' + esc(String(keyMaxLabel())) + '"></label>'
+      + '<code>' + esc(form.fingerprint) + '</code>'
+      + '</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="key-save">save</button>'
+      + '<button class="ghost small" data-act="key-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function keyMaxLabel() {
+    return ((S.keys.data || {}).maxLabel) || 48;
+  }
+
+  function saveKeyLabel(button) {
+    var form = S.keyEdit;
+    if (!form) { return; }
+
+    guard(button, Api.post('/keys/' + encodeURIComponent(form.fingerprint),
+                           { label: form.label }, null,
+                           { priority: Api.P.USER, label: 'rename key' }))
+      .then(function () {
+        S.keyEdit = null;
+        loadKeys(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not rename that key'); });
+  }
+
+  /* Revoking is the mod's business, but a key the bridge is holding a copy of has to go
+     from there too: the mod would stop answering it and the poller would sit there
+     collecting 401s for a key its owner thinks is gone. Forgetting first is best effort -
+     if the bridge refuses, the revoke still goes ahead, because that is the half that
+     actually stops the key working. */
+  function revokeKey(button, fingerprint) {
+    var enrolled = enrolmentFor(fingerprint);
+
+    var forgotten = enrolled
+      ? Api.post('/services/forget', { id: enrolled.id }, null,
+                 { priority: Api.P.USER, label: 'forget key' }).catch(function () {})
+      : Promise.resolve();
+
+    guard(button, forgotten.then(function () {
+      return Api.post('/keys/' + encodeURIComponent(fingerprint) + '/delete', {}, null,
+                      { priority: Api.P.USER, label: 'revoke key' });
+    }))
+      .then(function (body) {
+        S.keyRevoke = null;
+
+        if (body.wasCurrent) {
+          keyWasPulled(fingerprint);
+          return;
+        }
+
+        toast('good', 'Key revoked', fingerprint + ' no longer opens anything.');
+        loadKeys(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not revoke that key'); });
+  }
+
+  /* The console just revoked the key it is itself calling with. Every later call is a
+     401, so say so once here rather than letting the loops discover it one by one, and
+     take the dead key out of the box and out of storage so a reconnect is not tried with
+     it. */
+  function keyWasPulled(fingerprint) {
+    S.connected = false;
+    S.keys = { data: null, loaded: false, error: null };
+
+    $('#conn-key').value = '';
+    try { localStorage.removeItem(LS.key); } catch (e) { /* private mode; nothing to clear */ }
+
+    setStatus('off', 'key revoked');
+    banner('warn', 'Revoked <code>' + esc(fingerprint) + '</code>, which is the key this '
+           + 'console was using. Paste another one above and connect again, or make one in '
+           + 'the game with <code>/apikey new</code>.');
+    renderKeys();
+  }
+
+  /* ---------------------------- background services ----------------------------
+   *
+   * Which of this player's API keys the bridge's poller and notifier may call the API
+   * with. It sits directly under the key list because that is the question it asks about
+   * one of them, and because the answer is the thing that makes the Alerts tab do
+   * anything at all: a rule with nobody enrolled is never evaluated.
+   *
+   * The key is a credential and enrolling hands it over, so this says so plainly rather
+   * than presenting it as a checkbox like any other.
+   */
+
+  function blankEnrol() {
+    return { key: '', label: '', poll: true, notify: true };
+  }
+
+  function servicesSection() {
+    var state = S.services;
+    var kinds = ((state.data || {}).services) || {};
+    var rows = ((state.data || {}).enrolled) || [];
+
+    /*
+     * 503 is the deployment having no enrolment secret, which is not the player's
+     * problem to fix and not an error to shout about - it is the explanation for why
+     * the background services never do anything.
+     */
+    if (state.error) {
+      return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
+        + (state.error.status === 503
+          ? '<div class="note">' + esc(state.error.message) + '</div>'
+          : errorBox('Could not read what is enrolled', state.error))
+        + '</div>';
+    }
+
+    if (!state.loaded) {
+      return '<div class="section"><h2>Background services</h2>'
+        + '<p class="muted">loading…</p></div>';
+    }
+
+    var list = rows.map(function (entry) { return enrolRow(entry, kinds); }).join('');
+
+    return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
+      + '<p class="mute2">The bridge’s poller and notifier have to call the API as you, '
+      + 'and they need one of the keys above to do it with. Nothing they produce — the '
+      + 'fleet history, the economy figures, every alert — happens until one is '
+      + 'enrolled here.</p>'
+      + (list || '<p class="muted">Nothing enrolled. Your fleet is only recorded while '
+                 + 'this page is open, and no alert will ever be sent.</p>')
+      + (S.enrolForm ? enrolEditor(S.enrolForm, kinds)
+                     : '<div class="row" style="margin-top:8px">'
+                       + '<button class="ghost small" data-act="enrol-new">enrol a key</button>'
+                       + '</div>')
+      + '</div>';
+  }
+
+  function enrolRow(entry, kinds) {
+    var toggles = Object.keys(kinds).map(function (service) {
+      return '<label class="check switch"><input type="checkbox" data-service="'
+        + esc(service) + '" data-service-on="' + esc(entry.id) + '"'
+        + (entry[service] ? ' checked' : '') + '>'
+        + '<span>' + esc(kinds[service].title || service) + '</span></label>';
+    }).join('');
+
+    // A key the services have given up on. The reason is the mod's own, and is the
+    // difference between "revoke it and enrol a new one" and "your server was down".
+    var trouble = entry.failures > 0 && entry.error
+      ? '<div class="mute2 bad">' + esc(entry.error) + '</div>' : '';
+
+    return '<div class="order-row enrol-row">'
+      + '<span><b>' + esc(entry.label || ('key ' + entry.id.slice(0, 8))) + '</b></span>'
+      // The same handle the list above prints, so a row here can be told which key it is.
+      // Absent only for a row the bridge can no longer decrypt, or one carried over from
+      // the old POLL_KEYS before anybody claimed it.
+      + (entry.fingerprint ? '<code>' + esc(entry.fingerprint) + '</code>' : '')
+      + toggles
+      + '<span class="mute2">' + (entry.usedAt
+          ? 'last used ' + esc(new Date(entry.usedAt * 1000).toLocaleString())
+          : 'not used yet') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-service-forget="' + esc(entry.id) + '">forget</button>'
+      + trouble
+      + '</div>';
+  }
+
+  function enrolEditor(form, kinds) {
+    var boxes = Object.keys(kinds).map(function (service) {
+      return '<label class="check"><input type="checkbox" data-enrol-want="' + esc(service)
+        + '"' + (form[service] ? ' checked' : '') + '>'
+        + '<span><b>' + esc(kinds[service].title || service) + '</b> — '
+        + esc(kinds[service].about || '') + '</span></label>';
+    }).join('');
+
+    return '<div class="editor" style="margin-top:8px">'
+      + '<div class="row">'
+      + '<label class="field" style="flex:1"><span>API key</span>'
+      + '<input type="password" data-enrol="key" value="' + esc(form.key) + '"'
+      + ' placeholder="leave empty to use the key this console is connected with"></label>'
+      + '<label class="field"><span>Name</span>'
+      + '<input type="text" data-enrol="label" value="' + esc(form.label) + '"'
+      + ' placeholder="my fleet"></label>'
+      + '</div>'
+      + '<div class="enrol-wants">' + boxes + '</div>'
+      + '<div class="note" style="margin-top:8px">The bridge stores this key so it can '
+      + 'call the API while you are away. It is encrypted, never handed back out, and '
+      + '<b>forget</b> deletes it. Everywhere else the bridge keeps only a hash of a key; '
+      + 'this is the exception, because presenting one is the whole job.</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="enrol-save">enrol</button>'
+      + '<button class="ghost small" data-act="enrol-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function saveEnrol(button) {
+    var form = S.enrolForm;
+    if (!form) { return; }
+
+    var body = { poll: !!form.poll, notify: !!form.notify, label: form.label };
+    // Left empty on purpose means "the key I am already connected with", which the bridge
+    // reads off the header. Sending it in the body as well would put it somewhere it does
+    // not need to be.
+    if (form.key) { body.key = form.key; }
+
+    if (!body.poll && !body.notify) {
+      toast('bad', 'Nothing chosen', 'Pick at least one, or cancel.');
+      return;
+    }
+
+    guard(button, Api.post('/services/enrol', body, null,
+                           { priority: Api.P.USER, label: 'enrol' }))
+      .then(function () {
+        S.enrolForm = null;
+        toast('good', 'Key enrolled', 'The bridge will start using it within a minute.');
+        loadKeys(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not enrol that key'); });
+  }
+
+  function setEnrolled(id, service, on) {
+    var body = { id: id };
+    body[service] = on;
+
+    Api.post('/services/update', body, null, { priority: Api.P.USER, label: 'enrol' })
+      .then(function () { loadKeys(true); })
+      .catch(function (error) {
+        apiFailed(error, 'Could not change that');
+        loadKeys(true);
+      });
+  }
+
+  function forgetEnrolled(button, id) {
+    guard(button, Api.post('/services/forget', { id: id }, null,
+                           { priority: Api.P.USER, label: 'enrol' }))
+      .then(function () {
+        toast('good', 'Key forgotten', 'The bridge no longer holds it.');
+        loadKeys(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove it'); });
+  }
+
+  function keysClick(button) {
+    var act = button.dataset.act;
+
+    if (act === 'key-cancel') { S.keyEdit = null; renderKeys(); return true; }
+    if (act === 'key-save') { saveKeyLabel(button); return true; }
+    if (act === 'key-revoke-cancel') { S.keyRevoke = null; renderKeys(); return true; }
+    if (act === 'enrol-new') { S.enrolForm = blankEnrol(); renderKeys(); return true; }
+    if (act === 'enrol-cancel') { S.enrolForm = null; renderKeys(); return true; }
+    if (act === 'enrol-save') { saveEnrol(button); return true; }
+    if (act === 'keys-refresh') { loadKeys(true); return true; }
+
+    if (button.dataset.keyRename) {
+      var found = ((S.keys.data || {}).keys || []).filter(function (entry) {
+        return entry.fingerprint === button.dataset.keyRename;
+      })[0];
+      S.keyEdit = { fingerprint: button.dataset.keyRename, label: (found && found.label) || '' };
+      S.keyRevoke = null;
+      renderKeys();
+      return true;
+    }
+
+    if (button.dataset.keyRevoke) {
+      S.keyRevoke = button.dataset.keyRevoke;
+      S.keyEdit = null;
+      renderKeys();
+      return true;
+    }
+
+    if (button.dataset.keyRevokeSure) { revokeKey(button, button.dataset.keyRevokeSure); return true; }
+
+    if (button.dataset.serviceForget) {
+      forgetEnrolled(button, button.dataset.serviceForget);
+      return true;
+    }
+
+    return false;
+  }
+
+  function keysChange(node) {
+    if (node.dataset.keyLabel !== undefined && S.keyEdit) {
+      S.keyEdit.label = node.value;
+      return true;
+    }
+
+    if (node.dataset.serviceOn !== undefined) {
+      setEnrolled(node.dataset.serviceOn, node.dataset.service, node.checked);
+      return true;
+    }
+
+    if (node.dataset.enrol !== undefined && S.enrolForm) {
+      S.enrolForm[node.dataset.enrol] = node.value;
+      return true;
+    }
+
+    if (node.dataset.enrolWant !== undefined && S.enrolForm) {
+      S.enrolForm[node.dataset.enrolWant] = node.checked;
+      return true;
+    }
+
+    return false;
+  }
+
   /* ================================= ALERTS ================================
    *
    * Push notifications, which are the bridge's rather than the mod's: the mod cannot open
@@ -10530,8 +11014,9 @@
 
     /*
      * Two reads, drawn as one. They fail independently on purpose: a deployment with no
-     * enrolment secret answers 503 on /services, and the rules below it are still worth
-     * showing - and worth showing alongside the reason nothing is being sent.
+     * enrolment secret answers 503 on /services, and the rules are still worth showing -
+     * alongside the reason nothing will be sent. What is enrolled is managed on the Keys
+     * tab; this tab only reads it, to know whether any of this ever fires.
      */
     var alerts = Api.get('/notifications', null, { priority: priority, label: 'alerts' })
       .then(function (body) {
@@ -10542,16 +11027,7 @@
         S.notifications = { data: S.notifications.data, loaded: true, error: error };
       });
 
-    var enrolled = Api.get('/services', null, { priority: priority, label: 'services' })
-      .then(function (body) {
-        S.services = { data: body, loaded: true, error: null };
-      })
-      .catch(function (error) {
-        if (error.code === 'cancelled') { return; }
-        S.services = { data: null, loaded: true, error: error };
-      });
-
-    return Promise.all([alerts, enrolled]).then(renderNotifications);
+    return Promise.all([alerts, loadServices(priority)]).then(renderNotifications);
   }
 
   function notifyKinds() {
@@ -10636,169 +11112,43 @@
     var data = state.data || {};
 
     host.innerHTML = notifyIntro()
-      + notifyServices()
       + notifyChannels(data)
       + notifyRules(data)
       + notifyLog(data);
-  }
-
-  /* ---------------------------- background services ----------------------------
-   *
-   * Which of this player's API keys the bridge's poller and notifier may call the API
-   * with. It is drawn above the channels and rules because it is the thing that makes
-   * either of them do anything: a rule with nobody enrolled is never evaluated.
-   *
-   * The key is a credential and enrolling hands it over, so this says so plainly rather
-   * than presenting it as a checkbox like any other.
-   */
-
-  function blankEnrol() {
-    return { key: '', label: '', poll: true, notify: true };
-  }
-
-  function notifyServices() {
-    var state = S.services;
-    var kinds = ((state.data || {}).services) || {};
-    var rows = ((state.data || {}).enrolled) || [];
-
-    /*
-     * 503 is the deployment having no enrolment secret, which is not the player's
-     * problem to fix and not an error to shout about - it is the explanation for why
-     * nothing below this ever fires.
-     */
-    if (state.error) {
-      return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
-        + (state.error.status === 503
-          ? '<div class="note">' + esc(state.error.message) + '</div>'
-          : errorBox('Could not read what is enrolled', state.error))
-        + '</div>';
-    }
-
-    if (!state.loaded) {
-      return '<div class="section"><h2>Background services</h2>'
-        + '<p class="muted">loading…</p></div>';
-    }
-
-    var list = rows.map(function (entry) { return enrolRow(entry, kinds); }).join('');
-
-    return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
-      + '<p class="mute2">Nothing below runs unless a key of yours is enrolled here: the '
-      + 'bridge\u2019s poller and notifier have to call the API as you, and they need a '
-      + 'key to do it with.</p>'
-      + (list || '<p class="muted">Nothing enrolled. Your fleet is only recorded while '
-                 + 'this page is open, and no alert will ever be sent.</p>')
-      + (S.enrolForm ? enrolEditor(S.enrolForm, kinds)
-                     : '<div class="row" style="margin-top:8px">'
-                       + '<button class="ghost small" data-act="enrol-new">enrol a key</button>'
-                       + '</div>')
-      + '</div>';
-  }
-
-  function enrolRow(entry, kinds) {
-    var toggles = Object.keys(kinds).map(function (service) {
-      return '<label class="check switch"><input type="checkbox" data-service="'
-        + esc(service) + '" data-service-on="' + esc(entry.id) + '"'
-        + (entry[service] ? ' checked' : '') + '>'
-        + '<span>' + esc(kinds[service].title || service) + '</span></label>';
-    }).join('');
-
-    // A key the services have given up on. The reason is the mod's own, and is the
-    // difference between "revoke it and enrol a new one" and "your server was down".
-    var trouble = entry.failures > 0 && entry.error
-      ? '<div class="mute2 bad">' + esc(entry.error) + '</div>' : '';
-
-    return '<div class="order-row enrol-row">'
-      + '<span><b>' + esc(entry.label || ('key ' + entry.id.slice(0, 8))) + '</b></span>'
-      + toggles
-      + '<span class="mute2">' + (entry.usedAt
-          ? 'last used ' + esc(new Date(entry.usedAt * 1000).toLocaleString())
-          : 'not used yet') + '</span>'
-      + '<span class="spacer"></span>'
-      + '<button class="ghost small" data-service-forget="' + esc(entry.id) + '">forget</button>'
-      + trouble
-      + '</div>';
-  }
-
-  function enrolEditor(form, kinds) {
-    var boxes = Object.keys(kinds).map(function (service) {
-      return '<label class="check"><input type="checkbox" data-enrol-want="' + esc(service)
-        + '"' + (form[service] ? ' checked' : '') + '>'
-        + '<span><b>' + esc(kinds[service].title || service) + '</b> \u2014 '
-        + esc(kinds[service].about || '') + '</span></label>';
-    }).join('');
-
-    return '<div class="editor" style="margin-top:8px">'
-      + '<div class="row">'
-      + '<label class="field" style="flex:1"><span>API key</span>'
-      + '<input type="password" data-enrol="key" value="' + esc(form.key) + '"'
-      + ' placeholder="leave empty to use the key this console is connected with"></label>'
-      + '<label class="field"><span>Name</span>'
-      + '<input type="text" data-enrol="label" value="' + esc(form.label) + '"'
-      + ' placeholder="my fleet"></label>'
-      + '</div>'
-      + '<div class="enrol-wants">' + boxes + '</div>'
-      + '<div class="note" style="margin-top:8px">The bridge stores this key so it can '
-      + 'call the API while you are away. It is encrypted, never handed back out, and '
-      + '<b>forget</b> deletes it. Everywhere else the bridge keeps only a hash of a key; '
-      + 'this is the exception, because presenting one is the whole job.</div>'
-      + '<div class="row" style="margin-top:8px">'
-      + '<button class="primary small" data-act="enrol-save">enrol</button>'
-      + '<button class="ghost small" data-act="enrol-cancel">cancel</button>'
-      + '</div></div>';
-  }
-
-  function saveEnrol(button) {
-    var form = S.enrolForm;
-    if (!form) { return; }
-
-    var body = { poll: !!form.poll, notify: !!form.notify, label: form.label };
-    // Left empty on purpose means "the key I am already connected with", which the bridge
-    // reads off the header. Sending it in the body as well would put it somewhere it does
-    // not need to be.
-    if (form.key) { body.key = form.key; }
-
-    if (!body.poll && !body.notify) {
-      toast('bad', 'Nothing chosen', 'Pick at least one, or cancel.');
-      return;
-    }
-
-    guard(button, Api.post('/services/enrol', body, null,
-                           { priority: Api.P.USER, label: 'enrol' }))
-      .then(function () {
-        S.enrolForm = null;
-        toast('good', 'Key enrolled', 'The bridge will start using it within a minute.');
-        loadNotifications(true);
-      })
-      .catch(function (error) { apiFailed(error, 'Could not enrol that key'); });
-  }
-
-  function setEnrolled(id, service, on) {
-    var body = { id: id };
-    body[service] = on;
-
-    Api.post('/services/update', body, null, { priority: Api.P.USER, label: 'enrol' })
-      .then(function () { loadNotifications(true); })
-      .catch(function (error) {
-        apiFailed(error, 'Could not change that');
-        loadNotifications(true);
-      });
-  }
-
-  function forgetEnrolled(button, id) {
-    guard(button, Api.post('/services/forget', { id: id }, null,
-                           { priority: Api.P.USER, label: 'enrol' }))
-      .then(function () {
-        toast('good', 'Key forgotten', 'The bridge no longer holds it.');
-        loadNotifications(true);
-      })
-      .catch(function (error) { apiFailed(error, 'Could not remove it'); });
   }
 
   function notifyIntro() {
     return '<div class="section"><h2>Alerts ' + explain('alerts') + '</h2>'
       + '<p class="mute2">Pushed by the bridge while nothing of yours is open: the browser '
       + 'notifications in the top bar need this page to be. These are yours alone, even '
-      + 'for an alliance craft.</p></div>';
+      + 'for an alliance craft.</p>'
+      + deliveryNote()
+      + '</div>';
+  }
+
+  /* Rules and channels are worth nothing on their own: the notifier has to be able to
+     call the API as this player, and that is arranged on the Keys tab. Rather than let
+     someone build a rule that silently never fires, say so here - but only once it is
+     known, so a slow read does not flash a warning that turns out to be wrong. */
+  function deliveryNote() {
+    var state = S.services;
+
+    if (state.error) {
+      return state.error.status === 503
+        ? '<div class="note bad">' + esc(state.error.message) + ' Nothing below will be '
+          + 'sent until that is fixed on the server.</div>'
+        : '';
+    }
+
+    if (!state.loaded) { return ''; }
+
+    var sending = ((state.data || {}).enrolled || []).some(function (entry) {
+      return entry.notify;
+    });
+
+    return sending ? '' : '<div class="note bad">Nothing below will be sent: no key of '
+      + 'yours is enrolled for alerts. Enrol one under <b>Background services</b> on the '
+      + '<b>Keys</b> tab.</div>';
   }
 
   function notifyChannels(data) {
@@ -11119,14 +11469,6 @@
     if (act === 'rule-cancel') { S.ruleForm = null; renderNotifications(); return true; }
     if (act === 'rule-save') { saveRule(button); return true; }
     if (act === 'notify-refresh') { loadNotifications(true); return true; }
-    if (act === 'enrol-new') { S.enrolForm = blankEnrol(); renderNotifications(); return true; }
-    if (act === 'enrol-cancel') { S.enrolForm = null; renderNotifications(); return true; }
-    if (act === 'enrol-save') { saveEnrol(button); return true; }
-
-    if (button.dataset.serviceForget) {
-      forgetEnrolled(button, button.dataset.serviceForget);
-      return true;
-    }
 
     if (button.dataset.channelEdit) {
       S.channelForm = channelForm(notifyFind(data.channels, button.dataset.channelEdit));
@@ -11148,21 +11490,6 @@
 
   function notifyChange(node) {
     var data = S.notifications.data || {};
-
-    if (node.dataset.serviceOn !== undefined) {
-      setEnrolled(node.dataset.serviceOn, node.dataset.service, node.checked);
-      return true;
-    }
-
-    if (node.dataset.enrol !== undefined && S.enrolForm) {
-      S.enrolForm[node.dataset.enrol] = node.value;
-      return true;
-    }
-
-    if (node.dataset.enrolWant !== undefined && S.enrolForm) {
-      S.enrolForm[node.dataset.enrolWant] = node.checked;
-      return true;
-    }
 
     if (node.dataset.channelOn !== undefined) {
       var channel = notifyFind(data.channels, node.dataset.channelOn);
@@ -11320,6 +11647,13 @@
     });
 
     $('#notify-body').addEventListener('change', function (e) { notifyChange(e.target); });
+
+    $('#keys-body').addEventListener('click', function (e) {
+      var button = e.target.closest('button');
+      if (button) { keysClick(button); }
+    });
+
+    $('#keys-body').addEventListener('change', function (e) { keysChange(e.target); });
 
     $('#industry-refresh').addEventListener('click', function () { loadIndustry(true); });
 

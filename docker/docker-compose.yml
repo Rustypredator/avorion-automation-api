@@ -157,7 +157,7 @@ services:
   # every key.
   #
   # Whose fleets it records is not set here. Players enrol their own key from the
-  # console's Alerts tab and this reads the table every pass, so nobody has to edit a file
+  # console's Keys tab and this reads the table every pass, so nobody has to edit a file
   # or restart anything - see bridge/src/enrolment.php. With nobody enrolled it idles and
   # says so, which is why it stays up rather than exiting.
   poller:

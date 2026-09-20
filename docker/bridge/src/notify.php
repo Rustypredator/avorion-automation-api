@@ -34,7 +34,7 @@ declare(strict_types=1);
  * ### Whose rules
  *
  * The keys come out of the `service_keys` table, where a player put their own by opting
- * in on the console's Alerts tab - see src/enrolment.php. Re-read at the top of every
+ * in on the console's Keys tab - see src/enrolment.php. Re-read at the top of every
  * pass, so switching alerts on takes effect within one interval and nothing needs
  * restarting, and with nobody enrolled this idles rather than exiting.
  *
@@ -175,7 +175,7 @@ function announce(array $enrolled, ?string &$last): void
     }
     if (count($enrolled['keys']) === 0 && $enrolled['sealed'] === 0) {
         $note .= '. Nobody will be sent anything until a player enrols on the console\'s '
-               . 'Alerts tab, under Background services.';
+               . 'Keys tab, under Background services.';
     }
 
     if ($note !== $last) {

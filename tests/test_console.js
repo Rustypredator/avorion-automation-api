@@ -549,6 +549,46 @@ function saveNotifyRule(sent) {
 }
 
 /*
+ * The mod's own key store, which is what the Keys tab lists. Making a key is not on the
+ * API at all - that is /apikey new in the game - so this only has to answer for the rest
+ * of a key's life: what it is called, what is using it, and it going away.
+ *
+ * 'a1b2c3d4' is the key this console is connected with, which is what `current` means
+ * and what an enrolment with no key of its own ends up being.
+ */
+const keyStore = {
+    keys: [
+        { fingerprint: 'a1b2c3d4', label: 'this console', created: 120, current: true },
+        { fingerprint: 'f0e1d2c3', label: '', created: 300, current: false }
+    ]
+};
+
+function keySummary() {
+    return { keys: keyStore.keys, now: 4000, maxLabel: 48 };
+}
+
+function renameStoredKey(fingerprint) {
+    return (sent) => {
+        const entry = keyStore.keys.filter((k) => k.fingerprint === fingerprint)[0];
+        if (!entry) { return { status: 404, body: { error: { code: 'unknown_key' } } }; }
+        entry.label = sent.label;
+        return keySummary();
+    };
+}
+
+function revokeStoredKey(fingerprint) {
+    return () => {
+        const entry = keyStore.keys.filter((k) => k.fingerprint === fingerprint)[0];
+        if (!entry) { return { status: 404, body: { error: { code: 'unknown_key' } } }; }
+        keyStore.keys = keyStore.keys.filter((k) => k.fingerprint !== fingerprint);
+        const answer = keySummary();
+        answer.revoked = fingerprint;
+        answer.wasCurrent = entry.current === true;
+        return answer;
+    };
+}
+
+/*
  * The bridge's enrolment store: which of this player's API keys its background poller and
  * notifier may call the API with. Also the bridge's own - /services never reaches the
  * game - so this plays its part, including the bit the page has to get right, that a key
@@ -569,8 +609,11 @@ function enrolKey(sent) {
     // The real store hashes the key; here the id only has to be stable and not be the key.
     const id = 'hash-of-' + (sent.key || 'the-header-key');
     const existing = enrolStore.entries.filter((e) => e.id === id)[0];
-    const entry = existing || { id: id, enrolledAt: 1700000000, usedAt: null,
-                                failures: 0, error: '' };
+    // The bridge derives this from the key it stored, so the console can say which key a
+    // row is. No key in the body means the one the request itself arrived with.
+    const fingerprint = sent.key ? sent.key.replace(/^avo_/, '').slice(0, 8) : 'a1b2c3d4';
+    const entry = existing || { id: id, fingerprint: fingerprint, enrolledAt: 1700000000,
+                                usedAt: null, failures: 0, error: '' };
 
     entry.label = sent.label || '';
     entry.poll = sent.poll === true;
@@ -603,6 +646,9 @@ function forgetEnrolment(sent) {
 }
 
 const dynamic = {
+    '/keys/f0e1d2c3': renameStoredKey('f0e1d2c3'),
+    '/keys/f0e1d2c3/delete': revokeStoredKey('f0e1d2c3'),
+    '/keys/a1b2c3d4/delete': revokeStoredKey('a1b2c3d4'),
     '/services/enrol': enrolKey,
     '/services/update': updateEnrolled,
     '/services/forget': forgetEnrolment,
@@ -626,6 +672,7 @@ const dynamic = {
 const routes = {
     get '/notifications'() { return notifySummary(); },
     get '/services'() { return enrolSummary(); },
+    get '/keys'() { return keySummary(); },
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
     // The type filter is not applied, as the checks above the Industry tab have always
@@ -2050,6 +2097,123 @@ const ready = window.document.readyState === 'loading'
     check(fleeSent && fleeSent.body.standing.enemies === undefined,
           'and nothing about the other standing orders');
 
+    console.log('\nthe keys tab');
+
+    $('.tab[data-view="keys"]').click();
+    await settle(400);
+
+    const keys = () => $('#keys-body');
+
+    check(/a1b2c3d4/.test(keys().textContent) && /f0e1d2c3/.test(keys().textContent),
+          'both of the player\u2019s keys are listed, by fingerprint');
+    check(/this console/.test(keys().textContent),
+          'and the one this page is connected with is marked, because revoking it logs you out');
+
+    // Renaming. The label is all a player has to tell two keys apart, and an unnamed key
+    // still has to be nameable.
+    click(keys().querySelector('[data-key-rename="f0e1d2c3"]'));
+    await settle(50);
+    change(keys().querySelector('[data-key-label]'), 'the poller');
+    click(keys().querySelector('[data-act="key-save"]'));
+    await settle(300);
+
+    const renamed = posts.filter((p) => p.path === '/keys/f0e1d2c3').pop();
+    check(renamed && renamed.body.label === 'the poller', 'a key can be renamed');
+    check(/the poller/.test(keys().textContent), 'and the list says so afterwards');
+
+    /*
+     * Background services, on the same tab because it is a question about one of the keys
+     * above: which of them the bridge may call the API with while nobody is looking.
+     */
+    check(/Nothing enrolled/.test(keys().textContent),
+          'with nothing enrolled, the page says so rather than implying alerts will arrive');
+
+    click(keys().querySelector('[data-act="enrol-new"]'));
+    await settle(50);
+    check(keys().querySelector('[data-enrol="key"]').type === 'password',
+          'the key field is a password field, not plain text');
+    check(/leave empty/.test(keys().querySelector('[data-enrol="key"]').placeholder),
+          'and can be left empty to enrol the key the console is already using');
+
+    change(keys().querySelector('[data-enrol="label"]'), 'my fleet');
+    click(keys().querySelector('[data-act="enrol-save"]'));
+    await settle(300);
+
+    const enrolSent = posts.filter((p) => p.path === '/services/enrol').pop();
+    check(enrolSent && enrolSent.body.key === undefined,
+          'an empty key field sends no key at all, so the bridge takes it off the header');
+    check(enrolSent && enrolSent.body.poll === true && enrolSent.body.notify === true,
+          'and both opt-ins are sent');
+    check(/my fleet/.test(keys().textContent), 'the enrolment is listed afterwards');
+    check(!/Nothing enrolled/.test(keys().textContent), 'and the warning is gone');
+
+    // The two lists are joined by the fingerprint, which is the only handle they share:
+    // the bridge works in a hash of the key, which the game never shows anybody.
+    const currentRow = [...keys().querySelectorAll('.order-row')]
+        .filter((row) => /a1b2c3d4/.test(row.textContent))[0];
+    check(currentRow && /recording/.test(currentRow.textContent)
+          && /alerts/.test(currentRow.textContent),
+          'and the key it used is marked with what it is now doing');
+
+    // Each service is its own opt-in: recording a fleet and being messaged about it are
+    // different things to want.
+    const alertSwitch = () => keys().querySelector('[data-service="notify"]');
+    check(alertSwitch() && alertSwitch().checked, 'both services show as on');
+    alertSwitch().checked = false;
+    change(alertSwitch());
+    await settle(300);
+
+    const switched = posts.filter((p) => p.path === '/services/update').pop();
+    check(switched && switched.body.notify === false && switched.body.poll === undefined,
+          'switching one off sends only that one, leaving the other alone');
+    check(keys().querySelector('[data-service="poll"]').checked,
+          'which is what the page shows');
+
+    click(keys().querySelector('[data-service-forget]'));
+    await settle(300);
+    check(posts.filter((p) => p.path === '/services/forget').length === 1,
+          'and the whole enrolment can be withdrawn');
+    check(/Nothing enrolled/.test(keys().textContent),
+          'after which the bridge holds nothing of ours again');
+
+    /*
+     * Revoking. It cannot be undone and the key is never shown again, so it asks first -
+     * and the first click must not send anything, or the question is decoration.
+     */
+    click(keys().querySelector('[data-key-revoke="f0e1d2c3"]'));
+    await settle(50);
+    check(posts.filter((p) => p.path === '/keys/f0e1d2c3/delete').length === 0,
+          'asking to revoke a key sends nothing yet');
+    check(/cannot be undone/.test(keys().textContent), 'it asks first');
+
+    click(keys().querySelector('[data-act="key-revoke-cancel"]'));
+    await settle(50);
+    check(posts.filter((p) => p.path === '/keys/f0e1d2c3/delete').length === 0,
+          'and backing out sends nothing either');
+
+    click(keys().querySelector('[data-key-revoke="f0e1d2c3"]'));
+    await settle(50);
+    click(keys().querySelector('[data-key-revoke-sure="f0e1d2c3"]'));
+    await settle(300);
+
+    check(posts.filter((p) => p.path === '/keys/f0e1d2c3/delete').length === 1,
+          'confirming revokes it');
+    check(!/f0e1d2c3/.test(keys().textContent), 'and it is gone from the list');
+
+    // Put an enrolment back, so the alerts tab below is exercised the way a real setup
+    // looks - and with a key of its own, which is what a careful player would enrol.
+    click(keys().querySelector('[data-act="enrol-new"]'));
+    await settle(50);
+    change(keys().querySelector('[data-enrol="key"]'), 'avo_dedicated');
+    click(keys().querySelector('[data-act="enrol-save"]'));
+    await settle(300);
+
+    const pasted = posts.filter((p) => p.path === '/services/enrol').pop();
+    check(pasted && pasted.body.key === 'avo_dedicated',
+          'a key pasted in is sent, for a player who would rather enrol a second one');
+    check(!/avo_dedicated/.test(keys().textContent),
+          'and is never shown back on the page');
+
     console.log('\nthe alerts tab');
 
     $('.tab[data-view="notify"]').click();
@@ -2059,67 +2223,8 @@ const ready = window.document.readyState === 'loading'
     check(/No channels yet/.test(alerts().textContent), 'an empty setup says so');
     check(/Ore Hound: hull at 45%/.test(alerts().textContent),
           'and still shows what has already been sent');
-
-    /*
-     * Background services first, because nothing under it does anything until a key is
-     * enrolled - the poller and the notifier are ordinary clients and have to call the
-     * API as somebody.
-     */
-    check(/Nothing enrolled/.test(alerts().textContent),
-          'with nothing enrolled, the page says so rather than implying alerts will arrive');
-
-    click(alerts().querySelector('[data-act="enrol-new"]'));
-    await settle(50);
-    check(alerts().querySelector('[data-enrol="key"]').type === 'password',
-          'the key field is a password field, not plain text');
-    check(/leave empty/.test(alerts().querySelector('[data-enrol="key"]').placeholder),
-          'and can be left empty to enrol the key the console is already using');
-
-    change(alerts().querySelector('[data-enrol="label"]'), 'my fleet');
-    click(alerts().querySelector('[data-act="enrol-save"]'));
-    await settle(300);
-
-    const enrolSent = posts.filter((p) => p.path === '/services/enrol').pop();
-    check(enrolSent && enrolSent.body.key === undefined,
-          'an empty key field sends no key at all, so the bridge takes it off the header');
-    check(enrolSent && enrolSent.body.poll === true && enrolSent.body.notify === true,
-          'and both opt-ins are sent');
-    check(/my fleet/.test(alerts().textContent), 'the enrolment is listed afterwards');
-    check(!/Nothing enrolled/.test(alerts().textContent), 'and the warning is gone');
-
-    // Each service is its own opt-in: recording a fleet and being messaged about it are
-    // different things to want.
-    const alertSwitch = () => alerts().querySelector('[data-service="notify"]');
-    check(alertSwitch() && alertSwitch().checked, 'both services show as on');
-    alertSwitch().checked = false;
-    change(alertSwitch());
-    await settle(300);
-
-    const switched = posts.filter((p) => p.path === '/services/update').pop();
-    check(switched && switched.body.notify === false && switched.body.poll === undefined,
-          'switching one off sends only that one, leaving the other alone');
-    check(alerts().querySelector('[data-service="poll"]').checked,
-          'which is what the page shows');
-
-    click(alerts().querySelector('[data-service-forget]'));
-    await settle(300);
-    check(posts.filter((p) => p.path === '/services/forget').length === 1,
-          'and the whole enrolment can be withdrawn');
-    check(/Nothing enrolled/.test(alerts().textContent),
-          'after which the bridge holds nothing of ours again');
-
-    // Put one back, so the rest of the tab is exercised the way a real setup looks.
-    click(alerts().querySelector('[data-act="enrol-new"]'));
-    await settle(50);
-    change(alerts().querySelector('[data-enrol="key"]'), 'avo_dedicated');
-    click(alerts().querySelector('[data-act="enrol-save"]'));
-    await settle(300);
-
-    const pasted = posts.filter((p) => p.path === '/services/enrol').pop();
-    check(pasted && pasted.body.key === 'avo_dedicated',
-          'a key pasted in is sent, for a player who would rather enrol a second one');
-    check(!/avo_dedicated/.test(alerts().textContent),
-          'and is never shown back on the page');
+    check(!/no key of yours is enrolled/.test(alerts().textContent),
+          'and does not warn that nothing will be sent, because something now will be');
 
     click(alerts().querySelector('[data-act="channel-new"]'));
     await settle(50);

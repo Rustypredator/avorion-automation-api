@@ -281,6 +281,51 @@ stations="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["statio
 check "$([ "$status" = "200" ] && [ "$stations" = "0" ] && echo 0 || echo 1)" \
     "an unknown key reads an empty economy, not someone else's" "got $status, $stations stations"
 
+# #### Keys #### --
+#
+# A player managing their own keys over the API, which is what the console's Keys tab
+# drives. The interesting half is the last check: a revoke has to actually take the key
+# out of the mod's hands, not merely out of a listing.
+
+echo
+echo "keys"
+
+FP="$(printf %s "$KEY" | cut -c5-12)"
+MEMBER_FP="$(printf %s "$MEMBER_KEY" | cut -c5-12)"
+
+mine='import json,sys;b=json.load(open(sys.argv[1]));k=[e for e in b["keys"] if e["fingerprint"]==sys.argv[2]];print(json.dumps(k[0]) if k else "")'
+
+status="$(get "$KEY" /keys)"
+listed="$(python3 -c "$mine" "$WORK/body" "$FP")"
+leaked="$(grep -c "$KEY" "$WORK/body" 2>/dev/null || true)"
+check "$([ "$status" = "200" ] && [ -n "$listed" ] && echo 0 || echo 1)" \
+    "a player reads their own keys by fingerprint" "got $status: $listed"
+check "$([ "$leaked" = "0" ] && echo 0 || echo 1)" \
+    "and the listing carries no key itself" "found it $leaked time(s)"
+check "$(echo "$listed" | grep -q '"current": *true' && echo 0 || echo 1)" \
+    "the key the request came with is marked as this one" "got $listed"
+
+status="$(post "$KEY" "/keys/$FP" '{"label":"e2e console"}')"
+named="$(python3 -c "$mine" "$WORK/body" "$FP")"
+check "$([ "$status" = "200" ] && echo "$named" | grep -q 'e2e console' && echo 0 || echo 1)" \
+    "a key can be renamed through the bridge" "got $status: $named"
+
+# Another player's key is not theirs to touch, and the answer must not even admit it
+# exists: the same 404 as a fingerprint nobody was ever issued.
+status="$(post "$MEMBER_KEY" "/keys/$FP" '{"label":"mine now"}')"
+check "$([ "$status" = "404" ] && echo 0 || echo 1)" \
+    "and not by anybody else" "got $status: $(code)"
+
+status="$(post "$MEMBER_KEY" "/keys/$MEMBER_FP/delete" '{}')"
+gone="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(1 if b.get("wasCurrent") and not b["keys"] else 0)')"
+check "$([ "$status" = "200" ] && [ "$gone" = "1" ] && echo 0 || echo 1)" \
+    "a player revokes their own key, and is told it was the one they were holding" \
+    "got $status, $gone"
+
+status="$(get "$MEMBER_KEY" /keys)"
+check "$([ "$status" = "401" ] && echo 0 || echo 1)" \
+    "after which the mod itself no longer answers it" "got $status: $(code)"
+
 # #### Enrolment #### --
 #
 # Which keys the background services may call the API with. Nothing is listed in .env any

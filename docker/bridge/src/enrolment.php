@@ -265,7 +265,7 @@ final class Enrolment
     /**
      * Change the services on an enrolment already held, without the key being sent again.
      *
-     * This is what the toggles on the console's Alerts tab use. It cannot create a row -
+     * This is what the toggles on the console's Keys tab use. It cannot create a row -
      * there is no key to store - and it is scoped to the player, so an id is only useful
      * to whoever it belongs to.
      *
@@ -342,7 +342,7 @@ final class Enrolment
         // Epoch seconds, as everything else the bridge hands a client is: a client that
         // has to parse a Postgres timestamp string gets the timezone wrong sooner or later.
         $rows = Db::connect()->prepare(
-            'SELECT key_hash, label, poll, notify, failures, error,
+            'SELECT key_hash, secret, label, poll, notify, failures, error,
                     EXTRACT(EPOCH FROM enrolled_at)::bigint AS enrolled,
                     EXTRACT(EPOCH FROM used_at)::bigint AS used
              FROM service_keys WHERE player = :p ORDER BY enrolled_at'
@@ -351,6 +351,11 @@ final class Enrolment
 
         return array_map(static fn (array $row): array => [
             'id' => (string) $row['key_hash'],
+            // Derived rather than stored, so it costs no column and no migration, and so
+            // a row nobody can decrypt any more simply has none. It is the same handle
+            // the mod prints for that key, which is the only thing tying a row here to a
+            // key in the game: the id is a hash the mod never shows.
+            'fingerprint' => self::fingerprint(self::open((string) $row['secret'])),
             'label' => (string) $row['label'],
             'poll' => self::truthy($row['poll']),
             'notify' => self::truthy($row['notify']),
@@ -359,6 +364,23 @@ final class Enrolment
             'failures' => (int) $row['failures'],
             'error' => (string) $row['error'],
         ], $rows->fetchAll());
+    }
+
+    /**
+     * The mod's own short handle for a key: the first 8 characters after the `avo_`
+     * prefix. Safe to show - 8 of 64 hex characters reconstruct nothing - and it is what
+     * /apikey list and the console's Keys tab print, so a player can match an enrolment
+     * to the key it is.
+     */
+    public static function fingerprint(?string $key): string
+    {
+        if ($key === null) {
+            return '';
+        }
+
+        $body = str_contains($key, '_') ? substr($key, strpos($key, '_') + 1) : $key;
+
+        return substr($body, 0, 8);
     }
 
     /** @return array<string, mixed>|null */

@@ -21,6 +21,69 @@ Service metadata. Call it first to check the API version.
 means a mod older than the field. The bundled bridge decides who may read an alliance's
 shared history off it; see [Storage and privacy](#storage-and-privacy).
 
+## Keys
+
+A player's own API keys, so a console can name and retire them without the game's chat
+window. Keys belong to a player, never to an alliance, so `?owner=` means nothing here and
+one player's keys are invisible to every other.
+
+**Creating a key is deliberately not on the API.** It stays `/apikey new` in game chat. A
+key already grants everything this API can do, so one that could mint another would
+outlive its own revocation: whoever took it simply makes a second while you delete the
+first. The owner's chat window is the one place a stolen key cannot reach, which is why a
+key is born there and only the rest of its life is here.
+
+Nothing here ever returns a key. A key is identified by its **fingerprint**: the first
+eight characters of its hex body, the same handle `/apikey list` prints.
+
+### GET /keys
+
+```json
+{
+  "keys": [
+    {"fingerprint": "1a2b3c4d", "label": "my console", "created": 1234.5, "current": true}
+  ],
+  "now": 4820.5,
+  "maxLabel": 48
+}
+```
+
+`current` marks the key this very request arrived with, so a client can say so before
+revoking it.
+
+`created` is the server's uptime when the key was made, and `now` is the uptime as the
+answer was written: the engine gives a script no wall clock, so the two together order
+keys within one server run and say nothing across a restart. The bundled console shows no
+dates for that reason, and lists keys oldest first.
+
+### POST /keys/{fingerprint}
+
+```json
+{"label": "the poller"}
+```
+
+Renames one. The label is trimmed, may be empty, is at most `maxLabel` characters and may
+not contain control characters - it is shown in chat and written into the key file on
+disk. Answers the same body as `GET /keys`. `404 unknown_key` if the caller owns no such
+key, which is also the answer for a key belonging to somebody else.
+
+The file the mod wrote the key to when it was made keeps the label it had then; it exists
+to be copied out of once, not as a second copy of this list.
+
+### POST /keys/{fingerprint}/delete
+
+Revokes one, at once and for good. Answers `GET /keys`' body plus:
+
+```json
+{"revoked": "1a2b3c4d", "wasCurrent": true}
+```
+
+Revoking the key the call was made with is allowed - it is how a console retires the key
+it is holding - and `wasCurrent` says it happened, because every later call with that key
+is a `401`. A key the bridge is holding for a background service should be withdrawn with
+[`POST /services/forget`](#post-servicesforget) too, or the poller spends its passes
+collecting `401`s; the bundled console does both.
+
 ## GET /ships
 
 Lists owned craft. Reads the ship database, so it works for craft in unloaded sectors
@@ -2734,11 +2797,17 @@ The catalogue, plus this player's own enrolments. Never anybody else's.
 {
   "services": {"poll": {}, "notify": {}},
   "enrolled": [
-    {"id": "9f86d081...", "label": "my fleet", "poll": true, "notify": false,
-     "enrolledAt": 1730000000, "usedAt": 1730000600, "failures": 0, "error": ""}
+    {"id": "9f86d081...", "fingerprint": "1a2b3c4d", "label": "my fleet",
+     "poll": true, "notify": false, "enrolledAt": 1730000000, "usedAt": 1730000600,
+     "failures": 0, "error": ""}
   ]
 }
 ```
+
+`fingerprint` is the mod's own handle for that key, the one [`GET /keys`](#get-keys) and
+`/apikey list` print. It is derived from the stored key rather than kept in a column, so
+it is empty for a row the bridge can no longer decrypt. It is the only thing tying a row
+here to a key in the game: `id` is a hash of the key, which the mod never shows anybody.
 
 `usedAt` is the last pass that worked. `failures` and `error` are the last one that did
 not, which is how a player finds out their key was revoked rather than wondering why

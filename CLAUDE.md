@@ -39,7 +39,8 @@ data/scripts/                   everything the game loads
                                 (move goods, dock/fly into reach) run on the ship
   lib/tradingmanager.lua        APPENDED onto vanilla: hands TradingManager to stationhooks
   entity/merchants/factory.lua  APPENDED onto vanilla: hands production locals to stationhooks
-  commands/apikey.lua           /apikey chat command (new/list/revoke keys)
+  commands/apikey.lua           /apikey chat command (new/list/revoke keys); making a key
+                                lives here and nowhere else, see handlers/keys.lua
   galaxy/automationapi/bridge.lua   Galaxy script: transport loop, auth, router, all reads,
                                     job queue for writes, stats console line
   player/automationapi/agent.lua    Player/Alliance script: executes write jobs (Simulation
@@ -76,6 +77,9 @@ data/scripts/                   everything the game loads
                       (boss + loot + carrier in a sector, prints engine answers)
     handlers/         one module per endpoint group, each exposes .register(router)
       meta.lua              GET /ping
+      keys.lua              /keys: the caller's own API keys, renamed and revoked. NOT
+                            created - that stays /apikey new, so a stolen key cannot
+                            outlive its own revocation
       ships.lua             /ships, /ships/{name}, /ships/{name}/events
       missions.lua          catalog, preview, start, status, recall, collect; owns
                             Missions.enqueue (job queue) + Missions.tick
@@ -119,14 +123,15 @@ web/                            browser console, no build step, no deps, NOT shi
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (fleet, missions, orders + standing orders incl. flee,
               cargo transfer, Automation tab (programs + mission rules + standing orders per
-              craft), Alerts tab (background service enrolment + push channels + rules, all
-              off the bridge), economy + station activity log (live feed merged with
-              history), industry)
+              craft), Keys tab (the player's API keys off /keys + background service
+              enrolment off /services), Alerts tab (push channels + rules, off the bridge),
+              economy + station activity log (live feed merged with history), industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/
   mock_avorion.lua   hostile mock of the sandbox (Mock.install/reset/addPlayer/addAlliance/
                      addShip/addKnownSector/addPredictedSector/setOffline/setOnline/setClock)
   test_*.lua         one per area; dofile the real bridge.lua and drive requests
+                     (test_keys.lua covers /keys, which the console's Keys tab drives)
   test_history.php   history store against real Postgres (via tools/dbtest.sh)
   test_notifications.php  notification rules and delivery, same Postgres, same script;
                      delivery is checked against PHP's own web server on localhost

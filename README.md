@@ -142,6 +142,10 @@ In game, run `/apikey new` to get a key. It is shown once. To let non-admins run
 command, add `<command name="apikey"/>` to `defaultAuthorizationGroup` in
 `<galaxy>/admin.xml`.
 
+Making a key is the only part that has to happen in game. Naming, checking and revoking
+your keys are on the console's **Keys** tab and at [`/keys`](docs/api.md#keys) - see
+[Managing your keys](#managing-your-keys).
+
 The mod is `serverSideOnly`, so clients do not download it and do not need it installed.
 
 ### 4. Run a bridge process
@@ -222,6 +226,10 @@ The standing orders on the **Orders** and **Automation** tabs include **break of
 set a hull or shield threshold in percent and where the craft should go, and it clears its
 chain and jumps out rather than dying where it stands. Beside it the console shows the hull
 and shield the craft itself last published, and how its last run ended.
+
+The **Keys** tab is your credentials: the API keys the mod issued you, and which of them
+the bridge's background services are allowed to call the API with. See
+[Managing your keys](#managing-your-keys) and [Enrolling a key](#enrolling-a-key).
 
 The **Alerts** tab is where push notifications are set up - channels, rules and what has
 already been sent. It reads its whole form from the bridge, so it offers whatever that
@@ -341,7 +349,7 @@ A few things to know about it:
 - **Nothing in the mod pushes.** Movement is only recorded when something asks for `/ships`,
   and the mod's own event log is a 200-entry ring buffer that drops its oldest entry whether
   or not anyone collected it. The `poller` service is what keeps something asking - and it
-  only does so for players who have enrolled a key, on the console's **Alerts** tab under
+  only does so for players who have enrolled a key, on the console's **Keys** tab under
   *Background services*. Without that the history only covers the moments a console
   happened to be open, and dwell is reported as *observed* seconds rather than guessed at
   either way.
@@ -397,15 +405,29 @@ still yours, sent to your channels; another member configures their own and sees
 yours. Channel tokens are never handed back out by the API.
 
 Set them up on the console's **Alerts** tab, or through
-[`/notifications`](docs/api.md#push-notifications). Unlike the poller, one member is *not*
+[`/notifications`](docs/api.md#push-notifications). Nothing is sent until a key of yours
+is enrolled for alerts - see [Enrolling a key](#enrolling-a-key). Unlike the poller, one member is *not*
 enough for an alliance - each player who wants alerts enrols themselves, because a rule is
 theirs and goes to their channels.
+
+## Managing your keys
+
+A key is not a password: it is the whole account, and anything holding one can do
+everything to your craft that you can. The console's **Keys** tab lists yours by
+fingerprint - the eight characters `/apikey list` prints - says which one the page itself
+is using and what the background services are doing with each, lets you name them, and
+revokes them. The same is at [`/keys`](docs/api.md#keys).
+
+New keys are only ever made in game, with `/apikey new`. That is deliberate: a key that
+could mint another could never really be revoked, because whoever took it would just make
+a second one while you deleted the first. Your chat window is the one place a stolen key
+cannot reach.
 
 ## Enrolling a key
 
 The poller and the notifier are ordinary API clients: they make the same calls the console
 does, so they need one of your keys to make them with. You give them one on the console's
-**Alerts** tab under *Background services*, or at
+**Keys** tab under *Background services*, or at
 [`/services`](docs/api.md#background-services), and pick the two opt-ins separately -
 *record my fleet* and *send me alerts* are different things to want.
 
@@ -444,6 +466,7 @@ Full reference in [docs/api.md](docs/api.md).
 | endpoint | |
 |---|---|
 | `GET /ping` | service metadata and API version |
+| `GET /keys`, `POST /keys/{fingerprint}`, `.../delete` | your own API keys: list, rename, revoke (new ones are `/apikey new` in game) |
 | `GET /ships` | owned craft, with the usability check every mission runs first |
 | `GET /ships/{name}` | captain, crew, cargo, turrets, systems, hyperspace, requirements |
 | `GET /missions`, `GET /ships/{name}/missions` | mission catalog, resolved for one ship |

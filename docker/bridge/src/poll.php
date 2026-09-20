@@ -20,7 +20,7 @@ declare(strict_types=1);
  * ### Whose fleets
  *
  * The keys come out of the database - the `service_keys` table, filled in by players
- * opting in from the console's Alerts tab. See src/enrolment.php. They are re-read at the
+ * opting in from the console's Keys tab. See src/enrolment.php. They are re-read at the
  * top of every pass, so enrolling takes effect within one interval and this service never
  * needs restarting; and with nobody enrolled it idles quietly rather than exiting, since
  * somebody may enrol a minute from now.
@@ -337,7 +337,7 @@ function announce(array $enrolled, ?string &$last): void
     }
     if (count($enrolled['keys']) === 0 && $enrolled['sealed'] === 0) {
         $note .= '. Nothing is being recorded. A player enrols their key on the console\'s '
-               . 'Alerts tab, under Background services.';
+               . 'Keys tab, under Background services.';
     }
 
     if ($note !== $last) {

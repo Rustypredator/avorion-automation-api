@@ -135,6 +135,13 @@ check(is_string($json) && !str_contains($json, $aliceKey),
 check(($mine[0]['id'] ?? '') === hash('sha256', $aliceKey),
       'the id being the same hash api_keys stores, which is not the key');
 
+// The one handle a player can match against what /apikey list and the console's Keys tab
+// show them. 8 of 64 hex characters, so it identifies a key without being one.
+check(($mine[0]['fingerprint'] ?? '') === substr($aliceKey, 4, 8),
+      'and the mod\'s own fingerprint alongside, so the row can be told which key it is');
+check(is_string($json) && !str_contains($json, substr($aliceKey, 12)),
+      'which is still nothing like enough to rebuild the key from');
+
 echo "\nwhat the services read\n";
 
 $forPoll = Enrolment::keysFor('poll');
