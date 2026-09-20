@@ -34,7 +34,8 @@ data/scripts/                   everything the game loads
   entity/orderchain.lua         APPENDED onto vanilla orderchain.lua (wraps updateServer,
                                 getOrderInfo, secure, restore): route plans, enemy
                                 handling, standing orders (enemies/loot, idle or
-                                interrupt+resume), boss farming, cargo transfers
+                                interrupt+resume; flee, which outranks everything), hull
+                                and shield telemetry, boss farming, cargo transfers
                                 (move goods, dock/fly into reach) run on the ship
   lib/tradingmanager.lua        APPENDED onto vanilla: hands TradingManager to stationhooks
   entity/merchants/factory.lua  APPENDED onto vanilla: hands production locals to stationhooks
@@ -97,24 +98,31 @@ docs/
 docker/                         deployment only, NOT shipped to Workshop
   docker-compose.yml            services: api (FrankenPHP bridge), db (Postgres), poller, init
   Caddyfile, .env.example       plain HTTP site + self-signed HTTPS site (TLS_HOSTS)
-  bridge/public/index.php       HTTP <-> file relay, serves /history/*, records history
+  bridge/public/index.php       HTTP <-> file relay, serves /history/* and /notifications/*
   bridge/src/db.php             PDO connection + schema/migrations
   bridge/src/history.php        history store: visits, events, station/faction samples, manifests,
                                 station events (all rows owned by faction, see Storage in api.md)
+  bridge/src/notifications.php  push notification store + rule engine (rows owned by PLAYER,
+                                not faction: whose phone buzzes is not shared by an alliance)
+  bridge/src/push.php           the ntfy / gotify / webhook drivers, and channel validation
+  bridge/src/notify.php         notifier loop (NOTIFY_KEYS, defaults to POLL_KEYS): evaluates
+                                rules over the `events` table + one /ships call, then delivers
   bridge/src/poll.php           poller loop (POLL_KEYS) calling the API over HTTP
 web/                            browser console, no build step, no deps, NOT shipped
   index.html, app.css
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
-  app.js      the whole console UI (~7.4k lines: fleet, missions, orders + standing orders,
+  app.js      the whole console UI (fleet, missions, orders + standing orders incl. flee,
               cargo transfer, Automation tab (programs + mission rules + standing orders per
-              craft), economy + station activity log (live feed merged with history),
-              industry)
+              craft), Alerts tab (push channels + rules, off the bridge), economy + station
+              activity log (live feed merged with history), industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/
   mock_avorion.lua   hostile mock of the sandbox (Mock.install/reset/addPlayer/addAlliance/
                      addShip/addKnownSector/addPredictedSector/setOffline/setOnline/setClock)
   test_*.lua         one per area; dofile the real bridge.lua and drive requests
   test_history.php   history store against real Postgres (via tools/dbtest.sh)
+  test_notifications.php  notification rules and delivery, same Postgres, same script;
+                     delivery is checked against PHP's own web server on localhost
   test_console.js    web console under jsdom (via tools/uitest.sh)
 tools/
   bump.sh       set version everywhere
@@ -193,7 +201,7 @@ tools/
 # all Lua tests (from repo root; each exits non-zero on failure)
 for t in tests/test_*.lua; do lua5.4 "$t" || echo "FAILED: $t"; done
 
-tools/dbtest.sh    # PHP history store (needs docker)
+tools/dbtest.sh    # PHP history store and notification rules (needs docker)
 tools/uitest.sh    # web console under jsdom (needs docker)
 tools/e2e.sh       # full docker stack against fakeserver (needs docker + lua)
 tools/localserver.sh start   # real game server on the test galaxy, see docs/local-testing.md

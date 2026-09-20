@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.6.2](https://img.shields.io/badge/version-0.6.2-8957e5)](modinfo.lua)
+[![version 0.7.0](https://img.shields.io/badge/version-0.7.0-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -35,6 +35,10 @@ galaxy map.
   in no man's space, and have the ship fight, hold or press on when enemies show up on the way
 - farm bosses: loop jumps through empty space in the AI or Swoks ring while you fly the ship; the ship recognises the boss, sends fighters for the loot and sits out the 30 minute cooldown after a kill
 - let idle ships defend themselves: aggressive while enemies are in the sector, idle after
+- and let them know when to stop: below a hull or shield threshold a ship breaks off and
+  runs for known space, friendly space, one of your stations or a named location
+- get told about it while you are away from the machine: the bridge pushes to ntfy, Gotify
+  or a webhook when a craft is attacked, is losing a fight, runs, goes idle or goes missing
 - query known sectors, and predict unvisited ones straight from the galaxy seed
 - read your stations' books - production chain, stock, and what each one has earned - and
   keep a series of them, so a lifetime total becomes credits an hour
@@ -112,7 +116,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.6.2 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.7.0 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -213,6 +217,15 @@ an optional one is left behind when it is not. **Test limits** runs the check wi
 starting anything and lists every option it weighed with why each would or would not go. Once
 saved, the mod does the rest; the fleet list badges each automated craft with what its rule is
 doing, and every alliance member's console shows the same rules and state.
+
+The standing orders on the **Orders** and **Automation** tabs include **break off and run**:
+set a hull or shield threshold in percent and where the craft should go, and it clears its
+chain and jumps out rather than dying where it stands. Beside it the console shows the hull
+and shield the craft itself last published, and how its last run ended.
+
+The **Alerts** tab is where push notifications are set up - channels, rules and what has
+already been sent. It reads its whole form from the bridge, so it offers whatever that
+bridge knows how to watch and send to.
 
 The **Industry** tab puts those lines together, one sector at a time. Each station in the
 sector is a card with its ingredients down one edge and its results down the other, wired
@@ -358,6 +371,40 @@ station per `HISTORY_ECONOMY_INTERVAL` (default 300s) - the mod reads a station'
 of its database row, and the game only rewrites that row when it saves, so a faster sample
 is a copy of the last one.
 
+## Push notifications
+
+Avorion is a game you leave running, and the console's browser notifications only reach a
+tab that is open on a machine that is awake. So the bridge does the other half: it watches
+what the poller has already recorded and pushes an alert to **ntfy**, **Gotify** or a
+**webhook** - a self-hosted or free service with a phone app, or anything else you can point
+a JSON POST at.
+
+Nothing new is asked of the game. Every alert is built from rows the history store already
+holds, plus one craft listing per key per pass, so the game server pays nothing for it.
+
+Nine things a rule can watch: a craft coming **under attack**, its **hull** or **shield**
+falling below a fraction of its own maximum, it **breaking off and running** (and where it
+got to), going **out of orders**, a **route or boss loop ending**, a **boss** spawning or
+dying, its **status line** matching some text, and a craft **going missing** from the fleet.
+Thresholds fire on the way down and rearm once the craft has recovered, and every rule has a
+quiet period, so one long fight is one buzz rather than forty.
+
+Rules and channels belong to a player, not to a faction - which is the opposite of
+everything else the bridge stores, and right here: what a craft did is shared by an
+alliance, but whose phone buzzes is not. A rule can widen to your alliance's craft and is
+still yours, sent to your channels; another member configures their own and sees nothing of
+yours. Channel tokens are never handed back out by the API.
+
+Set them up on the console's **Alerts** tab, or through
+[`/notifications`](docs/api.md#push-notifications). The deployment side is one setting:
+`NOTIFY_KEYS` in `.env`, which defaults to `POLL_KEYS`. Unlike the poller, one member's key
+is *not* enough for an alliance - each player who wants alerts needs their own key listed.
+
+An alert is never quicker than the poller, and a craft records nothing while its owner is
+logged out, so nothing about it can raise one then. That is the same limit the history store
+has, and it is worth knowing, because a missed alert is more surprising than a gap in a
+heatmap.
+
 ## Endpoints
 
 Full reference in [docs/api.md](docs/api.md).
@@ -381,7 +428,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `POST /ships/{name}/orders` | in-sector order chain: jump, patrol, repair, mine, ... |
 | `POST /ships/{name}/route` | plan a route with preferences and fly it as an order chain |
 | `POST /ships/{name}/farm` | boss farming: loop through empty space in a boss ring |
-| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, standing orders (fight enemies, collect loot), stop |
+| `GET`/`POST /ships/{name}/automation`, `.../stop` | the ship's plan, standing orders (fight enemies, collect loot, break off and run), stop |
 | `GET`/`POST /ships/{name}/transfer` | cargo transfer: the holds a craft could trade with, and moving goods into or out of another craft of yours or your alliance |
 | `GET /ships/{name}/events` | what the ship has actually been doing |
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
@@ -391,6 +438,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
 | `GET /history/*` | where the fleet has been, and what its stations earned - served by the bridge, not the mod |
+| `GET`/`POST /notifications/*` | push notification channels and rules - also the bridge's, not the mod's |
 
 ## What needs the owner online
 
@@ -412,6 +460,12 @@ logs out. `recording` and `watchers` on the event feed say which case you are in
 has to stay connected - but each start it makes is still a start, and waits until the owner
 (or, for alliance craft, any member) is in game.
 
+**Push notifications** are the bridge's own and need no client either, but they are built
+out of what the poller collected, so they inherit the line above: an alert about a craft's
+orders, its fights or its flee comes from the event feed, and that goes quiet when nobody
+who could record it is in game. Hull, shield and a craft going missing come from the ship
+database instead, and keep working on an empty server.
+
 Ship *positions* need nobody at all: they come from the ship database, which is why the
 bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 
@@ -419,7 +473,7 @@ bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 
 | | |
 |---|---|
-| [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape |
+| [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape, including the bridge's `/history` and `/notifications` |
 | [docs/protocol.md](docs/protocol.md) | the file transport, envelopes, status codes, auth |
 | [docs/external.md](docs/external.md) | writing the bridge process and clients against it |
 | [docs/local-testing.md](docs/local-testing.md) | a local server, the bridge over HTTPS, and the boss lab |

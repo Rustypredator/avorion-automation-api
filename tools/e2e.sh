@@ -332,6 +332,58 @@ logs="$("${COMPOSE[@]}" logs poller 2>&1 | tail -20)"
 check "$(echo "$logs" | grep -q 'polling 1 key' && echo 0 || echo 1)" \
     "and says what it is polling on startup" "$(echo "$logs" | tail -3)"
 
+# #### Notifications #### --
+#
+# The bridge's own, like the history: rules over what the poller recorded, pushed out over
+# HTTP. Delivery and the rule engine are covered against a real database and a real web
+# server by tests/test_notifications.php; what only a stack can prove is that the service
+# comes up with the compose wiring it was given, and that the endpoints are served.
+
+echo
+echo "notifications"
+
+post() {
+    curl -s -m 40 -o "$WORK/body" -w '%{http_code}' -X POST \
+        -H "X-API-Key: $1" -H 'Content-Type: application/json' \
+        -d "$3" "http://127.0.0.1:$PORT$2"
+}
+
+status="$(post "$KEY" /notifications/channels \
+    '{"name":"Sink","kind":"webhook","url":"http://127.0.0.1:9/nowhere"}')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" \
+    "a channel is saved through the bridge" "got $status: $(code)"
+
+status="$(post "$KEY" /notifications/rules \
+    '{"name":"Hurt","kind":"hull","config":{"below":0.4},"quiet":0}')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" \
+    "and a rule over it" "got $status: $(code)"
+
+status="$(post "$KEY" /notifications/channels \
+    '{"name":"Bad","kind":"ntfy","url":"https://ntfy.sh"}')"
+check "$([ "$status" = "400" ] && echo 0 || echo 1)" \
+    "a channel the bridge cannot use is refused where it is made" "got $status: $(code)"
+
+status="$(get "$KEY" /notifications)"
+token="$(json 'import json,sys;b=json.load(open(sys.argv[1]));print(b["channels"][0].get("token","-"))')"
+check "$([ "$status" = "200" ] && [ "$token" = "-" ] && echo 0 || echo 1)" \
+    "the summary reads back without ever carrying a channel token" "got $status, token '$token'"
+
+status="$(get none /notifications)"
+check "$([ "$status" = "401" ] && echo 0 || echo 1)" \
+    "and a key the mod does not know configures nothing" "got $status: $(code)"
+
+echo "NOTIFY_KEYS=$KEY" >> "$WORK/env"
+"${COMPOSE[@]}" up -d notifier >/dev/null 2>&1
+
+for _ in $(seq 1 30); do
+    logs="$("${COMPOSE[@]}" logs notifier 2>&1 | tail -20)"
+    echo "$logs" | grep -q 'watching 1 key' && break
+    sleep 1
+done
+
+check "$(echo "$logs" | grep -q 'watching 1 key' && echo 0 || echo 1)" \
+    "the notifier service comes up and says what it is watching" "$(echo "$logs" | tail -3)"
+
 # #### Self-healing #### --
 #
 # The mod re-creates its directories every 30s. A bind mount binds an inode, so mounting

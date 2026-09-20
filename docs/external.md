@@ -372,6 +372,29 @@ whenever the caller has also seen the sector; when it is there, trust it over th
 Predicted searches are capped at 10000 sectors and answer partially rather than failing:
 check `truncated`, which is `false` or one of `"limit"`, `"budget"`, `"timeout"`.
 
+### Telling a player something while they are away
+
+Everything above is a client asking. The one thing this API cannot do is reach somebody who
+is not looking at it: the mod has no socket, so nothing is ever pushed to you either.
+
+A bridge is where that belongs, and the bundled one does it - `/notifications/*`, rules over
+what it has already recorded, delivered to ntfy, Gotify or a webhook. If you are writing your
+own, the pieces to build it out of are `GET /ships`, which carries each craft's position,
+status and `condition` (hull and shield) and keeps answering with every player logged out,
+and `GET /ships/{name}/events`, whose `automation` payload carries the craft's live state -
+enemies in its sector, its `vitals`, a flee in progress, a plan ending.
+
+Two things to get right, learned the hard way:
+
+- **Fire on the edge, not on the state.** A craft under fire republishes for as long as the
+  fight lasts. A rule that sends on every event sends forty times; one that sends on the
+  change from quiet to not sends once. For a value that moves - hull, shield - rearm only
+  once it has recovered past the threshold by a margin, or a craft sitting on the line
+  buzzes every pass.
+- **Start from now.** The first time a rule runs it has a whole history in front of it.
+  Take the cursor to the newest event and send nothing, or the first rule anybody writes
+  replays a month onto their phone.
+
 ## Skipping HTTP
 
 A client on the server machine can implement the six-step transaction directly and drop the

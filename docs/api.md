@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.6.2", "game": "2.5.13",
+  "api": 1, "mod": "0.7.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true,
@@ -43,13 +43,22 @@ and while the owning player is offline.
       "availability": "Available",
       "status": "Idle",
       "usable": {"ok": true},
-      "hasCaptain": true
+      "hasCaptain": true,
+      "condition": {"hull": 0.87, "shield": 1}
     }
   ]
 }
 ```
 
 `availability` is `Available`, `InBackground` (out on a captain mission) or `Destroyed`.
+
+`condition` is how much of the hull and of the shield is left, each as a fraction of that
+craft's own maximum, so "which of my craft is hurt" is one call rather than one per craft.
+Either half is absent where the database row will not say, and the whole field is absent
+for a craft with no row. It comes out of the ship database, which the game rewrites when it
+saves or when the sector unloads - a craft being shot at right now reports live on its own
+automation feed instead, as `automation.vitals` in
+[GET /ships/{name}/automation](#get-shipsnameautomation).
 
 `hasCaptain` says whether the craft has a captain in command. For a station, whose `usable`
 is always `NotAShip`, it is what decides whether it can be automated: a station with a
@@ -1164,11 +1173,14 @@ What the ship's automation is doing, as the ship itself last reported it.
 {
   "ship": "Ore Hound", "source": "live", "reported": true,
   "automation": {
-    "version": 1,
+    "version": 2,
     "standing": {"enemies": {"enabled": true, "mode": "interrupt"},
-                 "loot": {"enabled": true, "mode": "idle"}},
+                 "loot": {"enabled": true, "mode": "idle"},
+                 "flee": {"enabled": true, "hull": 0.4, "shield": 0,
+                          "requireEnemies": true, "hops": 1, "to": {"kind": "known"}}},
     "autoAggressive": true, "attackCivilians": false,
     "enemies": false, "defenceFights": 3, "lootRuns": 5,
+    "vitals": {"hull": 0.65, "shield": 1},
     "sector": {"x": 290, "y": 1},
     "plan": {
       "id": "p5-7322", "kind": "farm", "phase": "running", "onEnemies": "fight",
@@ -1200,7 +1212,10 @@ What the ship's automation is doing, as the ship itself last reported it.
 | `plan.lootResult` | farms: how the last looting ended - `collected`, `stalled`, `timeout`, `no_launch`, `no_fighters`; `_recalled` appended when stragglers had to be pulled in |
 | `plan.hop` | the hop being flown, 1-based, counting the approach |
 | `last.outcome` | `arrived`, `stopped`, `replaced` (other orders took over), `refused`, `resume_failed`, `pilot_left` |
-| `standing` | the ship's standing orders, `enemies` and `loot`, each `{enabled, mode}`. Absent on ships running a mod version from before standing orders |
+| `standing` | the ship's standing orders. `enemies` and `loot` are each `{enabled, mode}`; `flee` carries thresholds and a destination instead, see [POST /ships/{name}/automation](#post-shipsnameautomation). Absent on ships running a mod version from before standing orders, and `standing.flee` absent on those from before the flee order |
+| `vitals` | hull and shield as fractions of this craft's own maximum, as the craft itself reports them. Rounded to 5% and rate limited, because every publish is an event in the craft's feed - so it is a condition reading, not a damage meter. Absent until the craft has published one, which it only does while it is hurt or has some automation switched on |
+| `flee` | the flee order taking the craft out of a fight right now: `{reason, phase, hops, hopsLeft, from, target, hull, shield, to}`. `reason` is `hull` or `shield`; `phase` is `jumping`, or `stuck` when it has nowhere to go yet. Absent when there is none, and it is never alongside a `reaction` |
+| `lastFlee` | how the last one went: `{reason, outcome, detail, hops, from, sector, hull, shield}`. `outcome` is `arrived` (where it was sent), `escaped` (out, short of the destination), `failed` (never got away - `detail` says why), `stopped`, `switched_off` or `replaced` |
 | `autoAggressive` | kept for older clients: `standing.enemies.enabled` |
 | `reaction` | a standing order holding the ship right now: `{kind, mode, phase, resumes, loot, lootResult}`. `phase` is `fighting`, `looting` or `returning`; `resumes` says whether an interrupted chain comes back afterwards. Absent when there is none, and never alongside `plan` |
 | `lastReaction.outcome` | `done`, `replaced` (orders from elsewhere; the old chain is not put back), `switched_off` (the chain is put back), `stopped` |
@@ -1219,8 +1234,9 @@ loaded.
 |---|---|
 | `enemies` | turns aggressive while enemies are in the sector, until it has been clear for five seconds |
 | `loot` | sends every squad for loot in the sector, then waits for the fighters to land. Needs fighters aboard; cargo drops only count with a transporter block and Transporter Software (rare or better). Never under fire. Loot that could not all be taken (a stall, fighters that would not launch) is left alone in that sector for two minutes |
+| `flee` | breaks off and jumps out when the craft's hull or shield falls below a threshold. See [the flee order](#the-flee-order) below |
 
-Each has a `mode`:
+`enemies` and `loot` each have a `mode`:
 
 | mode | when it may take the ship |
 |---|---|
@@ -1242,11 +1258,59 @@ off while it holds the ship ends it and puts the chain back.
 {
   "standing": {
     "enemies": {"enabled": true, "mode": "interrupt"},
-    "loot": {"enabled": true}
+    "loot": {"enabled": true},
+    "flee": {
+      "enabled": true,
+      "hull": 0.4,
+      "shield": 0,
+      "requireEnemies": true,
+      "hops": 1,
+      "to": {"kind": "known"}
+    }
   },
   "attackCivilians": false
 }
 ```
+
+### The flee order
+
+`standing.flee` takes a craft out of a fight it is losing. It has no `mode`: it outranks
+everything - a planned route, a boss farm, a fight it was told to pick, a cargo transfer on
+its way - because none of those matter once the craft is about to be lost. Unlike the other
+two it never puts the interrupted chain back: those orders are what flew it into the fight.
+
+| field | notes |
+|---|---|
+| `enabled` | whether the order is on |
+| `hull` | flee below this fraction of the craft's own maximum hull. `0` does not watch the hull |
+| `shield` | the same for the shield. At least one of the two has to be set, or nothing would ever fire |
+| `requireEnemies` | only flee while there are enemies in the sector (the default). `false` flees on the threshold alone, which catches a craft bleeding out after a fight |
+| `hops` | the most jumps one flee may make, 1 to 10. Only meaningful for the destinations that can be further than one jump |
+| `to` | where to run; see below |
+
+A threshold is a fraction from 0 to 1, so one rule fits a freighter and a battleship.
+Anything above 1 is read as a percentage, since a fraction cannot be - `81` and `0.81` are
+the same request, and the answer reports the fraction.
+
+`to.kind` is one of:
+
+| kind | where it goes |
+|---|---|
+| `known` | a sector the owner has already been to, inside one jump, picked at random - a predictable bolthole is one an attacker can follow the craft to every time. If the owner knows nowhere in range, any valid sector in range |
+| `safe` | the nearest sector in jump range held by a faction that is not hostile to the owner, which polices it. Falls back to `known` when there is none |
+| `station` | towards the nearest station of the owner or their alliance. `"name": "any"` widens it to the nearest craft of the fleet |
+| `location` | towards a sector from the [location library](#locations), as `"name"`. Checked when the order is set, so a typo is `404 no_such_location` rather than a craft running somewhere unexpected mid-fight |
+| `sector` | towards fixed `x` and `y` |
+
+The last three can be further than one jump, and are walked towards a hop at a time rather
+than routed: the route planner is a galaxy-side search sliced across ticks and a craft being
+shot at cannot wait for one, and a greedy step towards the destination is out of this sector
+either way, which is the urgent half. The flee ends when the craft reaches the destination
+(`arrived`), when it runs out of `hops` short of it (`escaped`), or after four minutes of
+finding nowhere to jump (`failed`).
+
+A destination is replaced whole rather than merged: sending `{"to": {"kind": "known"}}` over
+a `location` destination drops its name.
 
 Every part is optional: an order or field left out stays as the ship has it. `attackCivilians`
 decides whether civilian ships count as enemies, for the standing orders and the ship's enemy
@@ -1260,14 +1324,16 @@ apply, not the captain ones.
 
 Errors: `400 no_settings`, `400 bad_setting`, `400 bad_standing` (not an object, an unknown
 order - `details.known` lists them - or an order that sets nothing), `400 bad_standing_mode`,
-`400 conflicting_settings`.
+`400 conflicting_settings`, `400 bad_threshold` (outside 0 to 100, or an enabled flee order
+with both thresholds at 0), `400 bad_flee_hops`, `400 bad_flee_to` (`details.known` lists the
+kinds), `404 no_such_location`.
 
 **Requires the owning player to be logged in.**
 
 ## POST /ships/{name}/automation/stop
 
-Ends the ship's plan, a standing order holding the ship, or a cargo transfer on its way to its
-target, and clears its order chain. The standing orders are settings and stay as they were.
+Ends the ship's plan, a flee in progress, a standing order holding the ship, or a cargo
+transfer on its way to its target, and clears its order chain. The standing orders are settings and stay as they were.
 Answered once the ship reports it has none of them.
 
 **Requires the owning player to be logged in.**
@@ -1972,8 +2038,9 @@ content cost a full generator run.
 
 # Bridge-local endpoints
 
-Everything above is the mod's. `/history/*` is not: it is answered by the HTTP bridge in
-`docker/bridge/`, out of its own store, and never reaches the game server.
+Everything above is the mod's. `/history/*` and `/notifications/*` are not: they are
+answered by the HTTP bridge in `docker/bridge/`, out of its own store, and never reach the
+game server.
 
 ## Why it is not part of the mod
 
@@ -2375,3 +2442,210 @@ player's rows under every one of their keys.
 
 Alliance history is never cleared: it belongs to every member, and the bridge cannot ask the
 game which of them may delete it. `?owner=alliance` answers `403 history_shared`.
+
+# Push notifications
+
+`/notifications/*` is the bridge's, like `/history/*`. Avorion is a game you leave running,
+and a browser notification only reaches a tab that is open on a machine that is awake -
+which is exactly not the case when a fleet is grinding overnight. These are rules over what
+the bridge has already collected, pushed out to a phone.
+
+## How it works, and what that costs
+
+Nothing new is asked of the game. The mod already publishes everything an alert could be
+built from - each craft's order and status events, whether there are enemies in its sector,
+its hull and shield - and the poller is already collecting all of it into Postgres for the
+history store. A second service, `notifier`, reads those rows, decides what crossed a line
+somebody cared about, and does one HTTP POST per alert. Its one live call is the craft
+listing, once per key per pass.
+
+The consequences are worth stating plainly, because a missed alert is more surprising than
+a gap in a heatmap:
+
+* An alert is never quicker than the poller. `POLL_INTERVAL` is the floor.
+* A craft records nothing while its owner is logged out, because the player scripts that
+  capture its events do not run then. Nothing about it can raise an alert.
+* The deployment has to list a player's API key in `NOTIFY_KEYS` (it defaults to
+  `POLL_KEYS`) for that player's rules to be run at all. Unlike the poller, one member's
+  key is **not** enough for an alliance: a rule belongs to a player.
+
+## Whose they are
+
+A rule and a channel belong to the player an API key is, never to a faction. Everything in
+the history store is the other way round on purpose - what a craft did is shared by an
+alliance - but whose phone buzzes is not. Two members of one alliance want different things
+from the same fleet, and neither should be able to switch the other's alerts off or read
+the other's ntfy token.
+
+A rule can widen its scope to the player's alliance craft with `alliance: true`, and is
+still that player's rule, sent to that player's channels. That needs the mod to confirm the
+membership, so a player who has left stops hearing about the fleet even though they kept
+their key.
+
+Identity comes from the mod, exactly as it does for the history store: the bridge relays a
+`/ping` when its answer about a key is older than `HISTORY_VERIFY_TTL`. A key the mod will
+not vouch for reads and writes nothing, and gets `401 unknown_key`.
+
+## Channels
+
+Where a message goes.
+
+| kind | needs | notes |
+|---|---|---|
+| `ntfy` | `url`, `config.topic` | Free, self-hostable, and an app on both phone platforms. Published as JSON to the server root, so a non-ASCII craft name survives the title. `token` is an access token, or `user:password` |
+| `gotify` | `url`, `token` | Self-hosted. Posted to `/message` with the application token in a header, so it stays out of the push server's access log |
+| `webhook` | `url` | The notification as JSON to any URL, with `config.headers` of your choosing. Discord, Slack, Home Assistant, an Apprise container or a script of your own all live behind this. `token` is sent as `Authorization: Bearer` |
+
+A channel's token is a credential the bridge has to be able to present, so unlike an API
+key it cannot be stored as a hash. It is never handed back out: reads answer `hasToken`
+instead, and a save that leaves `token` out keeps whatever is stored. Send `""` to clear it.
+
+### GET /notifications/channels
+
+```json
+{
+  "channels": [
+    {"name": "Phone", "kind": "ntfy", "url": "https://ntfy.sh",
+     "config": {"topic": "avorion-rusty"}, "enabled": true, "hasToken": true,
+     "updated": 1730000000}
+  ]
+}
+```
+
+### POST /notifications/channels
+
+Creates one, or replaces the one of that name.
+
+```json
+{"name": "Phone", "kind": "ntfy", "url": "https://ntfy.sh",
+ "config": {"topic": "avorion-rusty"}, "token": "tk_...", "enabled": true}
+```
+
+Answers `{"channel": {...}}`. Errors: `400 bad_name`, `400 bad_channel` (an unknown kind, a
+URL that is not `http`/`https`, ntfy without a topic, Gotify without a token, headers that
+are not an object of words to text).
+
+### POST /notifications/channels/delete
+
+`{"name": "Phone"}`. Answers `{"removed": true, "rules": ["Under attack"]}` - the rules that
+named it, which now reach every other channel instead. They are not changed, and not
+silently left sending to nothing either.
+
+### POST /notifications/channels/test
+
+`{"name": "Phone"}`, or no body for every enabled channel. Sent immediately rather than
+queued, since whoever asked is waiting to find out whether the channel works.
+
+```json
+{"results": [{"channel": "Phone", "ok": true, "status": 200, "error": ""}]}
+```
+
+A failure reports the status code and nothing else. The URL is one the player chose, often
+a private address, and returning its body would turn a channel into a way of reading pages
+off the network the bridge sits on.
+
+## Rules
+
+When to send one.
+
+| kind | source | options |
+|---|---|---|
+| `combat` | events | `ends` - also tell me when the fight is over |
+| `hull` | level | `below` - the fraction of hull left |
+| `shield` | level | `below` |
+| `flee` | events | - |
+| `idle` | events | - |
+| `plan` | events | - |
+| `boss` | events | - |
+| `status` | events | `contains` - text to look for in the craft's status line, case insensitive |
+| `gone` | fleet | - |
+
+`source` decides how a rule behaves:
+
+* **level** is a value that moves. It fires on the way down past `below` and rearms only
+  once the craft has recovered 5% past it again, so a craft sitting on the line does not
+  buzz once a pass. `below` takes a fraction or a percentage, like the flee thresholds.
+* **events** is a point in time, out of the craft's event feed, and fires on the edge - a
+  fight starting, a plan ending, a boss going down.
+* **fleet** is the shape of the fleet itself. `gone` fires for a craft that was in the
+  listing and is not any more: destroyed, sold, or handed over. Nothing fires until a
+  craft has been seen at least once, and an empty listing raises nothing at all - that is
+  far more likely to be the mod reloading than a fleet wiped out in one pass. It also
+  fires if you leave the alliance whose craft it was.
+
+Every rule has a `quiet` period, in seconds: the floor between two of that rule about one
+craft. A fight is a long sequence of events and none of them is worth a second buzz.
+
+A player evaluated for the first time starts from now. Writing a first rule does not replay
+a month of history onto a phone.
+
+### GET /notifications/rules
+
+```json
+{
+  "rules": [
+    {"id": 3, "name": "Losing a fight", "kind": "hull", "enabled": true,
+     "ship": "", "alliance": false, "config": {"below": 0.4},
+     "channels": ["Phone"], "priority": 4, "quiet": 300, "updated": 1730000000}
+  ]
+}
+```
+
+### POST /notifications/rules
+
+Creates one, or replaces the one of that name.
+
+```jsonc
+{
+  "name": "Losing a fight",
+  "kind": "hull",
+  "config": {"below": 0.4},
+  "ship": "",            // "" is every craft in scope
+  "alliance": false,     // also watch the alliance's craft
+  "channels": [],        // [] is every channel the player has
+  "priority": 4,         // 1 to 5; mapped onto whatever the service uses
+  "quiet": 300,
+  "enabled": true
+}
+```
+
+Answers `{"rule": {...}}`. Errors: `400 bad_name`, `400 bad_kind`, `400 bad_config` (an
+option the kind does not take, or the wrong shape), `400 bad_priority`, `400 bad_quiet`,
+`400 bad_ship`, `404 no_such_channel`, `409 no_alliance`.
+
+### POST /notifications/rules/delete
+
+`{"name": "Losing a fight"}`. Answers `{"removed": true}`.
+
+### GET /notifications/kinds
+
+The catalogue above, as data: `{"kinds": {...}, "channelKinds": {...}}`. The only call here
+that needs no identity, so a client can build its form before it has a key that works. The
+bundled console draws its form from this rather than from a copy of its own.
+
+### GET /notifications
+
+Everything at once, which is what a console opening the page wants: `player`, `alliance`,
+`channels`, `rules`, `log` (the 50 newest), `kinds`, `channelKinds`, and `pending`, the
+number of notifications raised but not yet delivered.
+
+### GET /notifications/log
+
+`?limit=` up to 500, newest first.
+
+```json
+{
+  "log": [
+    {"rule": "Losing a fight", "kind": "hull", "ship": "Ore Hound",
+     "title": "Ore Hound: hull at 35%", "body": "Hull is below 40% and was 65%.",
+     "priority": 4, "at": 1730000000, "delivered": 1730000001,
+     "attempts": 1, "error": "", "data": {}}
+  ]
+}
+```
+
+`delivered` is null while a notification is still in the outbox. A send that fails is backed
+off - 30s, 60s, 2m, 4m, 8m - and given up on after six attempts, because an alert about a
+fight an hour ago is noise. One channel succeeding counts as delivered: the point is that
+the player hears about it, not that every route worked.
+
