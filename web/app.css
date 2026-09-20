@@ -274,6 +274,18 @@ tr.best td { color: var(--good); }
 .order-row .idx { color: var(--text-mute); width: 18px; text-align: right; }
 .order-row input[type=number] { width: 78px; }
 .standing-row { flex-wrap: wrap; }
+/* The flee order's thresholds and destination, which sit under its switch rather than
+   on the same line: there are too many of them for one row at any sensible width. */
+.standing-flee { gap: 6px; margin-left: 4px; }
+.standing-flee input[type=number] { width: 70px; }
+
+/* An editor card: the flee order's, a channel's, a rule's. Set apart from the rows above
+   it, since it is a form that has to be saved rather than a switch that acts at once. */
+.editor { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 5px; padding: 10px 11px; }
+.editor .row { margin-bottom: 6px; }
+.editor .row:last-child { margin-bottom: 0; }
+.editor input[type=text], .editor input[type=password] { width: 210px; }
+.editor select, .editor input { max-width: 100%; }
 
 /* ---------------------------------- map --------------------------------- */
 

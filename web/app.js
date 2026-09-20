@@ -65,6 +65,16 @@
     autoSeen: {},       // ship name -> the last automation state seen, for notifications
     expectEnd: {},      // ship name -> true while a stop sent from here is on its way
     standingSaving: null, // ship name whose standing orders are being saved
+    /* The flee order's editor for the selected craft: thresholds and a destination, which
+       are typed rather than toggled, so they are held here until saved. */
+    fleeForm: null,
+
+    /* Push notifications, which live on the bridge rather than in the mod: channels,
+       rules and the recent log, all off /notifications. `channelForm` and `ruleForm` are
+       the editors open on the Alerts tab. */
+    notifications: { data: null, loaded: false, error: null },
+    channelForm: null,
+    ruleForm: null,
     autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
     autoSearch: '',     // the Automation tab's search box, lower-cased
     /* Stations, read apart from the fleet listing so the Automation tab can list those with
@@ -776,11 +786,33 @@
       + 'at the order it was on.</p>'
       + '<p>Either needs a captain; a ship you are flying is left to you. A planned route or '
       + 'farm brings its own enemy handling from the Travel tab, and a route also collects '
-      + 'loot after a fight when <b>Collect loot</b> may interrupt.</p>',
+      + 'loot after a fight when <b>Collect loot</b> may interrupt.</p>'
+      + '<p><b>Break off and run</b> outranks all of it, including a route, a fight and a '
+      + 'cargo transfer: below either threshold the ship clears its chain and jumps out. '
+      + 'The thresholds are fractions of that craft\'s own maximum, so one setting fits a '
+      + 'freighter and a battleship. It does not put the interrupted chain back \u2014 those '
+      + 'orders are what flew it into the fight.</p>'
+      + '<p>A destination further than one jump is walked towards a hop at a time, up to '
+      + 'the jump limit, rather than routed: the route planner is a galaxy-side search and '
+      + 'a ship being shot at cannot wait for one.</p>',
 
     'nav-state':
       'What the ship last reported. Live while you are in game; otherwise the ship database\'s '
       + 'copy, which is as fresh as the last save.',
+
+    'alerts':
+      '<p>These are pushed by the bridge, not by this page: it watches what its poller has '
+      + 'recorded and sends to <b>ntfy</b>, <b>Gotify</b> or a <b>webhook</b>. That is the '
+      + 'difference from the bell in the top bar, which needs this tab open on a machine '
+      + 'that is awake.</p>'
+      + '<p>Two halves. A <b>channel</b> is where a message goes. A <b>rule</b> is when to '
+      + 'send one; a rule with no channel picked reaches all of them.</p>'
+      + '<p>They are yours, not your alliance\u2019s: another member sees none of this and '
+      + 'cannot switch it off. A rule can widen to the alliance\u2019s craft, and is still '
+      + 'sent to your channels alone.</p>'
+      + '<p>An alert is only as quick and as complete as the bridge\u2019s poller. A craft '
+      + 'records nothing while its owner is logged out, and the deployment has to list your '
+      + 'API key in <code>NOTIFY_KEYS</code> for your rules to be run at all.</p>',
 
     'connect-network':
       '<p>The browser reports no status for this, which means either the bridge is not '
@@ -1060,6 +1092,11 @@
         // Holds are per key as much as history is - a different key may see different
         // craft - and the bridge's stored manifests make starting over cheap.
         S.cargoIndex = {};
+        // The alerts belong to whichever player the new key is, so nothing about the old
+        // one survives the reconnect.
+        S.notifications = { data: null, loaded: false, error: null };
+        S.channelForm = null;
+        S.ruleForm = null;
         manifestsAt = 0;
         startLoops();
         refreshFleet();
@@ -1068,6 +1105,7 @@
         loadLocations();
         loadGalaxy();
         loadHistory(true);
+        if (S.view === 'notify') { loadNotifications(true); }
       })
       .catch(function (error) {
         S.connected = false;
@@ -1176,6 +1214,14 @@
       // Cheap when nothing draws it: loadHistory returns without a call in that case.
       if (historyWanted()) { return loadHistory(false); }
     });
+    loop('alerts', EVERY.mission, function () {
+      // The bridge's own, not the mod's, so this costs the game server nothing - but
+      // there is still no point reading a log nobody is looking at. An editor left open
+      // is left alone: a redraw underneath it would throw away what is being typed.
+      if (S.view === 'notify' && !S.channelForm && !S.ruleForm) {
+        return loadNotifications(false);
+      }
+    });
   }
 
   function setPaused(paused) {
@@ -1233,6 +1279,10 @@
     if (name === 'industry') {
       renderIndustry();
       if (S.connected) { loadIndustry(true); }
+    }
+    if (name === 'notify') {
+      renderNotifications();
+      if (S.connected) { loadNotifications(true); }
     }
   }
 
@@ -3647,9 +3697,15 @@
   function standingOn(automation) {
     var standing = automation && automation.standing;
     if (!standing) { return automation && automation.autoAggressive ? ['enemies'] : []; }
-    return STANDING.filter(function (spec) {
+
+    var on = STANDING.filter(function (spec) {
       return standing[spec.key] && standing[spec.key].enabled;
     }).map(function (spec) { return spec.key; });
+
+    // Not in STANDING, which is only the two orders that carry a mode.
+    if (standing.flee && standing.flee.enabled) { on.push('flee'); }
+
+    return on;
   }
 
   function isAutomated(ship) {
@@ -3658,7 +3714,7 @@
     if (programFor(ship.name)) { return true; }
     var automation = shipAutomation(ship.name);
     return !!(automation && (automation.plan || automation.reaction || automation.transfer
-                             || standingOn(automation).length));
+                             || automation.flee || standingOn(automation).length));
   }
 
   function shipAutomationBadges(ship) {
@@ -3677,6 +3733,10 @@
     if (automation.transfer) {
       out.push('<span class="badge info" title="' + esc(transferText(automation.transfer, true)) + '">transfer · '
         + esc(automation.transfer.phase || 'moving') + '</span>');
+    }
+    if (automation.flee) {
+      out.push('<span class="badge bad" title="the flee standing order has the craft">'
+        + 'fleeing · ' + esc(automation.flee.reason || '') + '</span>');
     }
     var on = standingOn(automation);
     if (on.length) {
@@ -5939,6 +5999,225 @@
     stopped: 'stopped'
   };
 
+  /* Where a flee order may send a craft. The last three can be further than one jump and
+     are walked towards a hop at a time; see the FLEEING section of entity/orderchain.lua. */
+  var FLEE_KINDS = [
+    ['known', 'a known sector', 'one jump, into space the owner has already been to'],
+    ['safe', 'friendly space', 'the nearest sector in jump range held by a faction that is not hostile, which polices it'],
+    ['station', 'a station of the fleet', 'towards the nearest own station, a hop at a time'],
+    ['location', 'a location', 'towards a sector from the location library'],
+    ['sector', 'a sector', 'towards fixed coordinates']
+  ];
+
+  var FLEE_ENDS = {
+    arrived: 'got where it was sent',
+    escaped: 'got out, short of the destination',
+    failed: 'could not get away',
+    stopped: 'stopped',
+    switched_off: 'switched off',
+    replaced: 'other orders took over'
+  };
+
+  /* Percent in the console, fraction over the wire. The API takes either - anything above
+     1 is read as a percentage - but sending the fraction keeps the confirmation exact. */
+  function fleePercent(value) {
+    var number = Number(value);
+    if (!isFinite(number) || number < 0) { return 0; }
+    return Math.round(Math.min(100, number));
+  }
+
+  /* The editor's working copy, made from what the ship reports the first time it is
+     wanted for this craft. Held across redraws so a half-typed threshold survives a poll. */
+  function fleeForm(flee) {
+    if (S.fleeForm && S.fleeForm.ship === S.selected) { return S.fleeForm; }
+
+    var to = flee.to || { kind: 'known' };
+
+    S.fleeForm = {
+      ship: S.selected,
+      hull: Math.round((flee.hull || 0) * 100),
+      shield: Math.round((flee.shield || 0) * 100),
+      requireEnemies: flee.requireEnemies !== false,
+      hops: flee.hops || 1,
+      kind: to.kind || 'known',
+      location: to.kind === 'location' ? (to.name || '') : '',
+      anyCraft: to.kind === 'station' && to.name === 'any',
+      x: to.kind === 'sector' ? (to.x || 0) : 0,
+      y: to.kind === 'sector' ? (to.y || 0) : 0
+    };
+
+    return S.fleeForm;
+  }
+
+  function fleeSection(a, off) {
+    var flee = a.standing.flee;
+
+    // A ship on a mod version from before the flee order publishes no such setting.
+    if (!flee) { return ''; }
+
+    var form = fleeForm(flee);
+
+    var out = ['<div class="order-row standing-row">'
+      + '<label class="check switch"><input type="checkbox" data-standing-on="flee"'
+      + (flee.enabled ? ' checked' : '') + off + '><span><b>Break off and run</b></span></label>'
+      + '<span class="mute2">leave the fight when the craft is losing it</span>'
+      + '</div>'];
+
+    out.push('<div class="row standing-flee" style="margin-top:4px">'
+      + '<span class="mute2">below</span>'
+      + '<input type="number" min="0" max="100" data-flee="hull" value="' + form.hull + '"'
+      + ' style="width:70px"' + off + '>'
+      + '<span class="mute2">% hull, or below</span>'
+      + '<input type="number" min="0" max="100" data-flee="shield" value="' + form.shield + '"'
+      + ' style="width:70px"' + off + '>'
+      + '<span class="mute2">% shield &mdash; 0 to ignore that half</span>'
+      + '</div>');
+
+    out.push('<div class="row standing-flee">'
+      + '<span class="mute2">run to</span>'
+      + '<select data-flee="kind"' + off + '>'
+      + FLEE_KINDS.map(function (kind) {
+          return '<option value="' + kind[0] + '"' + (form.kind === kind[0] ? ' selected' : '')
+            + '>' + esc(kind[1]) + '</option>';
+        }).join('')
+      + '</select>'
+      + fleeTargetField(form, off)
+      + '</div>');
+
+    out.push('<div class="mute2" style="margin:2px 0 6px">'
+      + esc((FLEE_KINDS.filter(function (k) { return k[0] === form.kind; })[0] || [])[2] || '')
+      + '</div>');
+
+    var walks = form.kind === 'station' || form.kind === 'location' || form.kind === 'sector';
+
+    out.push('<div class="row standing-flee">'
+      + (walks
+        ? '<span class="mute2">at most</span>'
+          + '<input type="number" min="1" max="10" data-flee="hops" value="' + form.hops + '"'
+          + ' style="width:64px"' + off + '><span class="mute2">jumps</span>'
+        : '')
+      + '<label class="check"><input type="checkbox" data-flee="requireEnemies"'
+      + (form.requireEnemies ? ' checked' : '') + off + '>'
+      + '<span>only while there are enemies in the sector</span></label>'
+      + '<span class="spacer"></span>'
+      + '<button class="primary small" data-act="flee-save"' + off + '>save</button>'
+      + '</div>');
+
+    return out.join('');
+  }
+
+  function fleeTargetField(form, off) {
+    if (form.kind === 'location') {
+      return '<select data-flee="location"' + off + '>'
+        + '<option value="">'
+        + (S.locations.list.length ? 'pick a location…' : 'no locations yet')
+        + '</option>'
+        + S.locations.list.map(function (l) {
+            return '<option value="' + esc(l.name) + '"'
+              + (form.location === l.name ? ' selected' : '') + '>' + esc(locationLabel(l))
+              + '</option>';
+          }).join('')
+        + '</select>';
+    }
+
+    if (form.kind === 'sector') {
+      return '<input type="number" data-flee="x" value="' + form.x + '" style="width:80px"' + off + '>'
+        + '<span class="mute2">:</span>'
+        + '<input type="number" data-flee="y" value="' + form.y + '" style="width:80px"' + off + '>';
+    }
+
+    if (form.kind === 'station') {
+      return '<label class="check"><input type="checkbox" data-flee="anyCraft"'
+        + (form.anyCraft ? ' checked' : '') + off + '>'
+        + '<span>any craft of the fleet, not only a station</span></label>';
+    }
+
+    return '';
+  }
+
+  /* What the craft is doing about it right now, and how the last one went. */
+  function fleeState(a) {
+    var parts = [];
+
+    if (a.vitals) {
+      var vitals = [];
+      if (a.vitals.hull !== undefined) { vitals.push('hull ' + Math.round(a.vitals.hull * 100) + '%'); }
+      if (a.vitals.shield !== undefined) { vitals.push('shield ' + Math.round(a.vitals.shield * 100) + '%'); }
+      // Rounded to 5% by the ship: every publish is an event in its log, so the value it
+      // sends is bucketed rather than exact.
+      if (vitals.length) {
+        parts.push('<span class="mute2" title="reported by the craft, to the nearest 5%">'
+          + esc(vitals.join(' · ')) + '</span>');
+      }
+    }
+
+    if (a.flee) {
+      parts.push('<span class="badge bad">running ('
+        + esc(a.flee.reason || '') + ')</span>');
+      if (a.flee.target) {
+        parts.push('<span class="mute2">heading for ' + coords(a.flee.target) + '</span>');
+      }
+      if (a.flee.phase === 'stuck') {
+        parts.push('<span class="mute2">nowhere to jump yet'
+          + (a.flee.detail ? ': ' + esc(a.flee.detail) : '') + '</span>');
+      }
+    } else if (a.lastFlee) {
+      parts.push('<span class="mute2">last run: '
+        + esc(FLEE_ENDS[a.lastFlee.outcome] || a.lastFlee.outcome)
+        + (a.lastFlee.sector ? ' in ' + coords(a.lastFlee.sector) : '')
+        + (a.lastFlee.detail ? ' (' + esc(a.lastFlee.detail) + ')' : '') + '</span>');
+    }
+
+    return parts.length ? '<div class="row" style="margin-top:4px">' + parts.join(' ') + '</div>' : '';
+  }
+
+  function fleeField(node) {
+    var form = S.fleeForm;
+    if (!form || node.dataset.flee === undefined) { return false; }
+
+    var field = node.dataset.flee;
+
+    if (field === 'requireEnemies' || field === 'anyCraft') { form[field] = node.checked; }
+    else if (field === 'hull' || field === 'shield') { form[field] = fleePercent(node.value); }
+    else if (field === 'hops') { form.hops = Math.max(1, Math.min(10, Number(node.value) || 1)); }
+    else { form[field] = node.value; }
+
+    renderStanding();
+    return true;
+  }
+
+  function saveFlee() {
+    var form = S.fleeForm;
+    if (!form) { return; }
+
+    if ((form.hull || 0) === 0 && (form.shield || 0) === 0) {
+      toast('warn', 'Nothing to watch',
+            'Set a hull threshold, a shield threshold, or both - an order with neither '
+            + 'would never fire.');
+      return;
+    }
+
+    var to = { kind: form.kind };
+
+    if (form.kind === 'location') {
+      if (!form.location) { toast('warn', 'Pick a location', 'Choose one from the library.'); return; }
+      to.name = form.location;
+    } else if (form.kind === 'sector') {
+      to.x = Number(form.x) || 0;
+      to.y = Number(form.y) || 0;
+    } else if (form.kind === 'station' && form.anyCraft) {
+      to.name = 'any';
+    }
+
+    saveStanding({ standing: { flee: {
+      hull: form.hull / 100,
+      shield: form.shield / 100,
+      requireEnemies: form.requireEnemies,
+      hops: form.hops,
+      to: to
+    } } }, 'Flee order saved');
+  }
+
   function paintStanding(nodes, html) {
     nodes.forEach(function (node) { node.innerHTML = html; });
   }
@@ -6012,7 +6291,7 @@
         + (last.resumed ? ' · chain resumed' : ''));
     }
 
-    paintStanding(nodes, head + rows + civilians
+    paintStanding(nodes, head + rows + fleeSection(a, off) + fleeState(a) + civilians
       + (badges.length || stats.length
         ? '<div class="row" style="margin-top:8px">' + badges.join('')
           + '<span class="spacer"></span>'
@@ -6048,6 +6327,7 @@
   }
 
   function standingLabel(key) {
+    if (key === 'flee') { return 'Break off and run'; }
     return (STANDING.filter(function (spec) { return spec.key === key; })[0] || {}).label || key;
   }
 
@@ -6064,11 +6344,13 @@
       }
       return true;
     }
+    if (button.dataset.act === 'flee-save') { saveFlee(); return true; }
     if (button.dataset.act === 'standing-stop') { stopAutomation(button); return true; }
     return false;
   }
 
   function standingChange(node) {
+    if (fleeField(node)) { return true; }
     if (node.dataset.standingOn !== undefined) {
       var patch = {};
       patch[node.dataset.standingOn] = { enabled: node.checked };
@@ -10205,6 +10487,529 @@
     $('#galaxy-body').innerHTML = '<div class="cards">' + cards.join('') + '</div>';
   }
 
+  /* ================================= ALERTS ================================
+   *
+   * Push notifications, which are the bridge's rather than the mod's: the mod cannot open
+   * a socket, and everything a rule needs is already in the bridge's database. So this
+   * talks to /notifications, not to the game.
+   *
+   * Two halves. A channel is where a message goes - an ntfy topic, a Gotify server, a
+   * webhook. A rule is when to send one, over the craft the poller is watching. Both
+   * belong to the player the API key is, never to an alliance: a rule may widen to the
+   * alliance's craft, and is still yours and sent to your channels.
+   *
+   * The catalogue of what a rule can watch and what a channel can be comes from the
+   * bridge, so this form does not have to be kept in step with it by hand.
+   */
+
+  function loadNotifications(userInitiated) {
+    if (!S.connected) { return Promise.resolve(); }
+
+    return Api.get('/notifications', null,
+                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'alerts' })
+      .then(function (body) {
+        S.notifications = { data: body, loaded: true, error: null };
+        renderNotifications();
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.notifications = { data: S.notifications.data, loaded: true, error: error };
+        renderNotifications();
+      });
+  }
+
+  function notifyKinds() {
+    return (S.notifications.data || {}).kinds || {};
+  }
+
+  function notifyChannelKinds() {
+    return (S.notifications.data || {}).channelKinds || {};
+  }
+
+  /* The editor for one channel, or null. `name` empty means a new one. */
+  function blankChannel() {
+    return { name: '', kind: 'ntfy', url: '', token: '', topic: '', headers: '',
+             enabled: true, isNew: true, hasToken: false };
+  }
+
+  function channelForm(existing) {
+    if (!existing) { return blankChannel(); }
+
+    return {
+      name: existing.name,
+      kind: existing.kind,
+      url: existing.url,
+      // Never sent to us, and never needed to save the rest: left empty keeps the stored
+      // one, and the bridge says so too.
+      token: '',
+      hasToken: existing.hasToken,
+      topic: (existing.config || {}).topic || '',
+      headers: (existing.config || {}).headers
+        ? JSON.stringify((existing.config || {}).headers) : '',
+      enabled: existing.enabled !== false,
+      isNew: false
+    };
+  }
+
+  function blankRule() {
+    return { name: '', kind: 'combat', ship: '', alliance: false, enabled: true,
+             priority: 3, quiet: 300, channels: [], config: {}, isNew: true };
+  }
+
+  function ruleForm(existing) {
+    if (!existing) { return blankRule(); }
+
+    return {
+      name: existing.name,
+      kind: existing.kind,
+      ship: existing.ship || '',
+      alliance: !!existing.alliance,
+      enabled: existing.enabled !== false,
+      priority: existing.priority,
+      quiet: existing.quiet,
+      channels: (existing.channels || []).slice(),
+      config: JSON.parse(JSON.stringify(existing.config || {})),
+      isNew: false
+    };
+  }
+
+  function renderNotifications() {
+    var host = $('#notify-body');
+    if (!host) { return; }
+
+    if (!S.connected) {
+      host.innerHTML = '<div class="empty"><p>Connect first.</p></div>';
+      return;
+    }
+
+    var state = S.notifications;
+
+    if (state.error) {
+      host.innerHTML = notifyIntro()
+        + errorBox('Could not read your alerts', state.error)
+        + (state.error.status === 404
+          ? '<div class="note">This bridge keeps no database, so it has nowhere to put '
+            + 'rules. Unset <code>HISTORY_DB_HOST</code> in its <code>.env</code> and '
+            + 'bring the stack back up.</div>'
+          : '');
+      return;
+    }
+
+    if (!state.loaded) { host.innerHTML = notifyIntro() + '<p class="muted">loading…</p>'; return; }
+
+    var data = state.data || {};
+
+    host.innerHTML = notifyIntro()
+      + notifyChannels(data)
+      + notifyRules(data)
+      + notifyLog(data);
+  }
+
+  function notifyIntro() {
+    return '<div class="section"><h2>Alerts ' + explain('alerts') + '</h2>'
+      + '<p class="mute2">Pushed by the bridge while nothing of yours is open: the browser '
+      + 'notifications in the top bar need this page to be. These are yours alone, even '
+      + 'for an alliance craft.</p></div>';
+  }
+
+  function notifyChannels(data) {
+    var kinds = notifyChannelKinds();
+    var form = S.channelForm;
+
+    var rows = (data.channels || []).map(function (channel) {
+      var about = (kinds[channel.kind] || {}).title || channel.kind;
+
+      return '<div class="order-row">'
+        + '<label class="check switch"><input type="checkbox" data-channel-on="'
+        + esc(channel.name) + '"' + (channel.enabled ? ' checked' : '') + '>'
+        + '<span><b>' + esc(channel.name) + '</b></span></label>'
+        + '<span class="mute2">' + esc(about) + ' · ' + esc(channel.url)
+        + ((channel.config || {}).topic ? ' · ' + esc(channel.config.topic) : '')
+        + (channel.hasToken ? ' · token set' : '') + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-channel-test="' + esc(channel.name) + '">test</button>'
+        + '<button class="ghost small" data-channel-edit="' + esc(channel.name) + '">edit</button>'
+        + '<button class="ghost small" data-channel-delete="' + esc(channel.name) + '">remove</button>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="section"><h2>Channels</h2>'
+      + (rows || '<p class="muted">No channels yet. Add one and every rule can reach it.</p>')
+      + (form ? notifyChannelEditor(form, kinds)
+              : '<div class="row" style="margin-top:8px">'
+                + '<button class="ghost small" data-act="channel-new">add a channel</button></div>')
+      + '</div>';
+  }
+
+  function notifyChannelEditor(form, kinds) {
+    var spec = kinds[form.kind] || {};
+
+    var extra = '';
+    if (form.kind === 'ntfy') {
+      extra = '<label class="field"><span>Topic</span>'
+        + '<input type="text" data-channel="topic" value="' + esc(form.topic) + '"'
+        + ' placeholder="avorion-yourname"></label>';
+    } else if (form.kind === 'webhook') {
+      extra = '<label class="field"><span>Headers</span>'
+        + '<input type="text" data-channel="headers" value="' + esc(form.headers) + '"'
+        + ' placeholder=\'{"X-Token": "abc"}\'></label>';
+    }
+
+    return '<div class="editor channel-editor" style="margin-top:8px">'
+      + '<div class="row">'
+      + '<label class="field"><span>Name</span>'
+      + '<input type="text" data-channel="name" value="' + esc(form.name) + '"'
+      + (form.isNew ? '' : ' disabled') + ' placeholder="Phone"></label>'
+      + '<label class="field"><span>Service</span><select data-channel="kind">'
+      + Object.keys(kinds).map(function (key) {
+          return '<option value="' + esc(key) + '"' + (form.kind === key ? ' selected' : '')
+            + '>' + esc(kinds[key].title || key) + '</option>';
+        }).join('')
+      + '</select></label>'
+      + '</div>'
+      + '<div class="row">'
+      + '<label class="field" style="flex:1"><span>Server</span>'
+      + '<input type="text" data-channel="url" value="' + esc(form.url) + '"'
+      + ' placeholder="https://ntfy.sh"></label>'
+      + extra
+      + '</div>'
+      + '<div class="row">'
+      + '<label class="field" style="flex:1"><span>Token</span>'
+      + '<input type="password" data-channel="token" value="' + esc(form.token) + '"'
+      + ' placeholder="' + (form.hasToken ? 'set — leave empty to keep it' : 'optional') + '">'
+      + '</label>'
+      + '</div>'
+      + '<div class="mute2">' + esc(spec.url || '')
+      + (spec.token ? ' · ' + esc(spec.token) : '') + '</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="channel-save">save</button>'
+      + '<button class="ghost small" data-act="channel-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function notifyRules(data) {
+    var kinds = notifyKinds();
+    var form = S.ruleForm;
+
+    var rows = (data.rules || []).map(function (rule) {
+      var spec = kinds[rule.kind] || {};
+      var about = [spec.title || rule.kind];
+
+      if (rule.config && rule.config.below !== undefined) {
+        about.push('below ' + fleePercent(rule.config.below > 1
+          ? rule.config.below : rule.config.below * 100) + '%');
+      }
+      if (rule.config && rule.config.contains) { about.push('"' + rule.config.contains + '"'); }
+      about.push(rule.ship ? rule.ship : 'any craft');
+      if (rule.alliance) { about.push('+ alliance'); }
+      about.push(rule.channels.length ? rule.channels.join(', ') : 'all channels');
+
+      return '<div class="order-row">'
+        + '<label class="check switch"><input type="checkbox" data-rule-on="' + esc(rule.name) + '"'
+        + (rule.enabled ? ' checked' : '') + '><span><b>' + esc(rule.name) + '</b></span></label>'
+        + '<span class="mute2">' + esc(about.join(' · ')) + '</span>'
+        + '<span class="spacer"></span>'
+        + '<button class="ghost small" data-rule-edit="' + esc(rule.name) + '">edit</button>'
+        + '<button class="ghost small" data-rule-delete="' + esc(rule.name) + '">remove</button>'
+        + '</div>';
+    }).join('');
+
+    return '<div class="section"><h2>Rules</h2>'
+      + (rows || '<p class="muted">No rules yet. Nothing is sent until there is one.</p>')
+      + (form ? notifyRuleEditor(form, kinds, data)
+              : '<div class="row" style="margin-top:8px">'
+                + '<button class="ghost small" data-act="rule-new">add a rule</button></div>')
+      + '</div>';
+  }
+
+  function notifyRuleEditor(form, kinds, data) {
+    var spec = kinds[form.kind] || {};
+
+    var options = Object.keys(spec.options || {}).map(function (key) {
+      var option = spec.options[key];
+      var value = form.config[key];
+
+      if (option.kind === 'boolean') {
+        return '<label class="check"><input type="checkbox" data-rule-option="' + esc(key) + '"'
+          + (value === true ? ' checked' : '') + '><span>' + esc(option.title || key)
+          + '</span></label>';
+      }
+
+      if (option.kind === 'fraction') {
+        var percent = value === undefined ? Math.round((option.default || 0.5) * 100)
+          : fleePercent(value > 1 ? value : value * 100);
+        return '<label class="field"><span>' + esc(option.title || key) + ' (%)</span>'
+          + '<input type="number" min="1" max="100" data-rule-option="' + esc(key) + '"'
+          + ' data-rule-option-kind="fraction" value="' + percent + '" style="width:80px"></label>';
+      }
+
+      return '<label class="field" style="flex:1"><span>' + esc(option.title || key) + '</span>'
+        + '<input type="text" data-rule-option="' + esc(key) + '" value="'
+        + esc(value === undefined ? '' : String(value)) + '"></label>';
+    }).join('');
+
+    var channels = (data.channels || []).map(function (channel) {
+      return '<label class="check"><input type="checkbox" data-rule-channel="'
+        + esc(channel.name) + '"'
+        + (form.channels.indexOf(channel.name) >= 0 ? ' checked' : '') + '>'
+        + '<span>' + esc(channel.name) + '</span></label>';
+    }).join('');
+
+    return '<div class="editor rule-editor" style="margin-top:8px">'
+      + '<div class="row">'
+      + '<label class="field"><span>Name</span>'
+      + '<input type="text" data-rule="name" value="' + esc(form.name) + '"'
+      + (form.isNew ? '' : ' disabled') + ' placeholder="Under attack"></label>'
+      + '<label class="field"><span>Watch for</span><select data-rule="kind">'
+      + Object.keys(kinds).map(function (key) {
+          return '<option value="' + esc(key) + '"' + (form.kind === key ? ' selected' : '')
+            + '>' + esc(kinds[key].title || key) + '</option>';
+        }).join('')
+      + '</select></label>'
+      + '</div>'
+      + '<div class="mute2">' + esc(spec.about || '') + '</div>'
+      + (options ? '<div class="row" style="margin-top:6px">' + options + '</div>' : '')
+      + '<div class="row" style="margin-top:6px">'
+      + '<label class="field"><span>Craft</span>'
+      + '<input type="text" data-rule="ship" value="' + esc(form.ship) + '"'
+      + ' placeholder="every craft"></label>'
+      + '<label class="check"><input type="checkbox" data-rule="alliance"'
+      + (form.alliance ? ' checked' : '') + '><span>alliance craft too</span></label>'
+      + '</div>'
+      + '<div class="row">'
+      + '<label class="field"><span>Priority</span>'
+      + '<input type="number" min="1" max="5" data-rule="priority" value="' + form.priority
+      + '" style="width:70px"></label>'
+      + '<label class="field"><span>Quiet for (s)</span>'
+      + '<input type="number" min="0" max="86400" data-rule="quiet" value="' + form.quiet
+      + '" style="width:90px"></label>'
+      + '<span class="mute2">the floor between two of this alert about one craft</span>'
+      + '</div>'
+      + '<div class="row" style="margin-top:6px">'
+      + '<span class="mute2">send to</span>'
+      + (channels || '<span class="mute2">no channels yet</span>')
+      + '<span class="mute2">' + (form.channels.length ? '' : '(none picked: every channel)')
+      + '</span></div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="rule-save">save</button>'
+      + '<button class="ghost small" data-act="rule-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function notifyLog(data) {
+    var rows = (data.log || []).map(function (note) {
+      var when = note.at ? new Date(note.at * 1000).toLocaleString() : '';
+      var mark = note.delivered ? '<span class="badge good">sent</span>'
+        : note.attempts > 0 ? '<span class="badge bad">failed</span>'
+        : '<span class="badge">queued</span>';
+
+      return '<div class="log-row"><span class="mute2">' + esc(when) + '</span> '
+        + mark + ' <b>' + esc(note.title) + '</b> '
+        + '<span class="mute2">' + esc(note.body) + '</span>'
+        + (note.error && !note.delivered
+          ? ' <span class="mute2">(' + esc(note.error) + ')</span>' : '')
+        + '</div>';
+    }).join('');
+
+    return '<div class="section"><h2>Recent</h2>'
+      + (data.pending ? '<div class="note">' + num(data.pending)
+        + ' waiting to be delivered.</div>' : '')
+      + (rows || '<p class="muted">Nothing has been raised yet.</p>')
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="ghost small" data-act="notify-refresh">refresh</button></div>'
+      + '</div>';
+  }
+
+  /* -------------------------------- actions -------------------------------- */
+
+  function saveChannel(button) {
+    var form = S.channelForm;
+    if (!form) { return; }
+
+    var body = { name: form.name, kind: form.kind, url: form.url, enabled: form.enabled,
+                 config: {} };
+
+    if (form.kind === 'ntfy') { body.config.topic = form.topic; }
+    if (form.kind === 'webhook' && form.headers.trim()) {
+      try {
+        body.config.headers = JSON.parse(form.headers);
+      } catch (e) {
+        toast('warn', 'Headers are not JSON', 'Write them as {"Name": "value"}.');
+        return;
+      }
+    }
+
+    // Left out entirely keeps whatever is stored, which is how a channel whose token this
+    // page was never shown can still have its topic changed.
+    if (form.token !== '' || form.isNew) { body.token = form.token; }
+
+    guard(button, Api.post('/notifications/channels', body, null,
+                           { priority: Api.P.USER, label: 'save channel' }))
+      .then(function () {
+        S.channelForm = null;
+        toast('good', 'Channel saved', form.name);
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Channel refused'); });
+  }
+
+  function testChannel(button, name) {
+    guard(button, Api.post('/notifications/channels/test', { name: name }, null,
+                           { priority: Api.P.USER, label: 'test channel' }))
+      .then(function (body) {
+        var result = (body.results || [])[0] || {};
+        toast(result.ok ? 'good' : 'bad', result.ok ? 'Sent' : 'Not sent',
+              result.ok ? name + ' took the test message.' : (result.error || 'no reason given'));
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Test failed'); });
+  }
+
+  function deleteChannel(button, name) {
+    guard(button, Api.post('/notifications/channels/delete', { name: name }, null,
+                           { priority: Api.P.USER, label: 'remove channel' }))
+      .then(function (body) {
+        toast('good', 'Channel removed', (body.rules || []).length
+          ? 'These rules named it and now reach every other channel: ' + body.rules.join(', ')
+          : name);
+        if (S.channelForm && S.channelForm.name === name) { S.channelForm = null; }
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove it'); });
+  }
+
+  function saveRule(button) {
+    var form = S.ruleForm;
+    if (!form) { return; }
+
+    var config = {};
+    var spec = notifyKinds()[form.kind] || {};
+
+    Object.keys(spec.options || {}).forEach(function (key) {
+      if (form.config[key] !== undefined && form.config[key] !== '') {
+        config[key] = form.config[key];
+      }
+    });
+
+    guard(button, Api.post('/notifications/rules', {
+      name: form.name, kind: form.kind, ship: form.ship, alliance: form.alliance,
+      enabled: form.enabled, priority: Number(form.priority) || 3,
+      quiet: Number(form.quiet) || 0, channels: form.channels, config: config
+    }, null, { priority: Api.P.USER, label: 'save rule' }))
+      .then(function () {
+        S.ruleForm = null;
+        toast('good', 'Rule saved', form.name);
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Rule refused'); });
+  }
+
+  function deleteRule(button, name) {
+    guard(button, Api.post('/notifications/rules/delete', { name: name }, null,
+                           { priority: Api.P.USER, label: 'remove rule' }))
+      .then(function () {
+        if (S.ruleForm && S.ruleForm.name === name) { S.ruleForm = null; }
+        toast('good', 'Rule removed', name);
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove it'); });
+  }
+
+  function notifyFind(list, name) {
+    return (list || []).filter(function (entry) { return entry.name === name; })[0] || null;
+  }
+
+  function notifyClick(button) {
+    var data = S.notifications.data || {};
+    var act = button.dataset.act;
+
+    if (act === 'channel-new') { S.channelForm = blankChannel(); renderNotifications(); return true; }
+    if (act === 'channel-cancel') { S.channelForm = null; renderNotifications(); return true; }
+    if (act === 'channel-save') { saveChannel(button); return true; }
+    if (act === 'rule-new') { S.ruleForm = blankRule(); renderNotifications(); return true; }
+    if (act === 'rule-cancel') { S.ruleForm = null; renderNotifications(); return true; }
+    if (act === 'rule-save') { saveRule(button); return true; }
+    if (act === 'notify-refresh') { loadNotifications(true); return true; }
+
+    if (button.dataset.channelEdit) {
+      S.channelForm = channelForm(notifyFind(data.channels, button.dataset.channelEdit));
+      renderNotifications();
+      return true;
+    }
+    if (button.dataset.channelTest) { testChannel(button, button.dataset.channelTest); return true; }
+    if (button.dataset.channelDelete) { deleteChannel(button, button.dataset.channelDelete); return true; }
+
+    if (button.dataset.ruleEdit) {
+      S.ruleForm = ruleForm(notifyFind(data.rules, button.dataset.ruleEdit));
+      renderNotifications();
+      return true;
+    }
+    if (button.dataset.ruleDelete) { deleteRule(button, button.dataset.ruleDelete); return true; }
+
+    return false;
+  }
+
+  function notifyChange(node) {
+    var data = S.notifications.data || {};
+
+    if (node.dataset.channelOn !== undefined) {
+      var channel = notifyFind(data.channels, node.dataset.channelOn);
+      if (channel) {
+        S.channelForm = channelForm(channel);
+        S.channelForm.enabled = node.checked;
+        saveChannel(null);
+      }
+      return true;
+    }
+
+    if (node.dataset.ruleOn !== undefined) {
+      var rule = notifyFind(data.rules, node.dataset.ruleOn);
+      if (rule) {
+        S.ruleForm = ruleForm(rule);
+        S.ruleForm.enabled = node.checked;
+        saveRule(null);
+      }
+      return true;
+    }
+
+    if (node.dataset.channel !== undefined && S.channelForm) {
+      S.channelForm[node.dataset.channel] = node.value;
+      // The service decides which extra field is shown, so it has to redraw.
+      if (node.dataset.channel === 'kind') { renderNotifications(); }
+      return true;
+    }
+
+    if (node.dataset.ruleOption !== undefined && S.ruleForm) {
+      var key = node.dataset.ruleOption;
+      if (node.type === 'checkbox') {
+        S.ruleForm.config[key] = node.checked;
+      } else if (node.dataset.ruleOptionKind === 'fraction') {
+        S.ruleForm.config[key] = fleePercent(node.value) / 100;
+      } else {
+        S.ruleForm.config[key] = node.value;
+      }
+      return true;
+    }
+
+    if (node.dataset.ruleChannel !== undefined && S.ruleForm) {
+      var picked = S.ruleForm.channels;
+      var at = picked.indexOf(node.dataset.ruleChannel);
+      if (node.checked && at < 0) { picked.push(node.dataset.ruleChannel); }
+      if (!node.checked && at >= 0) { picked.splice(at, 1); }
+      renderNotifications();
+      return true;
+    }
+
+    if (node.dataset.rule !== undefined && S.ruleForm) {
+      S.ruleForm[node.dataset.rule] = node.type === 'checkbox' ? node.checked : node.value;
+      // A different kind brings different options with it.
+      if (node.dataset.rule === 'kind') { S.ruleForm.config = {}; renderNotifications(); }
+      return true;
+    }
+
+    return false;
+  }
+
   /* ================================= WIRING ================================ */
 
   function goto(x, y) {
@@ -10296,6 +11101,13 @@
 
     bindSeg('#filter-owner', setOwner);
     bindSeg('#industry-owner', setOwner);
+
+    $('#notify-body').addEventListener('click', function (e) {
+      var button = e.target.closest('button');
+      if (button) { notifyClick(button); }
+    });
+
+    $('#notify-body').addEventListener('change', function (e) { notifyChange(e.target); });
 
     $('#industry-refresh').addEventListener('click', function () { loadIndustry(true); });
 

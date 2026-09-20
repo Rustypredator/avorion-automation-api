@@ -260,7 +260,14 @@ const houndAutomation = {
     ship: 'Ore Hound', source: 'live', reported: true,
     automation: {
         autoAggressive: true, attackCivilians: false, enemies: true, defenceFights: 2,
-        standing: { enemies: { enabled: true, mode: 'idle' }, loot: { enabled: false, mode: 'idle' } },
+        standing: {
+            enemies: { enabled: true, mode: 'idle' },
+            loot: { enabled: false, mode: 'idle' },
+            flee: { enabled: false, hull: 0.5, shield: 0, requireEnemies: true, hops: 1,
+                    to: { kind: 'known' } }
+        },
+        vitals: { hull: 0.65, shield: 1 },
+        lastFlee: { outcome: 'arrived', reason: 'hull', sector: { x: 9, y: 9 }, hops: 1 },
         lootRuns: 0,
         lastReaction: { kind: 'enemies', outcome: 'done', resumed: true, sector: { x: 1, y: 2 } },
         plan: { id: 'p1', kind: 'route', phase: 'fighting', hops: 4, hop: 2, loopFrom: 0,
@@ -272,6 +279,8 @@ const houndAutomation = {
 function saveStanding(sent) {
     const automation = houndAutomation.automation;
     Object.keys(sent.standing || {}).forEach((key) => {
+        // Part by part, and a destination is one value: the ship replaces `to` rather
+        // than merging into whatever it held before.
         Object.assign(automation.standing[key], sent.standing[key]);
     });
     if (sent.attackCivilians !== undefined) { automation.attackCivilians = sent.attackCivilians; }
@@ -475,7 +484,74 @@ function saveLocation(name) {
     };
 }
 
+/*
+ * The bridge's notification store. Not the mod's - /notifications never reaches the game -
+ * so this plays the bridge's part: it keeps what was saved and hands the lot back, which
+ * is what the Alerts tab reads.
+ */
+const notifyStore = { channels: [], rules: [] };
+
+const NOTIFY_KINDS = {
+    combat: { title: 'Under attack', source: 'events', about: 'Enemies turned up.',
+              options: { ends: { kind: 'boolean', default: false, title: 'Also when it ends' } } },
+    hull: { title: 'Hull below', source: 'level', about: 'The hull fell below a fraction.',
+            options: { below: { kind: 'fraction', default: 0.5, title: 'Hull left' } } },
+    flee: { title: 'Broke off and ran', source: 'events', about: 'It ran.', options: {} }
+};
+
+const NOTIFY_CHANNEL_KINDS = {
+    ntfy: { title: 'ntfy', url: 'The ntfy server', fields: { topic: 'The topic' },
+            token: 'Access token' },
+    gotify: { title: 'Gotify', url: 'The Gotify server', fields: {}, token: 'App token' },
+    webhook: { title: 'Webhook', url: 'Any URL', fields: {}, token: 'Bearer token' }
+};
+
+function notifySummary() {
+    return {
+        player: 1, alliance: null,
+        channels: notifyStore.channels, rules: notifyStore.rules,
+        log: [{ rule: 'Hurt', kind: 'hull', ship: 'Ore Hound', title: 'Ore Hound: hull at 45%',
+                body: 'Hull is below 50%.', priority: 3, at: 1700000000,
+                delivered: 1700000001, attempts: 1, error: '', data: {} }],
+        kinds: NOTIFY_KINDS, channelKinds: NOTIFY_CHANNEL_KINDS, pending: 0
+    };
+}
+
+function saveNotifyChannel(sent) {
+    const existing = notifyStore.channels.filter((c) => c.name === sent.name)[0];
+    const channel = existing || { name: sent.name };
+
+    channel.kind = sent.kind;
+    channel.url = sent.url;
+    channel.config = sent.config || {};
+    channel.enabled = sent.enabled !== false;
+    // As the real store does: a token left out keeps whatever was stored.
+    if (sent.token !== undefined) { channel.hasToken = sent.token !== ''; }
+
+    if (!existing) { notifyStore.channels.push(channel); }
+
+    return { channel: channel };
+}
+
+function saveNotifyRule(sent) {
+    const existing = notifyStore.rules.filter((r) => r.name === sent.name)[0];
+    const rule = existing || { name: sent.name, id: notifyStore.rules.length + 1 };
+
+    Object.assign(rule, {
+        kind: sent.kind, enabled: sent.enabled !== false, ship: sent.ship || '',
+        alliance: !!sent.alliance, config: sent.config || {}, channels: sent.channels || [],
+        priority: sent.priority, quiet: sent.quiet
+    });
+
+    if (!existing) { notifyStore.rules.push(rule); }
+
+    return { rule: rule };
+}
+
 const dynamic = {
+    '/notifications/channels': saveNotifyChannel,
+    '/notifications/rules': saveNotifyRule,
+    '/notifications/channels/test': () => ({ results: [{ channel: 'Phone', ok: true, status: 200, error: '' }] }),
     '/locations/Rendezvous': saveLocation('Rendezvous'),
     '/locations/Belt': saveLocation('Belt'),
     '/ships/Ore%20Hound/transfer': sendTransfer,
@@ -491,6 +567,7 @@ const dynamic = {
 };
 
 const routes = {
+    get '/notifications'() { return notifySummary(); },
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
     // The type filter is not applied, as the checks above the Industry tab have always
@@ -1868,6 +1945,125 @@ const ready = window.document.readyState === 'loading'
           'and a program of only the steps that leave it where it is');
     click(editor().querySelector('[data-prog-act="cancel"]'));
     await settle(50);
+
+    console.log('\nthe flee standing order');
+
+    click($('#automation-rows [data-auto-ship="Ore Hound"]'));
+    await settle(600);
+
+    const flee = (selector) => autoPane.querySelector(selector);
+
+    check(flee('[data-standing-on="flee"]') && !flee('[data-standing-on="flee"]').checked,
+          'the flee order is offered, off, as the ship reports it');
+    check(flee('[data-flee="hull"]').value === '50' && flee('[data-flee="shield"]').value === '0',
+          'with its thresholds as whole percentages');
+    check(/hull 65%/.test(autoPane.textContent),
+          'and the condition the craft last published');
+    check(/got where it was sent/.test(autoPane.textContent), 'and how its last run ended');
+
+    // A destination that can be further than one jump brings a jump limit with it; one
+    // that is always a single jump does not.
+    check(!flee('[data-flee="hops"]'), 'a one-jump destination needs no jump limit');
+    change(flee('[data-flee="kind"]'), 'location');
+    await settle(80);
+    check(flee('[data-flee="location"]'), 'picking a location offers the library');
+    check(flee('[data-flee="hops"]'), 'and a jump limit, since it can be further than one jump');
+
+    const before = posts.length;
+    click(autoPane.querySelector('[data-act="flee-save"]'));
+    await settle(80);
+    check(posts.length === before,
+          'saving without picking a location sends nothing rather than a bad request');
+
+    change(flee('[data-flee="location"]'), 'Home');
+    await settle(80);
+    change(flee('[data-flee="hull"]'), '81');
+    await settle(80);
+    click(autoPane.querySelector('[data-act="flee-save"]'));
+    await settle(300);
+
+    const fleeSent = posts.filter((p) => p.path === '/ships/Ore%20Hound/automation'
+                                      && p.body.standing && p.body.standing.flee).pop();
+    check(fleeSent && fleeSent.body.standing.flee.hull === 0.81,
+          'a threshold typed as a percentage is sent as the fraction it means');
+    check(fleeSent && fleeSent.body.standing.flee.to.kind === 'location'
+          && fleeSent.body.standing.flee.to.name === 'Home',
+          'with the destination it was given');
+    check(fleeSent && fleeSent.body.standing.enemies === undefined,
+          'and nothing about the other standing orders');
+
+    console.log('\nthe alerts tab');
+
+    $('.tab[data-view="notify"]').click();
+    await settle(400);
+
+    const alerts = () => $('#notify-body');
+    check(/No channels yet/.test(alerts().textContent), 'an empty setup says so');
+    check(/Ore Hound: hull at 45%/.test(alerts().textContent),
+          'and still shows what has already been sent');
+
+    click(alerts().querySelector('[data-act="channel-new"]'));
+    await settle(50);
+    change(alerts().querySelector('[data-channel="name"]'), 'Phone');
+    change(alerts().querySelector('[data-channel="url"]'), 'https://ntfy.sh');
+    check(alerts().querySelector('[data-channel="topic"]'),
+          'ntfy asks for a topic, which is what it publishes to');
+    change(alerts().querySelector('[data-channel="topic"]'), 'avorion-rusty');
+    change(alerts().querySelector('[data-channel="token"]'), 'tk_secret');
+    click(alerts().querySelector('[data-act="channel-save"]'));
+    await settle(300);
+
+    const channelSent = posts.filter((p) => p.path === '/notifications/channels').pop();
+    check(channelSent && channelSent.body.config.topic === 'avorion-rusty',
+          'the topic is sent inside the channel config');
+    check(channelSent && channelSent.body.token === 'tk_secret', 'with the token');
+    check(/avorion-rusty/.test(alerts().textContent) && /token set/.test(alerts().textContent),
+          'and the channel is listed afterwards');
+
+    // The token is never handed back, so an edit that changes nothing else must not
+    // clear it: the field left empty means "keep what is stored".
+    click(alerts().querySelector('[data-channel-edit="Phone"]'));
+    await settle(80);
+    check(alerts().querySelector('[data-channel="token"]').value === '',
+          'editing a channel never fills the token back in');
+    change(alerts().querySelector('[data-channel="topic"]'), 'avorion-moved');
+    click(alerts().querySelector('[data-act="channel-save"]'));
+    await settle(300);
+
+    const edited = posts.filter((p) => p.path === '/notifications/channels').pop();
+    check(edited.body.token === undefined,
+          'and saving without one leaves the stored token alone');
+    check(/token set/.test(alerts().textContent), 'which the listing still shows');
+
+    click(alerts().querySelector('[data-act="rule-new"]'));
+    await settle(80);
+    change(alerts().querySelector('[data-rule="name"]'), 'Hurt');
+    change(alerts().querySelector('[data-rule="kind"]'), 'hull');
+    await settle(80);
+    const below = alerts().querySelector('[data-rule-option="below"]');
+    check(below && below.value === '50', 'a threshold rule offers its option, at the default');
+    change(below, '30');
+    // Dispatching change does not tick a box, so the state is set first, as a click would.
+    const ticked = (node) => { node.checked = true; change(node); };
+    ticked(alerts().querySelector('[data-rule="alliance"]'));
+    ticked(alerts().querySelector('[data-rule-channel="Phone"]'));
+    await settle(80);
+    click(alerts().querySelector('[data-act="rule-save"]'));
+    await settle(300);
+
+    const ruleSent = posts.filter((p) => p.path === '/notifications/rules').pop();
+    check(ruleSent && ruleSent.body.kind === 'hull' && ruleSent.body.config.below === 0.3,
+          'the rule is sent with its threshold as a fraction');
+    check(ruleSent && ruleSent.body.alliance === true
+          && ruleSent.body.channels.join() === 'Phone',
+          'and the scope and channel it was given');
+    check(/below 30%/.test(alerts().textContent) && /\+ alliance/.test(alerts().textContent),
+          'and the rule is listed with what it watches');
+
+    click(alerts().querySelector('[data-channel-test="Phone"]'));
+    await settle(300);
+    check(posts.filter((p) => p.path === '/notifications/channels/test').length === 1,
+          'a channel can be tested from the page');
 
     console.log('');
     if (failures === 0) {
