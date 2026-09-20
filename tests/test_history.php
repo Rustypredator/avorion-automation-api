@@ -54,6 +54,13 @@ try {
     exit(2);
 }
 
+/*
+ * The version a fresh database ends up at, read off the one this test is running against
+ * rather than written down. The upgrade tests below check that an old schema is brought
+ * all the way here, and that has to keep being true after the next migration is added.
+ */
+$currentSchema = (int) ($pdo->query('SELECT version FROM api_schema')->fetch()['version'] ?? 0);
+
 /** A key no previous run can have used, so every run starts empty. */
 function freshKey(): string
 {
@@ -1110,7 +1117,7 @@ try {
     Db::migrate($old);
 
     $version = (int) $old->query('SELECT version FROM api_schema')->fetch()['version'];
-    check($version === 4, 'the migration brings it up to date');
+    check($version === $currentSchema, 'the migration brings it up to date');
     check((int) $old->query('SELECT COUNT(*) AS n FROM api_keys WHERE legacy')->fetch()['n'] === 3,
           'every existing key is flagged for adoption');
     check((int) $old->query('SELECT COUNT(*) AS n FROM visits WHERE faction IS NULL')->fetch()['n'] === 6,
@@ -1220,7 +1227,7 @@ try {
            AND table_name = '{$table}' AND column_name = '{$name}'"
     )->fetch() !== false;
 
-    check((int) $old->query('SELECT version FROM api_schema')->fetch()['version'] === 4,
+    check((int) $old->query('SELECT version FROM api_schema')->fetch()['version'] === $currentSchema,
           'it is brought up to date');
     check($column('api_keys', 'legacy') && $column('visits', 'faction'),
           'including the ownership step it claimed to have');

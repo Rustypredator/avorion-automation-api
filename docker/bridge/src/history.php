@@ -2286,6 +2286,20 @@ final class History
         // probably gone. It is one row per craft, so it is not counted as history removed.
         $pdo->prepare('DELETE FROM manifests WHERE taken_at < to_timestamp(:c)')->execute([':c' => $cutoff]);
 
+        /*
+         * The notification log, which is not history and is kept on a much shorter leash:
+         * Notifications::trim already caps it per player, and this is only the floor for a
+         * player who has stopped using the bridge entirely. Undelivered rows go too - one
+         * that has been waiting a month is not worth sending.
+         *
+         * Marks for craft nothing has seen in the window go with them, or a rule about a
+         * fleet that has been rebuilt would carry the old craft's state for ever.
+         */
+        $pdo->prepare('DELETE FROM notifications WHERE created_at < to_timestamp(:c)')
+            ->execute([':c' => $cutoff]);
+        $pdo->prepare('DELETE FROM notification_marks WHERE seen_at < to_timestamp(:c)')
+            ->execute([':c' => $cutoff]);
+
         return $removed;
     }
 

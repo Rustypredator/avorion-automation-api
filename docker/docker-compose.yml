@@ -180,6 +180,43 @@ services:
     # committed before the sleep begins.
     stop_grace_period: 5s
 
+  # Turns what the poller collected into messages on somebody's phone.
+  #
+  # The console's browser notifications only reach a tab that is open on a machine that is
+  # awake, which is exactly not the case when a fleet is grinding overnight. This watches
+  # the events the poller is already recording, decides what crossed a line a player asked
+  # about, and pushes it through ntfy, Gotify or a webhook. See bridge/src/notify.php.
+  #
+  # It needs the poller: almost everything it reads comes out of the same tables, and one
+  # live call per key per pass for the craft listing. With NOTIFY_KEYS and POLL_KEYS both
+  # empty it says so once and exits, like the poller.
+  notifier:
+    build: ./bridge
+    restart: on-failure
+    entrypoint: ["php", "/app/src/notify.php"]
+
+    environment:
+      NOTIFY_URL: "http://api:80"
+      # Defaults to POLL_KEYS, which is normally the same list of players.
+      NOTIFY_KEYS: "${NOTIFY_KEYS-}"
+      POLL_KEYS: "${POLL_KEYS-}"
+      NOTIFY_INTERVAL: "${NOTIFY_INTERVAL:-15}"
+      HISTORY_DSN: "${HISTORY_DSN-}"
+      HISTORY_DB_HOST: "${HISTORY_DB_HOST-db}"
+      HISTORY_DB_NAME: "${POSTGRES_DB:-avorion}"
+      HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
+      HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      HISTORY_VERIFY_TTL: "${HISTORY_VERIFY_TTL:-300}"
+
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+    # Same as the poller: it sleeps between passes and cannot be woken early.
+    stop_grace_period: 5s
+
   # Docker creates a named volume owned by root, so with BRIDGE_USER set the API cannot
   # write /data - and Caddy needs it on startup even in plain-HTTP mode, because
   # skip_install_trust makes it provision the local CA whether or not TLS is served.

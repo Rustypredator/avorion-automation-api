@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Runs tests/test_history.php against a throwaway Postgres.
+# Runs the bridge's database tests against a throwaway Postgres.
 #
-# The history store is the one piece of real logic on the bridge side of the transport -
-# nothing in the Lua tests covers it - and it is SQL, so it cannot be tested against a
-# stub. This starts a database, runs the test in the same image the bridge is built from,
-# and takes both down again.
+# The history store and the notification rules are the only real logic on the bridge side
+# of the transport - nothing in the Lua tests covers either - and both are SQL, so they
+# cannot be tested against a stub. This starts a database, runs the tests in the same
+# image the bridge is built from, and takes both down again.
 #
 #   tools/dbtest.sh
 #
@@ -55,15 +55,26 @@ fi
 echo "building the bridge image"
 docker build -q -t "$TAG-php" ./docker/bridge >/dev/null || exit 1
 
-docker run --rm --network "$TAG" \
-    -v "$PWD:/w:ro" -w /w \
-    -e HISTORY_DB_HOST="$TAG" \
-    -e HISTORY_DB_NAME=avorion \
-    -e HISTORY_DB_USER=avorion \
-    -e HISTORY_DB_PASSWORD="$PASSWORD" \
-    --entrypoint php \
-    "$TAG-php" tests/test_history.php
-status=$?
+status=0
+
+for test in tests/test_history.php tests/test_notifications.php; do
+    echo
+    echo "$test"
+
+    # Read-only: nothing a test writes belongs in the checkout. test_notifications.php
+    # starts PHP's own web server from a router file, and puts it in the container's
+    # temp directory rather than here for exactly that reason.
+    docker run --rm --network "$TAG" \
+        -v "$PWD:/w:ro" -w /w \
+        -e HISTORY_DB_HOST="$TAG" \
+        -e HISTORY_DB_NAME=avorion \
+        -e HISTORY_DB_USER=avorion \
+        -e HISTORY_DB_PASSWORD="$PASSWORD" \
+        --entrypoint php \
+        "$TAG-php" "$test"
+
+    [ $? -ne 0 ] && status=1
+done
 
 docker rmi "$TAG-php" >/dev/null 2>&1
 

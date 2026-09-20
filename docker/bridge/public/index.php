@@ -22,6 +22,7 @@ const TIMEOUT = 30.0;
 set_time_limit(120);
 
 require __DIR__ . '/../src/history.php';
+require __DIR__ . '/../src/notifications.php';
 
 $galaxy = rtrim(getenv('GALAXY_DIR') ?: '/galaxy', '/');
 $root = $galaxy . '/moddata/AutomationAPI';
@@ -345,6 +346,136 @@ if (is_string($rawQuery) && $rawQuery !== '') {
     $query = array_filter($query, 'is_string');
 }
 
+// Caddy caps the body as well, but that cap simply makes the read come up short, so
+// the size has to be caught here to produce an honest error. The whole envelope has to
+// stay under the mod's 256 KB file limit, so leave room for the key, path and query.
+const MAX_BODY = 240 * 1024;
+
+if ((int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > MAX_BODY) {
+    fail(413, 'request_too_large', 'Body must be under 240 KB.');
+}
+
+$body = new stdClass();
+$rawBody = file_get_contents('php://input');
+if (is_string($rawBody) && strlen($rawBody) > MAX_BODY) {
+    fail(413, 'request_too_large', 'Body must be under 240 KB.');
+}
+if (is_string($rawBody) && $rawBody !== '') {
+    $decoded = json_decode($rawBody);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        fail(400, 'malformed_json', 'Body is not valid JSON.');
+    }
+    if (!$decoded instanceof stdClass) {
+        fail(400, 'malformed_request', 'Body must be an object.');
+    }
+    $body = $decoded;
+}
+
+/*
+ * /notifications is the bridge's own too, for the same reason /history is: it is built
+ * out of what the bridge has already collected, and the mod has no socket to push with.
+ * See src/notifications.php for what a rule is and src/notify.php for what sends them.
+ *
+ * Unlike /history, everything here belongs to a *player* rather than to a faction. Whose
+ * phone buzzes is not something an alliance shares, so the identity has to be current:
+ * the store relays a /ping through the transport when its answer about this key is stale,
+ * and a key the mod will not vouch for reads and writes nothing.
+ */
+if (str_starts_with($path, '/notifications')) {
+    if (!$keepHistory) {
+        fail(404, 'notifications_disabled',
+            'This bridge keeps no database: HISTORY_DSN is set empty, and notification '
+            . 'rules have nowhere to live. Unset it to turn the store back on.');
+    }
+
+    $notifications = new Notifications(new History($key, static fn (): array
+        => relay($requestDir, $responseDir, $key, 'GET', '/ping', [], new stdClass())));
+
+    $what = rawurldecode(substr($path, strlen('/notifications')));
+
+    /** Turns a store answer into a reply, or into the error it carries. */
+    $answer = static function (array $result, string $field): never {
+        if (isset($result['error'])) {
+            fail($result['error']['status'], $result['error']['code'],
+                 $result['error']['message']);
+        }
+
+        reply(200, [$field => $result[$field] ?? null]);
+    };
+
+    if ($method === 'GET' && ($what === '' || $what === '/' || $what === '/summary')) {
+        if ($notifications->player() === null) {
+            fail(401, 'unknown_key', 'The mod does not recognise this key, or could not '
+                . 'be asked. Notifications belong to a player, so the bridge has to be '
+                . 'told which one this is.');
+        }
+        reply(200, $notifications->summary());
+    }
+
+    // The catalogue: what a rule can watch and what a channel can be. Static, and the
+    // one thing here that needs no identity, so a client can build its form before the
+    // player has a key that works.
+    if ($method === 'GET' && $what === '/kinds') {
+        reply(200, ['kinds' => Notifications::KINDS, 'channelKinds' => Push::KINDS]);
+    }
+
+    if ($method === 'GET' && $what === '/channels') {
+        reply(200, ['channels' => $notifications->channels()]);
+    }
+
+    if ($method === 'POST' && $what === '/channels') {
+        $answer($notifications->saveChannel((array) $body), 'channel');
+    }
+
+    if ($method === 'POST' && $what === '/channels/delete') {
+        $result = $notifications->deleteChannel((string) ($body->name ?? ''));
+        if (isset($result['error'])) {
+            fail($result['error']['status'], $result['error']['code'], $result['error']['message']);
+        }
+        reply(200, $result);
+    }
+
+    // Sent now rather than queued: whoever pressed the button is waiting to find out
+    // whether the channel works.
+    if ($method === 'POST' && $what === '/channels/test') {
+        $name = isset($body->name) && is_string($body->name) && $body->name !== ''
+            ? $body->name : null;
+        $result = $notifications->test($name);
+        if (isset($result['error'])) {
+            fail($result['error']['status'], $result['error']['code'], $result['error']['message']);
+        }
+        reply(200, $result);
+    }
+
+    if ($method === 'GET' && $what === '/rules') {
+        reply(200, ['rules' => $notifications->rules()]);
+    }
+
+    if ($method === 'POST' && $what === '/rules') {
+        $answer($notifications->saveRule((array) $body), 'rule');
+    }
+
+    if ($method === 'POST' && $what === '/rules/delete') {
+        $result = $notifications->deleteRule((string) ($body->name ?? ''));
+        if (isset($result['error'])) {
+            fail($result['error']['status'], $result['error']['code'], $result['error']['message']);
+        }
+        reply(200, $result);
+    }
+
+    if ($method === 'GET' && $what === '/log') {
+        reply(200, ['log' => $notifications->log((int) ($query['limit'] ?? 50))]);
+    }
+
+    fail(404, 'no_such_route', sprintf(
+        'The bridge serves GET /notifications, /notifications/kinds, '
+        . '/notifications/channels, /notifications/rules and /notifications/log, and POST '
+        . '/notifications/channels, /notifications/channels/delete, '
+        . '/notifications/channels/test, /notifications/rules and '
+        . '/notifications/rules/delete. It does not serve %s %s.',
+        $method, $what === '' ? '/notifications' : '/notifications' . $what));
+}
+
 /*
  * /history is the bridge's own, and is answered here rather than forwarded.
  *
@@ -455,31 +586,6 @@ if (str_starts_with($path, '/history')) {
         . '/history/economy/series, /history/economy/goods, /history/economy/observed and '
         . '/history/economy/events, and POST /history/clear. It does not serve %s %s.',
         $method, $what === '' ? '/history' : '/history' . $what));
-}
-
-// Caddy caps the body as well, but that cap simply makes the read come up short, so
-// the size has to be caught here to produce an honest error. The whole envelope has to
-// stay under the mod's 256 KB file limit, so leave room for the key, path and query.
-const MAX_BODY = 240 * 1024;
-
-if ((int) ($_SERVER['CONTENT_LENGTH'] ?? 0) > MAX_BODY) {
-    fail(413, 'request_too_large', 'Body must be under 240 KB.');
-}
-
-$body = new stdClass();
-$rawBody = file_get_contents('php://input');
-if (is_string($rawBody) && strlen($rawBody) > MAX_BODY) {
-    fail(413, 'request_too_large', 'Body must be under 240 KB.');
-}
-if (is_string($rawBody) && $rawBody !== '') {
-    $decoded = json_decode($rawBody);
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        fail(400, 'malformed_json', 'Body is not valid JSON.');
-    }
-    if (!$decoded instanceof stdClass) {
-        fail(400, 'malformed_request', 'Body must be an object.');
-    }
-    $body = $decoded;
 }
 
 $result = relay($requestDir, $responseDir, $key, $method, $path, $query, $body);

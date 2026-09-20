@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 4;
+    private const SCHEMA = 5;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -219,7 +219,8 @@ final class Db
      */
     private static function migrations(): array
     {
-        return [2 => self::base(), 3 => self::shared(), 4 => self::stationEvents()];
+        return [2 => self::base(), 3 => self::shared(), 4 => self::stationEvents(),
+                5 => self::notifications()];
     }
 
     /**
@@ -574,6 +575,147 @@ final class Db
                  key_id     BIGINT      PRIMARY KEY REFERENCES api_keys(id) ON DELETE CASCADE,
                  boot       TEXT        NOT NULL,
                  cursor     BIGINT      NOT NULL DEFAULT 0,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+             )',
+        ];
+    }
+
+    /**
+     * Version 5: push notifications - where to send them, when to send them, and what has
+     * already been sent.
+     *
+     * These belong to a player rather than to a faction, which everything since version 3
+     * does. That is deliberate and is the one place in this store where it is right: a
+     * notification is somebody's phone buzzing, not a record of what a craft did. Two
+     * members of an alliance want different things from the same fleet, and neither should
+     * be able to switch the other's alerts off or read the other's ntfy token. A rule that
+     * wants the alliance's craft says so with `alliance`, and is still that player's rule.
+     *
+     * The player is the index the mod reports for a key, so a player's second key
+     * configures the same notifications rather than a second private set.
+     *
+     * @return list<string>
+     */
+    private static function notifications(): array
+    {
+        return [
+            /*
+             * Where a notification goes. `kind` picks the driver in src/push.php; `url` is
+             * the server, and what else is needed lives in `config` - a topic for ntfy,
+             * headers for a webhook.
+             *
+             * `token` is a credential at rest, and unlike an API key it cannot be hashed:
+             * this process has to present it to the push server. It is never handed back
+             * out - the API answers `hasToken` and nothing else - and it is worth about as
+             * much as the ability to send that player a message.
+             */
+            'CREATE TABLE IF NOT EXISTS notification_channels (
+                 id         BIGSERIAL   PRIMARY KEY,
+                 player     BIGINT      NOT NULL,
+                 name       TEXT        NOT NULL,
+                 kind       TEXT        NOT NULL,
+                 url        TEXT        NOT NULL DEFAULT \'\',
+                 token      TEXT        NOT NULL DEFAULT \'\',
+                 config     JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 enabled    BOOLEAN     NOT NULL DEFAULT TRUE,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 UNIQUE (player, name)
+             )',
+
+            /*
+             * When to send one. `kind` is what is being watched and decides how `config` is
+             * read - see src/notifications.php, which also serves the catalogue the console
+             * builds its form from.
+             *
+             * `ship` empty means every craft in scope. `alliance` widens that scope from the
+             * player\'s own craft to their alliance\'s as well, which is off by default
+             * because an alliance fleet is somebody else\'s business by default.
+             *
+             * `quiet` is the floor between two of the same rule about the same craft. A
+             * fight is a long sequence of events and none of them is worth a second buzz.
+             */
+            'CREATE TABLE IF NOT EXISTS notification_rules (
+                 id         BIGSERIAL   PRIMARY KEY,
+                 player     BIGINT      NOT NULL,
+                 name       TEXT        NOT NULL,
+                 kind       TEXT        NOT NULL,
+                 enabled    BOOLEAN     NOT NULL DEFAULT TRUE,
+                 ship       TEXT        NOT NULL DEFAULT \'\',
+                 alliance   BOOLEAN     NOT NULL DEFAULT FALSE,
+                 config     JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 channels   JSONB       NOT NULL DEFAULT \'[]\'::jsonb,
+                 priority   INTEGER     NOT NULL DEFAULT 3,
+                 quiet      INTEGER     NOT NULL DEFAULT 300,
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 UNIQUE (player, name)
+             )',
+
+            /*
+             * What one rule has already made of one craft.
+             *
+             * Two things at once, and both are needed. `firing` is the edge: a rule about
+             * hull below half fires when the hull crosses that line, not once a pass for as
+             * long as it stays under it. `fired_at` is the quiet period. `value` is what it
+             * last saw, which is what makes the crossing detectable at all, and `token`
+             * is the same thing for what is not a number: the id of the plan that ended,
+             * the name of the boss that was seen.
+             */
+            'CREATE TABLE IF NOT EXISTS notification_marks (
+                 rule_id  BIGINT      NOT NULL REFERENCES notification_rules(id) ON DELETE CASCADE,
+                 subject  TEXT        NOT NULL,
+                 firing   BOOLEAN     NOT NULL DEFAULT FALSE,
+                 value    DOUBLE PRECISION,
+                 token    TEXT        NOT NULL DEFAULT \'\',
+                 fired_at TIMESTAMPTZ,
+                 seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 PRIMARY KEY (rule_id, subject)
+             )',
+
+            /*
+             * The outbox, which is also the log the console shows.
+             *
+             * A row is written when a rule fires and updated when it is delivered, so a
+             * push server that is down is a row with attempts on it rather than a
+             * notification that never existed. `rule` keeps the rule\'s name even after the
+             * rule is deleted, because the log outlives it.
+             */
+            'CREATE TABLE IF NOT EXISTS notifications (
+                 id           BIGSERIAL   PRIMARY KEY,
+                 player       BIGINT      NOT NULL,
+                 rule_id      BIGINT      REFERENCES notification_rules(id) ON DELETE SET NULL,
+                 rule         TEXT        NOT NULL DEFAULT \'\',
+                 kind         TEXT        NOT NULL DEFAULT \'\',
+                 ship         TEXT        NOT NULL DEFAULT \'\',
+                 title        TEXT        NOT NULL,
+                 body         TEXT        NOT NULL DEFAULT \'\',
+                 priority     INTEGER     NOT NULL DEFAULT 3,
+                 data         JSONB       NOT NULL DEFAULT \'{}\'::jsonb,
+                 created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 delivered_at TIMESTAMPTZ,
+                 attempts     INTEGER     NOT NULL DEFAULT 0,
+                 next_try     TIMESTAMPTZ,
+                 error        TEXT        NOT NULL DEFAULT \'\'
+             )',
+
+            'CREATE INDEX IF NOT EXISTS notifications_player_idx
+                 ON notifications (player, created_at DESC)',
+
+            // The delivery queue: undelivered rows whose backoff has run out.
+            'CREATE INDEX IF NOT EXISTS notifications_pending_idx
+                 ON notifications (next_try) WHERE delivered_at IS NULL',
+
+            /*
+             * How far the notifier has read one player\'s craft events.
+             *
+             * Per player, not per key: the rules are the player\'s, so two of their keys
+             * polling must not each raise the same alert. Events arrive in the `events`
+             * table from the poller, so this is an id in that table and nothing else.
+             */
+            'CREATE TABLE IF NOT EXISTS notification_watch (
+                 player     BIGINT      PRIMARY KEY,
+                 last_event BIGINT      NOT NULL DEFAULT 0,
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
              )',
         ];
