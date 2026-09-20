@@ -248,7 +248,8 @@ final class Enrolment
              ON CONFLICT (key_hash) DO UPDATE
                  SET secret = EXCLUDED.secret, player = EXCLUDED.player,
                      label = EXCLUDED.label, poll = EXCLUDED.poll,
-                     notify = EXCLUDED.notify, failures = 0, error = \'\''
+                     notify = EXCLUDED.notify, failures = 0, error = \'\',
+                     from_env = FALSE'
         );
         $statement->bindValue(':h', $hash);
         $statement->bindValue(':s', self::seal($key));
@@ -471,26 +472,36 @@ final class Enrolment
      * the mod who a key is; the service's next successful pass fills it in, and until then
      * the row simply does not appear on that player's console.
      *
-     * Existing rows are never touched, so an admin who has left the variable set cannot
-     * keep overriding what a player chose from the console.
+     * The two services import in parallel and may name the same key - NOTIFY_KEYS used to
+     * default to POLL_KEYS, so on most deployments they name exactly the same keys. So
+     * whichever gets there second has to add its own service to the row the first one
+     * made, rather than finding it already present and doing nothing. `from_env` is what
+     * makes that safe: it is only ever true on a row nobody has enrolled from the console,
+     * so an admin who has left the variable set cannot switch a service back on that a
+     * player deliberately switched off.
      *
      * @param list<string> $keys
      */
     public static function importEnv(string $service, array $keys): int
     {
+        if (!isset(self::SERVICES[$service])) {
+            throw new InvalidArgumentException('unknown service ' . $service);
+        }
         if (!self::available() || $keys === []) {
             return 0;
         }
 
         $insert = Db::connect()->prepare(
-            "INSERT INTO service_keys (key_hash, secret, label, {$service})
-             VALUES (:h, :s, :l, TRUE) ON CONFLICT (key_hash) DO NOTHING"
+            "INSERT INTO service_keys (key_hash, secret, label, {$service}, from_env)
+             VALUES (:h, :s, :l, TRUE, TRUE)
+             ON CONFLICT (key_hash) DO UPDATE SET {$service} = TRUE
+             WHERE service_keys.from_env AND NOT service_keys.{$service}"
         );
 
         $added = 0;
         foreach ($keys as $key) {
             $insert->execute([':h' => self::hash($key), ':s' => self::seal($key),
-                              ':l' => 'from ' . strtoupper($service) . '_KEYS']);
+                              ':l' => 'carried over from .env']);
             $added += $insert->rowCount();
         }
 

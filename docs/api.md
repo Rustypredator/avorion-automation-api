@@ -2696,6 +2696,19 @@ and cannot be walked back to it.
 Enrolment is refused outright, with `503 enrolment_disabled`, where no secret is
 configured. A bridge that cannot store a key safely does not store one another way.
 
+## Upgrading from POLL_KEYS
+
+Keys still listed in `POLL_KEYS` or `NOTIFY_KEYS` are moved into the table once, on the
+service's next start, and the settings are then ignored - so upgrading a running stack
+does not silently stop recording or alerting. `NOTIFY_KEYS` still falls back to
+`POLL_KEYS` for that one import, because it always did and most deployments never set it.
+
+A carried-over row has no player on it until the first pass that works, so it does not
+appear on anybody's console before then, and it is marked as coming from `.env`. That mark
+is what lets the poller and the notifier each add their own service to the same row while
+stopping an admin who leaves the variable set from overriding what a player has since
+chosen on the console. Enrolling the key properly clears it.
+
 ## GET /services/kinds
 
 The catalogue: what a key can be enrolled for. Needs no identity and works with no secret

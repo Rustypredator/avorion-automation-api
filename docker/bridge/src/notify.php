@@ -42,7 +42,8 @@ declare(strict_types=1);
  *   NOTIFY_URL       base URL of the bridge (default http://api:80)
  *   NOTIFY_TIMEOUT   seconds to allow one call (default 30)
  *   NOTIFY_KEYS      deprecated, as POLL_KEYS is: keys still listed here are moved into
- *                    the table once on startup and the setting is then ignored.
+ *                    the table once on startup and the setting is then ignored. It still
+ *                    falls back to POLL_KEYS for that one import, because it always did.
  */
 
 require_once __DIR__ . '/db.php';
@@ -69,11 +70,19 @@ if (!Enrolment::available()) {
     exit(1);
 }
 
-// As in the poller: keys an older deployment still names in .env are moved into the table
-// once, so upgrading a running stack does not silently stop alerting. NOTIFY_KEYS used to
-// fall back to POLL_KEYS, and the poller's own import covers that half.
+/*
+ * As in the poller: keys an older deployment still names in .env are moved into the table
+ * once, so upgrading a running stack does not silently stop alerting.
+ *
+ * The fallback to POLL_KEYS is kept here on purpose, because that is what NOTIFY_KEYS did
+ * and most deployments therefore never set it. Without it, everyone who relied on the
+ * default would come up polling but not alerting, and would find out by not being told
+ * about a fight - which is the worst possible way to discover an upgrade changed
+ * something. From here on the two are separate opt-ins; this only reproduces what the
+ * deployment already had.
+ */
 $carriedOver = Enrolment::importEnv('notify', array_values(array_filter(array_map('trim',
-    explode(',', (string) (getenv('NOTIFY_KEYS') ?: ''))),
+    explode(',', (string) (getenv('NOTIFY_KEYS') ?: getenv('POLL_KEYS') ?: ''))),
     static fn (string $k): bool => $k !== '')));
 
 if ($carriedOver > 0) {

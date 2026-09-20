@@ -235,13 +235,39 @@ check($row->fetchColumn() === null,
 
 check(Enrolment::importEnv('poll', [$legacy]) === 0, 'importing again changes nothing');
 
+/*
+ * The two services import in parallel and, because NOTIFY_KEYS used to default to
+ * POLL_KEYS, usually name the same keys. So the second one has to add its service to the
+ * row the first one made rather than finding it present and doing nothing - otherwise an
+ * upgrade comes up polling but silently not alerting.
+ */
+check(Enrolment::importEnv('notify', [$legacy]) === 1,
+      'the other service adds itself to a row the first one imported');
+check(in_array($legacy, array_column(Enrolment::keysFor('notify')['keys'], 'key'), true),
+      'so a deployment that only ever set POLL_KEYS keeps its alerts');
+check(in_array($legacy, array_column(Enrolment::keysFor('poll')['keys'], 'key'), true),
+      'without disturbing the one that was already there');
+
+// But only while nobody has chosen otherwise. An admin who leaves the variable set must
+// not keep switching a service back on that a player deliberately switched off.
+$dave = freshPlayer();
+Enrolment::enrol($legacy, $dave, ['poll' => true, 'notify' => false], 'mine now');
+check(Enrolment::importEnv('notify', [$legacy]) === 0,
+      'a key a player has enrolled is not touched by the .env import again');
+check(!in_array($legacy, array_column(Enrolment::keysFor('notify')['keys'], 'key'), true),
+      'so what the player chose stands');
+
 // The first successful pass is what fills the player in, which is also what makes the
 // row appear on that player's console.
+$other = freshKey();
+$otherId = hash('sha256', $other);
+Enrolment::importEnv('poll', [$other]);
+
 $carol = freshPlayer();
-Enrolment::attribute($legacyId, $carol);
+Enrolment::attribute($otherId, $carol);
 check(count(Enrolment::mine($carol)) === 1, 'the first pass that works attributes it');
 
-Enrolment::attribute($legacyId, $bob);
+Enrolment::attribute($otherId, $bob);
 check(count(Enrolment::mine($carol)) === 1, 'and a later pass cannot move it to someone else');
 
 echo "\nno secret\n";

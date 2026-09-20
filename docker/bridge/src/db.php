@@ -759,7 +759,13 @@ final class Db
                  enrolled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                  used_at     TIMESTAMPTZ,
                  failures    INTEGER     NOT NULL DEFAULT 0,
-                 error       TEXT        NOT NULL DEFAULT \'\'
+                 error       TEXT        NOT NULL DEFAULT \'\',
+                 -- Carried over from POLL_KEYS or NOTIFY_KEYS rather than enrolled by a
+                 -- player. It is what lets the two services each add their own service to
+                 -- a row the other one imported first, without either of them being able
+                 -- to override something a player chose on the console. Cleared the
+                 -- moment anybody enrols the key properly.
+                 from_env    BOOLEAN     NOT NULL DEFAULT FALSE
              )',
 
             // What each service reads at the top of every pass: the handful of rows that

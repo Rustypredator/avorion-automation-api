@@ -217,8 +217,11 @@ services:
 
     environment:
       NOTIFY_URL: "http://api:80"
-      # Deprecated, like POLL_KEYS above: imported once on startup, then ignored.
+      # Both deprecated, like POLL_KEYS above: imported once on startup, then ignored.
+      # POLL_KEYS is here because NOTIFY_KEYS used to fall back to it, so a deployment
+      # that only ever set the one still gets its alerts carried over.
       NOTIFY_KEYS: "${NOTIFY_KEYS-}"
+      POLL_KEYS: "${POLL_KEYS-}"
       NOTIFY_INTERVAL: "${NOTIFY_INTERVAL:-15}"
       HISTORY_DSN: "${HISTORY_DSN-}"
       HISTORY_DB_HOST: "${HISTORY_DB_HOST-db}"
