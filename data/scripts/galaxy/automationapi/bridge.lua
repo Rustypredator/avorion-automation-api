@@ -17,6 +17,7 @@ local Router = include("automationapi/router")
 local Serialize = include("automationapi/serialize")
 
 local MetaHandler = include("automationapi/handlers/meta")
+local KeysHandler = include("automationapi/handlers/keys")
 local ShipsHandler = include("automationapi/handlers/ships")
 local MissionsHandler = include("automationapi/handlers/missions")
 local MissionAutomation = include("automationapi/handlers/missionautomation")
@@ -264,6 +265,10 @@ local function handleRequest(requestId, request)
         body = body,
         playerIndex = playerIndex,
         player = player,
+        -- Which key this arrived with, short enough to be safe to hand back. /keys marks
+        -- the caller's own key with it; nothing else needs the key itself, so the key
+        -- itself stays out of the context every handler can see.
+        keyFingerprint = Auth.fingerprint(request.key),
         now = Server().unpausedRuntime,
     }
 
@@ -502,6 +507,7 @@ function AutomationApiBridge.initialize()
 
     router = Router.new()
     MetaHandler.register(router)
+    KeysHandler.register(router)
     ShipsHandler.register(router)
     MissionsHandler.register(router)
     MissionAutomation.register(router)

@@ -138,6 +138,28 @@ function Auth.listKeys(playerIndex)
     return result
 end
 
+-- Changes a key's label. Returns true if this player owns a key with that fingerprint.
+--
+-- The file the key was also written to keeps the label it was made with. That file exists
+-- to be copied out of once, and rewriting it would mean holding a key in a second place
+-- for no gain; a stale comment in it is cheaper than that.
+function Auth.renameKey(playerIndex, fingerprint, label)
+    local player = Player(playerIndex)
+    if not player then return false end
+
+    local keys = loadKeys(player)
+
+    for _, entry in ipairs(keys) do
+        if Auth.fingerprint(entry.key) == fingerprint then
+            entry.label = label or ""
+            saveKeys(player, keys)
+            return true
+        end
+    end
+
+    return false
+end
+
 -- Returns true if a key was removed.
 function Auth.revokeKey(playerIndex, fingerprint)
     local player = Player(playerIndex)
