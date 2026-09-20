@@ -67,6 +67,12 @@ get() {
         "http://127.0.0.1:$PORT$2"
 }
 
+post() {
+    curl -s -m 40 -o "$WORK/body" -w '%{http_code}' -X POST \
+        -H "X-API-Key: $1" -H 'Content-Type: application/json' \
+        -d "$3" "http://127.0.0.1:$PORT$2"
+}
+
 json() { python3 -c "$1" "$WORK/body" 2>/dev/null; }
 
 # Waits for the bridge to answer at all, whatever it answers.
@@ -275,20 +281,56 @@ stations="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["statio
 check "$([ "$status" = "200" ] && [ "$stations" = "0" ] && echo 0 || echo 1)" \
     "an unknown key reads an empty economy, not someone else's" "got $status, $stations stations"
 
+# #### Enrolment #### --
+#
+# Which keys the background services may call the API with. Nothing is listed in .env any
+# more, so this is the step that makes the two sections below do anything at all - and it
+# is the one place the stack stores a credential, so it is worth proving against a real
+# database and a real secret rather than only in tests/test_enrolment.php.
+
+echo
+echo "enrolment"
+
+status="$(get "$KEY" /services)"
+enrolled="$(json 'import json,sys;print(len(json.load(open(sys.argv[1]))["enrolled"]))')"
+check "$([ "$status" = "200" ] && [ "$enrolled" = "0" ] && echo 0 || echo 1)" \
+    "a fresh stack has nobody enrolled" "got $status, $enrolled enrolled"
+
+# No key in the body: the bridge takes the one off the header, which is how the console
+# enrols the key it is already connected with.
+status="$(post "$KEY" /services/enrol '{"poll":true,"notify":false,"label":"e2e"}')"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" \
+    "a player enrols their own key through the bridge" "got $status: $(code)"
+
+status="$(get "$KEY" /services)"
+leaked="$(grep -c "$KEY" "$WORK/body" 2>/dev/null || true)"
+services="$(json 'import json,sys;e=json.load(open(sys.argv[1]))["enrolled"];print(",".join(sorted(k for k in ("poll","notify") if e[0][k])))')"
+check "$([ "$leaked" = "0" ] && echo 0 || echo 1)" \
+    "and reading it back never carries the key" "found it $leaked time(s)"
+check "$([ "$services" = "poll" ] && echo 0 || echo 1)" \
+    "only for the service it was enrolled for" "got '$services'"
+
+status="$(post none /services/enrol '{"poll":true}')"
+check "$([ "$status" = "401" ] && echo 0 || echo 1)" \
+    "a key the mod does not know enrols nothing" "got $status: $(code)"
+
+status="$(post "$KEY" /services/enrol '{"key":"avo_not_a_real_key","poll":true}')"
+check "$([ "$status" = "400" ] && echo 0 || echo 1)" \
+    "nor does a key it will not vouch for, offered in the body" "got $status: $(code)"
+
 # #### The poller #### --
 #
 # The service that makes the history continuous. Nothing in the mod pushes, so without
 # this the record only covers the moments something happened to be calling - which is the
 # one property of the store a user is most likely to be surprised by. Worth pinning that
 # it actually runs on its own.
+#
+# It has been running since the stack came up, idling because nothing was enrolled. The
+# enrolment above is what starts it working, within one POLL_INTERVAL and with nothing
+# restarted - which is the point of taking the list out of .env.
 
 echo
 echo "poller"
-
-# It starts with POLL_KEYS empty, so up to here it has said so and exited. Give it the key
-# the fake server issued and bring it back.
-echo "POLL_KEYS=$KEY" >> "$WORK/env"
-"${COMPOSE[@]}" up -d poller >/dev/null 2>&1
 
 curl -s -m 40 -X POST -o /dev/null -H "X-API-Key: $KEY" \
     "http://127.0.0.1:$PORT/history/clear" 2>/dev/null
@@ -328,9 +370,9 @@ utilization="$(json 'import json,sys;b=json.load(open(sys.argv[1]));p=b["station
 check "$([ "$utilization" = "0.6667" ] && echo 0 || echo 1)" \
     "and the production windows become a measured utilisation" "got '$utilization'"
 
-logs="$("${COMPOSE[@]}" logs poller 2>&1 | tail -20)"
-check "$(echo "$logs" | grep -q 'polling 1 key' && echo 0 || echo 1)" \
-    "and says what it is polling on startup" "$(echo "$logs" | tail -3)"
+logs="$("${COMPOSE[@]}" logs poller 2>&1 | tail -30)"
+check "$(echo "$logs" | grep -q '1 key enrolled' && echo 0 || echo 1)" \
+    "and noticed the enrolment without being restarted" "$(echo "$logs" | tail -3)"
 
 # #### Notifications #### --
 #
@@ -341,12 +383,6 @@ check "$(echo "$logs" | grep -q 'polling 1 key' && echo 0 || echo 1)" \
 
 echo
 echo "notifications"
-
-post() {
-    curl -s -m 40 -o "$WORK/body" -w '%{http_code}' -X POST \
-        -H "X-API-Key: $1" -H 'Content-Type: application/json' \
-        -d "$3" "http://127.0.0.1:$PORT$2"
-}
 
 status="$(post "$KEY" /notifications/channels \
     '{"name":"Sink","kind":"webhook","url":"http://127.0.0.1:9/nowhere"}')"
@@ -372,17 +408,20 @@ status="$(get none /notifications)"
 check "$([ "$status" = "401" ] && echo 0 || echo 1)" \
     "and a key the mod does not know configures nothing" "got $status: $(code)"
 
-echo "NOTIFY_KEYS=$KEY" >> "$WORK/env"
-"${COMPOSE[@]}" up -d notifier >/dev/null 2>&1
+# Alerts are their own opt-in: enrolling to have a fleet recorded does not sign anybody
+# up to be messaged about it. This is the second half of the same enrolment.
+status="$(post "$KEY" /services/update "{\"id\":\"$(printf %s "$KEY" | sha256sum | cut -d' ' -f1)\",\"notify\":true}")"
+check "$([ "$status" = "200" ] && echo 0 || echo 1)" \
+    "alerts are switched on separately from the recording" "got $status: $(code)"
 
 for _ in $(seq 1 30); do
-    logs="$("${COMPOSE[@]}" logs notifier 2>&1 | tail -20)"
-    echo "$logs" | grep -q 'watching 1 key' && break
+    logs="$("${COMPOSE[@]}" logs notifier 2>&1 | tail -30)"
+    echo "$logs" | grep -q '1 key enrolled for alerts' && break
     sleep 1
 done
 
-check "$(echo "$logs" | grep -q 'watching 1 key' && echo 0 || echo 1)" \
-    "the notifier service comes up and says what it is watching" "$(echo "$logs" | tail -3)"
+check "$(echo "$logs" | grep -q '1 key enrolled for alerts' && echo 0 || echo 1)" \
+    "and the notifier picks that up on its own" "$(echo "$logs" | tail -3)"
 
 # #### Self-healing #### --
 #

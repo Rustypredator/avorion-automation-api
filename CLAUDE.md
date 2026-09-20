@@ -96,25 +96,32 @@ docs/
   external.md   how to write a bridge/client; reference Python bridge
   local-testing.md  local server, bridge over HTTPS (self-signed), boss lab + findings
 docker/                         deployment only, NOT shipped to Workshop
-  docker-compose.yml            services: api (FrankenPHP bridge), db (Postgres), poller, init
+  docker-compose.yml            services: api (FrankenPHP bridge), db (Postgres), poller,
+                                notifier, init (also generates the enrolment secret)
   Caddyfile, .env.example       plain HTTP site + self-signed HTTPS site (TLS_HOSTS)
-  bridge/public/index.php       HTTP <-> file relay, serves /history/* and /notifications/*
+  bridge/public/index.php       HTTP <-> file relay, serves /history/*, /notifications/*
+                                and /services/* (enrolment)
   bridge/src/db.php             PDO connection + schema/migrations
   bridge/src/history.php        history store: visits, events, station/faction samples, manifests,
                                 station events (all rows owned by faction, see Storage in api.md)
   bridge/src/notifications.php  push notification store + rule engine (rows owned by PLAYER,
                                 not faction: whose phone buzzes is not shared by an alliance)
   bridge/src/push.php           the ntfy / gotify / webhook drivers, and channel validation
-  bridge/src/notify.php         notifier loop (NOTIFY_KEYS, defaults to POLL_KEYS): evaluates
-                                rules over the `events` table + one /ships call, then delivers
-  bridge/src/poll.php           poller loop (POLL_KEYS) calling the API over HTTP
+  bridge/src/enrolment.php      which API keys the poller/notifier may use: players opt in
+                                from the console, keys stored encrypted (the ONLY place the
+                                bridge holds a key rather than a hash), read every pass
+  bridge/src/notify.php         notifier loop: evaluates rules over the `events` table +
+                                one /ships call, then delivers. Keys from enrolment.php
+  bridge/src/poll.php           poller loop calling the API over HTTP, keys from
+                                enrolment.php; asks /ships?owner=all&type=all
 web/                            browser console, no build step, no deps, NOT shipped
   index.html, app.css
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (fleet, missions, orders + standing orders incl. flee,
               cargo transfer, Automation tab (programs + mission rules + standing orders per
-              craft), Alerts tab (push channels + rules, off the bridge), economy + station
-              activity log (live feed merged with history), industry)
+              craft), Alerts tab (background service enrolment + push channels + rules, all
+              off the bridge), economy + station activity log (live feed merged with
+              history), industry)
   map.js      canvas galaxy map, heatmap/travel overlays
 tests/
   mock_avorion.lua   hostile mock of the sandbox (Mock.install/reset/addPlayer/addAlliance/
@@ -123,13 +130,15 @@ tests/
   test_history.php   history store against real Postgres (via tools/dbtest.sh)
   test_notifications.php  notification rules and delivery, same Postgres, same script;
                      delivery is checked against PHP's own web server on localhost
+  test_enrolment.php  the service-key store: sealing, scoping, failure handling
   test_console.js    web console under jsdom (via tools/uitest.sh)
 tools/
   bump.sh       set version everywhere
   copy.sh       copy shippable files (git-tracked data/ docs/ tests/ + top-level) to mods dir
   fakeserver.lua  runs real bridge.lua on a real clock against MOCK_ROOT (prints API keys)
   e2e.sh        docker stack + fakeserver end-to-end
-  dbtest.sh     throwaway Postgres + test_history.php
+  dbtest.sh     throwaway Postgres + test_history.php, test_notifications.php,
+                test_enrolment.php
   uitest.sh     node image + jsdom + test_console.js
   localserver.sh  headless AvorionServer on the test galaxy, console via FIFO
                   (start/stop/cmd/run/lab/key/log); paths in gitignored tools/local.env

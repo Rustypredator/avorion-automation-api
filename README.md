@@ -340,10 +340,11 @@ A few things to know about it:
 
 - **Nothing in the mod pushes.** Movement is only recorded when something asks for `/ships`,
   and the mod's own event log is a 200-entry ring buffer that drops its oldest entry whether
-  or not anyone collected it. The `poller` service is what keeps something asking - set
-  `POLL_KEYS` in `.env` to the keys whose fleets should be recorded. Without it the history
-  only covers the moments a console happened to be open, and dwell is reported as *observed*
-  seconds rather than guessed at either way.
+  or not anyone collected it. The `poller` service is what keeps something asking - and it
+  only does so for players who have enrolled a key, on the console's **Alerts** tab under
+  *Background services*. Without that the history only covers the moments a console
+  happened to be open, and dwell is reported as *observed* seconds rather than guessed at
+  either way.
 - **Alliance history is shared; your own stays yours.** A row belongs to whoever owns the
   craft, as the mod reported it, so an alliance's fleet has one history whichever member's
   console or poller saw it, and every current member reads it. Your own craft are readable
@@ -351,11 +352,11 @@ A few things to know about it:
   mod which alliance a key's player is in every few minutes (`HISTORY_VERIFY_TTL`, default
   300s), so leaving an alliance takes its history with it, and while the game server is
   down nobody reads alliance history at all. No member can clear it.
-- **It never stores your API key**, only a SHA-256 of it, and nothing is written except off
-  the back of a call the mod itself answered. A key the mod refuses reads nothing.
-  `POLL_KEYS` is the one place a key is held at rest, because the poller has to
-  authenticate like any other client. One member's key there is enough to keep an
-  alliance's fleet recorded; each player's own fleet needs that player's key.
+- **It stores only a SHA-256 of your API key**, and nothing is written except off the back
+  of a call the mod itself answered. A key the mod refuses reads nothing. The one
+  exception is a key you *enrol*, below, which has to be kept because the poller presents
+  it. One member enrolling is enough to keep an alliance's fleet recorded; each player's
+  own fleet needs that player.
 
 Upgrading from a bridge that kept history per key needs nothing done by hand. The schema
 migrates on the first connection, each key keeps reading exactly what it recorded, and the
@@ -396,9 +397,40 @@ still yours, sent to your channels; another member configures their own and sees
 yours. Channel tokens are never handed back out by the API.
 
 Set them up on the console's **Alerts** tab, or through
-[`/notifications`](docs/api.md#push-notifications). The deployment side is one setting:
-`NOTIFY_KEYS` in `.env`, which defaults to `POLL_KEYS`. Unlike the poller, one member's key
-is *not* enough for an alliance - each player who wants alerts needs their own key listed.
+[`/notifications`](docs/api.md#push-notifications). Unlike the poller, one member is *not*
+enough for an alliance - each player who wants alerts enrols themselves, because a rule is
+theirs and goes to their channels.
+
+## Enrolling a key
+
+The poller and the notifier are ordinary API clients: they make the same calls the console
+does, so they need one of your keys to make them with. You give them one on the console's
+**Alerts** tab under *Background services*, or at
+[`/services`](docs/api.md#background-services), and pick the two opt-ins separately -
+*record my fleet* and *send me alerts* are different things to want.
+
+It takes effect within one pass. Nothing has to be restarted and nobody has to edit a file,
+which is the point: on a shared server, `POLL_KEYS` in `.env` meant every player who wanted
+a fleet watched was a job for whoever runs the box, and that person ended up holding
+everybody's credentials in a text file.
+
+**This is the one thing that stores a key rather than a hash of one**, because a background
+service has to present a key and no hash will do. What that means in practice:
+
+- The rows are encrypted with a secret the stack generates into the `enrol_secret` volume
+  on first start. That buys nothing against someone already inside the stack, and
+  everything against a database dump that travels without the secret - a backup, a copy of
+  a volume, a decommissioned disk. Back that volume up with the database; lose it and
+  everyone re-enrols.
+- The key is never handed back out. Reads answer with a hash as the row's id.
+- **forget** deletes it outright, and so does switching both opt-ins off. Revoking the key
+  in game with `/apikey revoke` stops it just as dead.
+- If you would rather not enrol the key you use day to day, make a second one with
+  `/apikey new` and enrol that. It can be revoked on its own.
+
+`POLL_KEYS` and `NOTIFY_KEYS` still work for one start after an upgrade: whatever is listed
+is moved into the database once and the settings are then ignored. Take them out of `.env`
+afterwards.
 
 An alert is never quicker than the poller, and a craft records nothing while its owner is
 logged out, so nothing about it can raise one then. That is the same limit the history store
@@ -439,6 +471,7 @@ Full reference in [docs/api.md](docs/api.md).
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
 | `GET /history/*` | where the fleet has been, and what its stations earned - served by the bridge, not the mod |
 | `GET`/`POST /notifications/*` | push notification channels and rules - also the bridge's, not the mod's |
+| `GET`/`POST /services/*` | which of your keys the bridge's poller and notifier may use - the bridge's too |
 
 ## What needs the owner online
 
@@ -473,7 +506,7 @@ bridge's [fleet history](#fleet-history) keeps filling on an empty server.
 
 | | |
 |---|---|
-| [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape, including the bridge's `/history` and `/notifications` |
+| [docs/api.md](docs/api.md) | every endpoint, its parameters and response shape, including the bridge's `/history`, `/notifications` and `/services` |
 | [docs/protocol.md](docs/protocol.md) | the file transport, envelopes, status codes, auth |
 | [docs/external.md](docs/external.md) | writing the bridge process and clients against it |
 | [docs/local-testing.md](docs/local-testing.md) | a local server, the bridge over HTTPS, and the boss lab |

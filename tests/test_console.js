@@ -548,7 +548,64 @@ function saveNotifyRule(sent) {
     return { rule: rule };
 }
 
+/*
+ * The bridge's enrolment store: which of this player's API keys its background poller and
+ * notifier may call the API with. Also the bridge's own - /services never reaches the
+ * game - so this plays its part, including the bit the page has to get right, that a key
+ * goes in and never comes back out.
+ */
+const enrolStore = { entries: [] };
+
+const ENROL_SERVICES = {
+    poll: { title: 'Record my fleet', about: 'Keeps something calling the API on a timer.' },
+    notify: { title: 'Send me alerts', about: 'Runs your rules while you are away.' }
+};
+
+function enrolSummary() {
+    return { services: ENROL_SERVICES, enrolled: enrolStore.entries };
+}
+
+function enrolKey(sent) {
+    // The real store hashes the key; here the id only has to be stable and not be the key.
+    const id = 'hash-of-' + (sent.key || 'the-header-key');
+    const existing = enrolStore.entries.filter((e) => e.id === id)[0];
+    const entry = existing || { id: id, enrolledAt: 1700000000, usedAt: null,
+                                failures: 0, error: '' };
+
+    entry.label = sent.label || '';
+    entry.poll = sent.poll === true;
+    entry.notify = sent.notify === true;
+
+    if (!existing) { enrolStore.entries.push(entry); }
+
+    return { entry: entry };
+}
+
+function updateEnrolled(sent) {
+    const entry = enrolStore.entries.filter((e) => e.id === sent.id)[0];
+    if (!entry) { return { entry: null }; }
+
+    if (sent.poll !== undefined) { entry.poll = sent.poll === true; }
+    if (sent.notify !== undefined) { entry.notify = sent.notify === true; }
+
+    // As the real store does: nothing left on means the bridge stops holding the key.
+    if (!entry.poll && !entry.notify) {
+        enrolStore.entries = enrolStore.entries.filter((e) => e.id !== sent.id);
+        return { entry: null };
+    }
+
+    return { entry: entry };
+}
+
+function forgetEnrolment(sent) {
+    enrolStore.entries = enrolStore.entries.filter((e) => e.id !== sent.id);
+    return { removed: true };
+}
+
 const dynamic = {
+    '/services/enrol': enrolKey,
+    '/services/update': updateEnrolled,
+    '/services/forget': forgetEnrolment,
     '/notifications/channels': saveNotifyChannel,
     '/notifications/rules': saveNotifyRule,
     '/notifications/channels/test': () => ({ results: [{ channel: 'Phone', ok: true, status: 200, error: '' }] }),
@@ -568,6 +625,7 @@ const dynamic = {
 
 const routes = {
     get '/notifications'() { return notifySummary(); },
+    get '/services'() { return enrolSummary(); },
     '/ping': { api: 1, mod: '0.4.0', galaxy: {}, server: {},
                player: { index: 1, name: 'Rusty', online: true } },
     // The type filter is not applied, as the checks above the Industry tab have always
@@ -2001,6 +2059,67 @@ const ready = window.document.readyState === 'loading'
     check(/No channels yet/.test(alerts().textContent), 'an empty setup says so');
     check(/Ore Hound: hull at 45%/.test(alerts().textContent),
           'and still shows what has already been sent');
+
+    /*
+     * Background services first, because nothing under it does anything until a key is
+     * enrolled - the poller and the notifier are ordinary clients and have to call the
+     * API as somebody.
+     */
+    check(/Nothing enrolled/.test(alerts().textContent),
+          'with nothing enrolled, the page says so rather than implying alerts will arrive');
+
+    click(alerts().querySelector('[data-act="enrol-new"]'));
+    await settle(50);
+    check(alerts().querySelector('[data-enrol="key"]').type === 'password',
+          'the key field is a password field, not plain text');
+    check(/leave empty/.test(alerts().querySelector('[data-enrol="key"]').placeholder),
+          'and can be left empty to enrol the key the console is already using');
+
+    change(alerts().querySelector('[data-enrol="label"]'), 'my fleet');
+    click(alerts().querySelector('[data-act="enrol-save"]'));
+    await settle(300);
+
+    const enrolSent = posts.filter((p) => p.path === '/services/enrol').pop();
+    check(enrolSent && enrolSent.body.key === undefined,
+          'an empty key field sends no key at all, so the bridge takes it off the header');
+    check(enrolSent && enrolSent.body.poll === true && enrolSent.body.notify === true,
+          'and both opt-ins are sent');
+    check(/my fleet/.test(alerts().textContent), 'the enrolment is listed afterwards');
+    check(!/Nothing enrolled/.test(alerts().textContent), 'and the warning is gone');
+
+    // Each service is its own opt-in: recording a fleet and being messaged about it are
+    // different things to want.
+    const alertSwitch = () => alerts().querySelector('[data-service="notify"]');
+    check(alertSwitch() && alertSwitch().checked, 'both services show as on');
+    alertSwitch().checked = false;
+    change(alertSwitch());
+    await settle(300);
+
+    const switched = posts.filter((p) => p.path === '/services/update').pop();
+    check(switched && switched.body.notify === false && switched.body.poll === undefined,
+          'switching one off sends only that one, leaving the other alone');
+    check(alerts().querySelector('[data-service="poll"]').checked,
+          'which is what the page shows');
+
+    click(alerts().querySelector('[data-service-forget]'));
+    await settle(300);
+    check(posts.filter((p) => p.path === '/services/forget').length === 1,
+          'and the whole enrolment can be withdrawn');
+    check(/Nothing enrolled/.test(alerts().textContent),
+          'after which the bridge holds nothing of ours again');
+
+    // Put one back, so the rest of the tab is exercised the way a real setup looks.
+    click(alerts().querySelector('[data-act="enrol-new"]'));
+    await settle(50);
+    change(alerts().querySelector('[data-enrol="key"]'), 'avo_dedicated');
+    click(alerts().querySelector('[data-act="enrol-save"]'));
+    await settle(300);
+
+    const pasted = posts.filter((p) => p.path === '/services/enrol').pop();
+    check(pasted && pasted.body.key === 'avo_dedicated',
+          'a key pasted in is sent, for a player who would rather enrol a second one');
+    check(!/avo_dedicated/.test(alerts().textContent),
+          'and is never shown back on the page');
 
     click(alerts().querySelector('[data-act="channel-new"]'));
     await settle(50);

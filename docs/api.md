@@ -2085,9 +2085,17 @@ so the travel record keeps filling whether or not anything is online to fly.
 
 **Nothing in the mod pushes.** History accumulates only while something is calling the API,
 and the mod's event log is a 200-entry ring buffer that drops its oldest entry whether or
-not anyone collected it. The compose stack runs a `poller` service for exactly this - set
-`POLL_KEYS` to the keys whose fleets should be recorded and it calls these endpoints
-every `POLL_INTERVAL` seconds (default 30), which is also the accuracy of a travel track.
+not anyone collected it. The compose stack runs a `poller` service for exactly this: for
+every key enrolled with [`POST /services/enrol`](#background-services) it calls these
+endpoints every `POLL_INTERVAL` seconds (default 30), which is also the accuracy of a
+travel track.
+
+It asks for `/ships?owner=all&type=all`, so an alliance's craft and everybody's stations
+are recorded, not just the calling player's own ships. Stations are left out of the visit
+log - a station's visit never ends, which is not a record of travel and would take over
+the heatmap - and out of the per-craft event calls, since the order chain does not run on
+one and the answer is always empty. What a station does is recorded through
+`/stations` and `/economy/events` instead.
 
 The station events are the one collection that is not a snapshot at all: they sit in the
 mod's buffer until something pages through `/economy/events`, and the poller does that on
@@ -2468,9 +2476,9 @@ a gap in a heatmap:
 * An alert is never quicker than the poller. `POLL_INTERVAL` is the floor.
 * A craft records nothing while its owner is logged out, because the player scripts that
   capture its events do not run then. Nothing about it can raise an alert.
-* The deployment has to list a player's API key in `NOTIFY_KEYS` (it defaults to
-  `POLL_KEYS`) for that player's rules to be run at all. Unlike the poller, one member's
-  key is **not** enough for an alliance: a rule belongs to a player.
+* A player has to have [enrolled a key](#background-services) with `notify` on for their
+  rules to be run at all. Unlike the poller, one member is **not** enough for an alliance:
+  a rule belongs to a player and goes to that player's channels.
 
 ## Whose they are
 
@@ -2652,3 +2660,122 @@ off - 30s, 60s, 2m, 4m, 8m - and given up on after six attempts, because an aler
 fight an hour ago is noise. One channel succeeding counts as delivered: the point is that
 the player hears about it, not that every route worked.
 
+
+# Background services
+
+Served by the bridge, not the mod. `GET`/`POST /services/*`.
+
+The `poller` and the `notifier` are ordinary API clients: they make the same calls a
+console does, over HTTP, and the mod authenticates them like anything else. So they need
+one of the player's keys to make those calls with, and something has to say whose.
+
+Up to schema 5 that was `POLL_KEYS` and `NOTIFY_KEYS` in the stack's `.env`. These
+endpoints replace it. A player enrols their own key, the keys live in the database, and
+each service re-reads them at the top of every pass - so enrolling takes effect within one
+interval, nothing is restarted, and an admin never handles anybody else's credential.
+
+## What is stored, and why it is a key rather than a hash
+
+Everywhere else the bridge keeps a SHA-256 of a key and never the key, because it only
+ever has to *recognise* one. A background service has to *present* one, and no hash the
+mod will accept can be derived from another. There is no version of "call the API as this
+player while they are asleep" that does not keep the player's key.
+
+So `service_keys.secret` is the key, encrypted with AES-256-GCM under a secret from
+`ENROL_SECRET`, or from the file at `ENROL_SECRET_FILE` (default `/run/enrol/secret`,
+which the compose stack generates into a volume on first start). Worth being plain about
+what that buys: nothing against someone already inside the stack, who can read the secret
+and the database alike; everything against the rows travelling without the secret, which
+is a backup, a copied volume, a decommissioned disk. Losing the secret is not corruption -
+the services skip what they cannot open and log it - but every player has to enrol again,
+so the volume deserves the same backup as the database.
+
+The key is never handed back out. A row's `id` is that same SHA-256, which is not the key
+and cannot be walked back to it.
+
+Enrolment is refused outright, with `503 enrolment_disabled`, where no secret is
+configured. A bridge that cannot store a key safely does not store one another way.
+
+## GET /services/kinds
+
+The catalogue: what a key can be enrolled for. Needs no identity and works with no secret
+configured, so a client can explain the feature - including explaining that this
+deployment has it switched off - before it holds a key that works.
+
+```json
+{
+  "services": {
+    "poll":   {"title": "Record my fleet", "about": "..."},
+    "notify": {"title": "Send me alerts",  "about": "..."}
+  },
+  "available": true,
+  "reason": ""
+}
+```
+
+## GET /services
+
+The catalogue, plus this player's own enrolments. Never anybody else's.
+
+```json
+{
+  "services": {"poll": {}, "notify": {}},
+  "enrolled": [
+    {"id": "9f86d081...", "label": "my fleet", "poll": true, "notify": false,
+     "enrolledAt": 1730000000, "usedAt": 1730000600, "failures": 0, "error": ""}
+  ]
+}
+```
+
+`usedAt` is the last pass that worked. `failures` and `error` are the last one that did
+not, which is how a player finds out their key was revoked rather than wondering why
+nothing arrives.
+
+## POST /services/enrol
+
+```json
+{"key": "avo_...", "poll": true, "notify": true, "label": "my fleet"}
+```
+
+`key` is optional and usually left out: without it the bridge enrols the key the call was
+made with, which is the one the console is already signed in as, so nothing has to be
+pasted anywhere. Give one to enrol a different key - a second key from `/apikey new`, so
+it can be revoked on its own - and the bridge relays a `/ping` for it first. A key the mod
+will not answer for is `400 bad_key`; one belonging to a different player is
+`403 not_your_key`.
+
+Enrolling a key already enrolled updates it in place and clears its failure count, which
+is how a player asks for one to be tried again.
+
+**Both opt-ins false removes the enrolment**, deleting the stored key. A key the bridge is
+not going to present is one it has no business holding.
+
+Answers `{"entry": {...}}`, or `{"entry": null}` when that last case applies.
+
+## POST /services/update
+
+```json
+{"id": "9f86d081...", "notify": false}
+```
+
+Changes what an enrolment is used for without the key being sent again - which is what the
+console's two switches do. A service left out of the body is left as it was. As above,
+switching the last one off deletes the row. `404 not_enrolled` if the id is not one of
+this player's.
+
+## POST /services/forget
+
+```json
+{"id": "9f86d081..."}
+```
+
+Deletes the stored key. Answers `{"removed": true}`, or `404 not_enrolled`.
+
+## What the services do with a failure
+
+A pass that works clears the row's failure count and stamps `usedAt`. A pass that fails
+counts, and the reason is kept for the player to read. `401` or `403` from the mod is the
+key having been revoked, or the galaxy replaced under it, which is not worth retrying for
+a week - that goes straight to the ceiling and the row stops being read. Everything else
+is an outage and takes 20 passes to get there. The row stays visible either way, and
+enrolling again clears it.
