@@ -58,6 +58,12 @@ services:
       # How long the mod's word on which alliance a key's player is in stays good. Alliance
       # history is shared between members, so a read past this asks the mod again first.
       HISTORY_VERIFY_TTL: "${HISTORY_VERIFY_TTL:-300}"
+      # The key the enrolled API keys are encrypted with. Normally left unset: the init
+      # service below generates one into the enrol_secret volume and every service that
+      # needs it reads it from there, so it never goes near .env. Setting it here
+      # overrides the file - do that only if you are managing the secret yourself, and
+      # keep it, because changing it makes every existing enrolment unreadable.
+      ENROL_SECRET: "${ENROL_SECRET-}"
 
     # moddata only, so a bridge process that misbehaves still cannot reach saves or the
     # globals file the API keys live in.
@@ -83,6 +89,8 @@ services:
       - ${GALAXY_DIR:?set GALAXY_DIR in .env}/moddata:/galaxy/moddata
       - caddy_data:/data
       - caddy_config:/config
+      # Read-only here: the bridge uses the secret, the init service makes it.
+      - enrol_secret:/run/enrol:ro
 
     # Root writes request files the game server can still read and delete. Set
     # BRIDGE_USER to the game account's uid:gid to have it own them instead; the init
@@ -146,15 +154,22 @@ services:
   #
   # It calls the api service over HTTP like any other client rather than writing to the
   # database itself, so there is one recording code path and the mod still authenticates
-  # every key. With POLL_KEYS unset it says so once and exits, which is why it is not
-  # restart: unless-stopped.
+  # every key.
+  #
+  # Whose fleets it records is not set here. Players enrol their own key from the
+  # console's Alerts tab and this reads the table every pass, so nobody has to edit a file
+  # or restart anything - see bridge/src/enrolment.php. With nobody enrolled it idles and
+  # says so, which is why it stays up rather than exiting.
   poller:
     build: ./bridge
-    restart: on-failure
+    restart: unless-stopped
     entrypoint: ["php", "/app/src/poll.php"]
 
     environment:
       POLL_URL: "http://api:80"
+      # Deprecated, and empty in a fresh deployment. Anything still listed here is moved
+      # into the database once on startup so an upgrade does not stop recording; take it
+      # out of .env afterwards.
       POLL_KEYS: "${POLL_KEYS-}"
       POLL_INTERVAL: "${POLL_INTERVAL:-30}"
       POLL_EVENTS: "${POLL_EVENTS:-1}"
@@ -168,6 +183,10 @@ services:
       HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
       HISTORY_DAYS: "${HISTORY_DAYS:-30}"
       HISTORY_ECONOMY_INTERVAL: "${HISTORY_ECONOMY_INTERVAL:-300}"
+      ENROL_SECRET: "${ENROL_SECRET-}"
+
+    volumes:
+      - enrol_secret:/run/enrol:ro
 
     depends_on:
       api:
@@ -188,18 +207,18 @@ services:
   # about, and pushes it through ntfy, Gotify or a webhook. See bridge/src/notify.php.
   #
   # It needs the poller: almost everything it reads comes out of the same tables, and one
-  # live call per key per pass for the craft listing. With NOTIFY_KEYS and POLL_KEYS both
-  # empty it says so once and exits, like the poller.
+  # live call per key per pass for the craft listing. Whose rules it runs comes from the
+  # same enrolment table the poller reads, and a player opts in to the two separately -
+  # recording a fleet and being messaged about it are different things to want.
   notifier:
     build: ./bridge
-    restart: on-failure
+    restart: unless-stopped
     entrypoint: ["php", "/app/src/notify.php"]
 
     environment:
       NOTIFY_URL: "http://api:80"
-      # Defaults to POLL_KEYS, which is normally the same list of players.
+      # Deprecated, like POLL_KEYS above: imported once on startup, then ignored.
       NOTIFY_KEYS: "${NOTIFY_KEYS-}"
-      POLL_KEYS: "${POLL_KEYS-}"
       NOTIFY_INTERVAL: "${NOTIFY_INTERVAL:-15}"
       HISTORY_DSN: "${HISTORY_DSN-}"
       HISTORY_DB_HOST: "${HISTORY_DB_HOST-db}"
@@ -207,6 +226,10 @@ services:
       HISTORY_DB_USER: "${POSTGRES_USER:-avorion}"
       HISTORY_DB_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
       HISTORY_VERIFY_TTL: "${HISTORY_VERIFY_TTL:-300}"
+      ENROL_SECRET: "${ENROL_SECRET-}"
+
+    volumes:
+      - enrol_secret:/run/enrol:ro
 
     depends_on:
       api:
@@ -222,20 +245,43 @@ services:
   # skip_install_trust makes it provision the local CA whether or not TLS is served.
   # Failing that mkdir aborts the whole config load, so the container never comes up.
   #
-  # This runs as root just long enough to hand both volumes over, then exits. It uses
+  # It also generates the enrolment secret, which is the key the players' API keys are
+  # encrypted with in the database (see bridge/src/enrolment.php). Doing it here rather
+  # than in .env means the secret exists without anybody having to choose one, and that
+  # it is not sitting in a file next to the compose project. It is written once and then
+  # left alone: regenerating it would make every existing enrolment unreadable, so back
+  # the enrol_secret volume up alongside the database.
+  #
+  # This runs as root just long enough to hand the volumes over, then exits. It uses
   # the image the bridge is built from, which is already pulled, rather than adding one.
   init:
     image: dunglas/frankenphp:1-php8.3-alpine
     user: root
-    entrypoint: ["chown", "-R", "${BRIDGE_USER:-root}", "/data", "/config"]
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -s /run/enrol/secret ]; then
+          head -c 48 /dev/urandom | base64 | tr -d '\n' > /run/enrol/secret
+        fi
+        chmod 0640 /run/enrol/secret
+        chown -R "$${BRIDGE_USER:-root}" /data /config /run/enrol
+    environment:
+      BRIDGE_USER: "${BRIDGE_USER:-root}"
     restart: "no"
     volumes:
       - caddy_data:/data
       - caddy_config:/config
+      - enrol_secret:/run/enrol
 
 volumes:
   caddy_data:
   caddy_config:
+  # The key the enrolled API keys in the database are encrypted with, generated by the
+  # init service. Worth exactly the same backup as the database volume: without it the
+  # enrolled keys cannot be read and every player has to enrol again.
+  enrol_secret:
   # The Postgres data directory. Postgres manages its own ownership inside the volume, so
   # unlike the caddy volumes this one needs nothing from the init service.
   history:

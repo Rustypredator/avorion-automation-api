@@ -23,6 +23,7 @@ set_time_limit(120);
 
 require __DIR__ . '/../src/history.php';
 require __DIR__ . '/../src/notifications.php';
+require __DIR__ . '/../src/enrolment.php';
 
 $galaxy = rtrim(getenv('GALAXY_DIR') ?: '/galaxy', '/');
 $root = $galaxy . '/moddata/AutomationAPI';
@@ -369,6 +370,122 @@ if (is_string($rawBody) && $rawBody !== '') {
         fail(400, 'malformed_request', 'Body must be an object.');
     }
     $body = $decoded;
+}
+
+/*
+ * /services is the bridge's own: which of this player's API keys the background poller
+ * and notifier may call the API with while nothing of theirs is open.
+ *
+ * It exists because those two services are clients like any other and need a key, and
+ * because the alternative - a list in the stack's .env - makes every player who wants
+ * their fleet watched into a job for whoever runs the server. Here the player opts in
+ * themselves, from the console, and nothing needs restarting.
+ *
+ * Enrolling stores the key itself rather than a hash of it, which is the one place the
+ * bridge does that. src/enrolment.php explains why there is no alternative and what is
+ * done about it.
+ */
+if (str_starts_with($path, '/services')) {
+    $what = rawurldecode(substr($path, strlen('/services')));
+
+    /*
+     * What can be enrolled for, and what each one means. Answered before the identity
+     * check and before the availability check, so a console can explain the feature -
+     * including explaining that this deployment has it switched off - without holding a
+     * key the mod likes.
+     */
+    if ($method === 'GET' && $what === '/kinds') {
+        reply(200, ['services' => Enrolment::SERVICES,
+                    'available' => Enrolment::available(),
+                    'reason' => Enrolment::available() ? '' : Enrolment::unavailable()]);
+    }
+
+    if (!Enrolment::available()) {
+        fail(503, 'enrolment_disabled', Enrolment::unavailable());
+    }
+
+    // Same identity as /notifications, and for the same reason: an enrolment is one
+    // player's, so the mod has to say which player this key is before anything is stored
+    // under their name.
+    $enrolHistory = new History($key, static fn (): array
+        => relay($requestDir, $responseDir, $key, 'GET', '/ping', [], new stdClass()));
+
+    $whoami = $enrolHistory->scope()['player'] ?? null;
+    if (!is_int($whoami)) {
+        fail(401, 'unknown_key', 'The mod does not recognise this key, or could not be '
+            . 'asked. An enrolment belongs to a player, so the bridge has to be told '
+            . 'which one this is.');
+    }
+
+    if ($method === 'GET' && ($what === '' || $what === '/')) {
+        reply(200, ['services' => Enrolment::SERVICES,
+                    'enrolled' => Enrolment::mine($whoami)]);
+    }
+
+    /** Turns a store answer into a reply, or into the error it carries. */
+    $enrolled = static function (array $result): never {
+        if (isset($result['error'])) {
+            fail($result['error']['status'], $result['error']['code'],
+                 $result['error']['message']);
+        }
+
+        reply(200, $result);
+    };
+
+    if ($method === 'POST' && $what === '/enrol') {
+        $offered = isset($body->key) && is_string($body->key) ? trim($body->key) : '';
+        $subject = $offered !== '' ? $offered : $key;
+
+        /*
+         * A key other than the one this call was made with has to be proved twice over:
+         * that the mod accepts it at all, and that it is this same player's. The first
+         * stops a typo being stored as a credential that quietly never works. The second
+         * is not really a defence - anyone holding a key can already act as its owner -
+         * but it keeps one player's enrolment list from being somewhere another player's
+         * key can be parked out of sight.
+         */
+        if ($subject !== $key) {
+            $ping = relay($requestDir, $responseDir, $subject, 'GET', '/ping', [], new stdClass());
+
+            if ($ping['status'] !== 200 || !is_object($ping['body'] ?? null)) {
+                fail(400, 'bad_key', 'The mod would not answer for that key, so the bridge '
+                    . 'will not store it. Check it against /apikey list in the game.');
+            }
+
+            $whose = $ping['body']->player->index ?? null;
+            if (!is_numeric($whose) || (int) $whose !== $whoami) {
+                fail(403, 'not_your_key', 'That key belongs to a different player. You can '
+                    . 'only enrol your own.');
+            }
+        }
+
+        $enrolled(Enrolment::enrol($subject, $whoami, [
+            'poll' => ($body->poll ?? false) === true,
+            'notify' => ($body->notify ?? false) === true,
+        ], (string) ($body->label ?? '')));
+    }
+
+    // Changing what an enrolment is used for, without the key being sent a second time.
+    if ($method === 'POST' && $what === '/update') {
+        $wants = [];
+        foreach (array_keys(Enrolment::SERVICES) as $service) {
+            if (property_exists($body, $service)) {
+                $wants[$service] = ($body->$service ?? false) === true;
+            }
+        }
+
+        $enrolled(Enrolment::update($whoami, (string) ($body->id ?? ''), $wants,
+            property_exists($body, 'label') ? (string) $body->label : null));
+    }
+
+    if ($method === 'POST' && $what === '/forget') {
+        $enrolled(Enrolment::forget($whoami, (string) ($body->id ?? '')));
+    }
+
+    fail(404, 'no_such_route', sprintf(
+        'The bridge serves GET /services and /services/kinds, and POST /services/enrol, '
+        . '/services/update and /services/forget. It does not serve %s %s.',
+        $method, $what === '' ? '/services' : '/services' . $what));
 }
 
 /*

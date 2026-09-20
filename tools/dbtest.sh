@@ -2,10 +2,11 @@
 #
 # Runs the bridge's database tests against a throwaway Postgres.
 #
-# The history store and the notification rules are the only real logic on the bridge side
-# of the transport - nothing in the Lua tests covers either - and both are SQL, so they
-# cannot be tested against a stub. This starts a database, runs the tests in the same
-# image the bridge is built from, and takes both down again.
+# The history store, the notification rules and the service enrolments are the only real
+# logic on the bridge side of the transport - nothing in the Lua tests covers any of them
+# - and all three are SQL, so they cannot be tested against a stub. This starts a
+# database, runs the tests in the same image the bridge is built from, and takes both
+# down again.
 #
 #   tools/dbtest.sh
 #
@@ -57,7 +58,7 @@ docker build -q -t "$TAG-php" ./docker/bridge >/dev/null || exit 1
 
 status=0
 
-for test in tests/test_history.php tests/test_notifications.php; do
+for test in tests/test_history.php tests/test_notifications.php tests/test_enrolment.php; do
     echo
     echo "$test"
 

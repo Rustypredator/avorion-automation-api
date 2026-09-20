@@ -75,6 +75,10 @@
     notifications: { data: null, loaded: false, error: null },
     channelForm: null,
     ruleForm: null,
+    /* Which of this player's API keys the bridge's background services may use, off
+       /services. `enrolForm` is the editor for adding one. */
+    services: { data: null, loaded: false, error: null },
+    enrolForm: null,
     autoFilter: 'automated', // the Automation tab's list: automated craft, or 'all' ships
     autoSearch: '',     // the Automation tab's search box, lower-cased
     /* Stations, read apart from the fleet listing so the Automation tab can list those with
@@ -549,8 +553,8 @@
 
     'economy-no-samples':
       'The bridge records a station when something asks for /stations, which the poller '
-      + 'service does on a timer &mdash; set POLL_KEYS in the stack\'s .env if it is not '
-      + 'running.',
+      + 'service does on a timer &mdash; enrol a key under Background services on the '
+      + 'Alerts tab if nothing is polling.',
 
     'economy-observed':
       'Rates are per <em>observed</em> hour. Nothing in the mod pushes, so a stretch with '
@@ -811,8 +815,21 @@
       + 'cannot switch it off. A rule can widen to the alliance\u2019s craft, and is still '
       + 'sent to your channels alone.</p>'
       + '<p>An alert is only as quick and as complete as the bridge\u2019s poller. A craft '
-      + 'records nothing while its owner is logged out, and the deployment has to list your '
-      + 'API key in <code>NOTIFY_KEYS</code> for your rules to be run at all.</p>',
+      + 'records nothing while its owner is logged out, and nothing is sent at all until '
+      + 'you enrol a key under <b>Background services</b> below.</p>',
+
+    'services':
+      '<p>The poller and the notifier are ordinary clients: they call the API the way this '
+      + 'page does, so they need a key of yours to do it with. Enrolling gives the bridge '
+      + 'one and stores it, encrypted, in its database.</p>'
+      + '<p>That is a real thing to agree to, so nothing here is on by default and you can '
+      + 'take it back at any moment \u2014 <b>forget</b> deletes the stored key outright. '
+      + 'Revoking the key in game with <code>/apikey revoke</code> also stops it dead.</p>'
+      + '<p>If you would rather not enrol the key you use here, make a second one with '
+      + '<code>/apikey new</code> and paste that instead. It can be revoked on its own.</p>'
+      + '<p><b>Record my fleet</b> covers your alliance\u2019s craft too, so one member is '
+      + 'enough for a shared fleet. <b>Send me alerts</b> is not: a rule is yours and goes '
+      + 'to your channels, so each player who wants telling enrols themselves.</p>',
 
     'connect-network':
       '<p>The browser reports no status for this, which means either the bridge is not '
@@ -1097,6 +1114,8 @@
         S.notifications = { data: null, loaded: false, error: null };
         S.channelForm = null;
         S.ruleForm = null;
+        S.services = { data: null, loaded: false, error: null };
+        S.enrolForm = null;
         manifestsAt = 0;
         startLoops();
         refreshFleet();
@@ -1218,7 +1237,7 @@
       // The bridge's own, not the mod's, so this costs the game server nothing - but
       // there is still no point reading a log nobody is looking at. An editor left open
       // is left alone: a redraw underneath it would throw away what is being typed.
-      if (S.view === 'notify' && !S.channelForm && !S.ruleForm) {
+      if (S.view === 'notify' && !S.channelForm && !S.ruleForm && !S.enrolForm) {
         return loadNotifications(false);
       }
     });
@@ -10505,17 +10524,32 @@
   function loadNotifications(userInitiated) {
     if (!S.connected) { return Promise.resolve(); }
 
-    return Api.get('/notifications', null,
-                   { priority: userInitiated ? Api.P.USER : Api.P.POLL, label: 'alerts' })
+    var priority = userInitiated ? Api.P.USER : Api.P.POLL;
+
+    /*
+     * Two reads, drawn as one. They fail independently on purpose: a deployment with no
+     * enrolment secret answers 503 on /services, and the rules below it are still worth
+     * showing - and worth showing alongside the reason nothing is being sent.
+     */
+    var alerts = Api.get('/notifications', null, { priority: priority, label: 'alerts' })
       .then(function (body) {
         S.notifications = { data: body, loaded: true, error: null };
-        renderNotifications();
       })
       .catch(function (error) {
         if (error.code === 'cancelled') { return; }
         S.notifications = { data: S.notifications.data, loaded: true, error: error };
-        renderNotifications();
       });
+
+    var enrolled = Api.get('/services', null, { priority: priority, label: 'services' })
+      .then(function (body) {
+        S.services = { data: body, loaded: true, error: null };
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.services = { data: null, loaded: true, error: error };
+      });
+
+    return Promise.all([alerts, enrolled]).then(renderNotifications);
   }
 
   function notifyKinds() {
@@ -10600,9 +10634,162 @@
     var data = state.data || {};
 
     host.innerHTML = notifyIntro()
+      + notifyServices()
       + notifyChannels(data)
       + notifyRules(data)
       + notifyLog(data);
+  }
+
+  /* ---------------------------- background services ----------------------------
+   *
+   * Which of this player's API keys the bridge's poller and notifier may call the API
+   * with. It is drawn above the channels and rules because it is the thing that makes
+   * either of them do anything: a rule with nobody enrolled is never evaluated.
+   *
+   * The key is a credential and enrolling hands it over, so this says so plainly rather
+   * than presenting it as a checkbox like any other.
+   */
+
+  function blankEnrol() {
+    return { key: '', label: '', poll: true, notify: true };
+  }
+
+  function notifyServices() {
+    var state = S.services;
+    var kinds = ((state.data || {}).services) || {};
+    var rows = ((state.data || {}).enrolled) || [];
+
+    /*
+     * 503 is the deployment having no enrolment secret, which is not the player's
+     * problem to fix and not an error to shout about - it is the explanation for why
+     * nothing below this ever fires.
+     */
+    if (state.error) {
+      return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
+        + (state.error.status === 503
+          ? '<div class="note">' + esc(state.error.message) + '</div>'
+          : errorBox('Could not read what is enrolled', state.error))
+        + '</div>';
+    }
+
+    if (!state.loaded) {
+      return '<div class="section"><h2>Background services</h2>'
+        + '<p class="muted">loading…</p></div>';
+    }
+
+    var list = rows.map(function (entry) { return enrolRow(entry, kinds); }).join('');
+
+    return '<div class="section"><h2>Background services ' + explain('services') + '</h2>'
+      + '<p class="mute2">Nothing below runs unless a key of yours is enrolled here: the '
+      + 'bridge\u2019s poller and notifier have to call the API as you, and they need a '
+      + 'key to do it with.</p>'
+      + (list || '<p class="muted">Nothing enrolled. Your fleet is only recorded while '
+                 + 'this page is open, and no alert will ever be sent.</p>')
+      + (S.enrolForm ? enrolEditor(S.enrolForm, kinds)
+                     : '<div class="row" style="margin-top:8px">'
+                       + '<button class="ghost small" data-act="enrol-new">enrol a key</button>'
+                       + '</div>')
+      + '</div>';
+  }
+
+  function enrolRow(entry, kinds) {
+    var toggles = Object.keys(kinds).map(function (service) {
+      return '<label class="check switch"><input type="checkbox" data-service="'
+        + esc(service) + '" data-service-on="' + esc(entry.id) + '"'
+        + (entry[service] ? ' checked' : '') + '>'
+        + '<span>' + esc(kinds[service].title || service) + '</span></label>';
+    }).join('');
+
+    // A key the services have given up on. The reason is the mod's own, and is the
+    // difference between "revoke it and enrol a new one" and "your server was down".
+    var trouble = entry.failures > 0 && entry.error
+      ? '<div class="mute2 bad">' + esc(entry.error) + '</div>' : '';
+
+    return '<div class="order-row enrol-row">'
+      + '<span><b>' + esc(entry.label || ('key ' + entry.id.slice(0, 8))) + '</b></span>'
+      + toggles
+      + '<span class="mute2">' + (entry.usedAt
+          ? 'last used ' + esc(new Date(entry.usedAt * 1000).toLocaleString())
+          : 'not used yet') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-service-forget="' + esc(entry.id) + '">forget</button>'
+      + trouble
+      + '</div>';
+  }
+
+  function enrolEditor(form, kinds) {
+    var boxes = Object.keys(kinds).map(function (service) {
+      return '<label class="check"><input type="checkbox" data-enrol-want="' + esc(service)
+        + '"' + (form[service] ? ' checked' : '') + '>'
+        + '<span><b>' + esc(kinds[service].title || service) + '</b> \u2014 '
+        + esc(kinds[service].about || '') + '</span></label>';
+    }).join('');
+
+    return '<div class="editor" style="margin-top:8px">'
+      + '<div class="row">'
+      + '<label class="field" style="flex:1"><span>API key</span>'
+      + '<input type="password" data-enrol="key" value="' + esc(form.key) + '"'
+      + ' placeholder="leave empty to use the key this console is connected with"></label>'
+      + '<label class="field"><span>Name</span>'
+      + '<input type="text" data-enrol="label" value="' + esc(form.label) + '"'
+      + ' placeholder="my fleet"></label>'
+      + '</div>'
+      + '<div class="enrol-wants">' + boxes + '</div>'
+      + '<div class="note" style="margin-top:8px">The bridge stores this key so it can '
+      + 'call the API while you are away. It is encrypted, never handed back out, and '
+      + '<b>forget</b> deletes it. Everywhere else the bridge keeps only a hash of a key; '
+      + 'this is the exception, because presenting one is the whole job.</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="enrol-save">enrol</button>'
+      + '<button class="ghost small" data-act="enrol-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function saveEnrol(button) {
+    var form = S.enrolForm;
+    if (!form) { return; }
+
+    var body = { poll: !!form.poll, notify: !!form.notify, label: form.label };
+    // Left empty on purpose means "the key I am already connected with", which the bridge
+    // reads off the header. Sending it in the body as well would put it somewhere it does
+    // not need to be.
+    if (form.key) { body.key = form.key; }
+
+    if (!body.poll && !body.notify) {
+      toast('bad', 'Nothing chosen', 'Pick at least one, or cancel.');
+      return;
+    }
+
+    guard(button, Api.post('/services/enrol', body, null,
+                           { priority: Api.P.USER, label: 'enrol' }))
+      .then(function () {
+        S.enrolForm = null;
+        toast('good', 'Key enrolled', 'The bridge will start using it within a minute.');
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not enrol that key'); });
+  }
+
+  function setEnrolled(id, service, on) {
+    var body = { id: id };
+    body[service] = on;
+
+    Api.post('/services/update', body, null, { priority: Api.P.USER, label: 'enrol' })
+      .then(function () { loadNotifications(true); })
+      .catch(function (error) {
+        apiFailed(error, 'Could not change that');
+        loadNotifications(true);
+      });
+  }
+
+  function forgetEnrolled(button, id) {
+    guard(button, Api.post('/services/forget', { id: id }, null,
+                           { priority: Api.P.USER, label: 'enrol' }))
+      .then(function () {
+        toast('good', 'Key forgotten', 'The bridge no longer holds it.');
+        loadNotifications(true);
+      })
+      .catch(function (error) { apiFailed(error, 'Could not remove it'); });
   }
 
   function notifyIntro() {
@@ -10930,6 +11117,14 @@
     if (act === 'rule-cancel') { S.ruleForm = null; renderNotifications(); return true; }
     if (act === 'rule-save') { saveRule(button); return true; }
     if (act === 'notify-refresh') { loadNotifications(true); return true; }
+    if (act === 'enrol-new') { S.enrolForm = blankEnrol(); renderNotifications(); return true; }
+    if (act === 'enrol-cancel') { S.enrolForm = null; renderNotifications(); return true; }
+    if (act === 'enrol-save') { saveEnrol(button); return true; }
+
+    if (button.dataset.serviceForget) {
+      forgetEnrolled(button, button.dataset.serviceForget);
+      return true;
+    }
 
     if (button.dataset.channelEdit) {
       S.channelForm = channelForm(notifyFind(data.channels, button.dataset.channelEdit));
@@ -10951,6 +11146,21 @@
 
   function notifyChange(node) {
     var data = S.notifications.data || {};
+
+    if (node.dataset.serviceOn !== undefined) {
+      setEnrolled(node.dataset.serviceOn, node.dataset.service, node.checked);
+      return true;
+    }
+
+    if (node.dataset.enrol !== undefined && S.enrolForm) {
+      S.enrolForm[node.dataset.enrol] = node.value;
+      return true;
+    }
+
+    if (node.dataset.enrolWant !== undefined && S.enrolForm) {
+      S.enrolForm[node.dataset.enrolWant] = node.checked;
+      return true;
+    }
 
     if (node.dataset.channelOn !== undefined) {
       var channel = notifyFind(data.channels, node.dataset.channelOn);

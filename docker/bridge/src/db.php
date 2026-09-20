@@ -24,7 +24,7 @@ declare(strict_types=1);
 final class Db
 {
     /** Bumped when the schema below changes in a way that needs applying. */
-    private const SCHEMA = 5;
+    private const SCHEMA = 6;
 
     /** Postgres advisory lock id, so two workers cannot migrate at the same moment. */
     private const MIGRATE_LOCK = 0x41564F31; // "AVO1"
@@ -220,7 +220,7 @@ final class Db
     private static function migrations(): array
     {
         return [2 => self::base(), 3 => self::shared(), 4 => self::stationEvents(),
-                5 => self::notifications()];
+                5 => self::notifications(), 6 => self::services()];
     }
 
     /**
@@ -718,6 +718,59 @@ final class Db
                  last_event BIGINT      NOT NULL DEFAULT 0,
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
              )',
+        ];
+    }
+
+    /**
+     * Version 6: which keys the background services may use, so nothing is listed in .env.
+     *
+     * The poller and the notifier are clients like any other - they hold an API key and
+     * call the API with it - and up to version 5 that list came from POLL_KEYS and
+     * NOTIFY_KEYS. On a server with more than a handful of players that is a file an admin
+     * has to edit, and restart two containers over, every time somebody wants their fleet
+     * watched. From here a player enrols their own key from the console and the services
+     * read this table.
+     *
+     * ### This is the one table that holds a credential
+     *
+     * Everywhere else the bridge stores a SHA-256 of a key and never the key (see
+     * api_keys), because it never needs to present one. A background service does: there
+     * is no way to call the API as a player without the player's key. So `secret` is the
+     * key itself, encrypted - see src/enrolment.php for with what, and why that is worth
+     * doing when the secret and the database sit in the same stack.
+     *
+     * `key_hash` is the same hash api_keys stores, which makes this row joinable to the
+     * identity the mod vouched for without anything having to decrypt anything. It is also
+     * the primary key, so enrolling a key twice updates the row rather than making a
+     * second copy of the same credential.
+     *
+     * @return list<string>
+     */
+    private static function services(): array
+    {
+        return [
+            'CREATE TABLE IF NOT EXISTS service_keys (
+                 key_hash    TEXT        PRIMARY KEY,
+                 secret      TEXT        NOT NULL,
+                 player      BIGINT,
+                 label       TEXT        NOT NULL DEFAULT \'\',
+                 poll        BOOLEAN     NOT NULL DEFAULT FALSE,
+                 notify      BOOLEAN     NOT NULL DEFAULT FALSE,
+                 enrolled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 used_at     TIMESTAMPTZ,
+                 failures    INTEGER     NOT NULL DEFAULT 0,
+                 error       TEXT        NOT NULL DEFAULT \'\'
+             )',
+
+            // What each service reads at the top of every pass: the handful of rows that
+            // asked for it. Partial on purpose - a row enrolled for alerts only is not a
+            // row the poller should even load.
+            'CREATE INDEX IF NOT EXISTS service_keys_poll_idx ON service_keys (key_hash) WHERE poll',
+            'CREATE INDEX IF NOT EXISTS service_keys_notify_idx ON service_keys (key_hash) WHERE notify',
+
+            // Listing one player's own enrolments, which the console does on every
+            // Alerts read.
+            'CREATE INDEX IF NOT EXISTS service_keys_player_idx ON service_keys (player)',
         ];
     }
 }

@@ -344,6 +344,13 @@ final class History
      * it, which the partial unique index guarantees there is at most one of. So the table
      * grows with travel rather than with polling, and a fleet parked for a week costs one
      * UPDATE per craft per poll and nothing on disk.
+     *
+     * Stations are left out. A listing asked for with type=all carries them - the poller
+     * and the notifier both ask for one - and a station's "visit" would be a single row
+     * that never ends, which is not a record of travel and would quietly take over the
+     * heatmap: it counts observed seconds per cell, and something that never leaves
+     * accumulates them faster than any ship can. Where a station is and what it earns is
+     * recorded by recordStations, in station_samples, which is the right shape for it.
      */
     public function recordShips(object $body): void
     {
@@ -363,6 +370,9 @@ final class History
                 continue;
             }
             if (!isset($position->x, $position->y)) {
+                continue;
+            }
+            if (($ship->type ?? '') === 'Station') {
                 continue;
             }
 

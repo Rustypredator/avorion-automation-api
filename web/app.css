@@ -274,6 +274,10 @@ tr.best td { color: var(--good); }
 .order-row .idx { color: var(--text-mute); width: 18px; text-align: right; }
 .order-row input[type=number] { width: 78px; }
 .standing-row { flex-wrap: wrap; }
+/* An enrolled key: two switches, when it was last used, and - when something is wrong -
+   the mod's own reason on a line of its own underneath, which needs the row to wrap. */
+.enrol-row { flex-wrap: wrap; }
+.enrol-row .mute2.bad { flex-basis: 100%; }
 /* The flee order's thresholds and destination, which sit under its switch rather than
    on the same line: there are too many of them for one row at any sensible width. */
 .standing-flee { gap: 6px; margin-left: 4px; }
@@ -286,6 +290,12 @@ tr.best td { color: var(--good); }
 .editor .row:last-child { margin-bottom: 0; }
 .editor input[type=text], .editor input[type=password] { width: 210px; }
 .editor select, .editor input { max-width: 100%; }
+/* The enrolment form's two opt-ins. Each carries a sentence saying what it means, so they
+   stack rather than sitting on one line, and the text wraps under itself rather than
+   under the checkbox. */
+.enrol-wants { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.enrol-wants .check { align-items: flex-start; white-space: normal; }
+.enrol-wants .check input { margin-top: 3px; }
 
 /* ---------------------------------- map --------------------------------- */
 
