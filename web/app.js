@@ -567,8 +567,10 @@
       + 'or set HISTORY_DB_HOST back if it was turned off deliberately.',
 
     'history-empty':
-      'The bridge builds the history out of the calls this console makes, so it fills in '
-      + 'while a tab is open on it.',
+      'The bridge builds the history out of the calls made to it, so with only this page '
+      + 'looking it fills in while a tab is open and stops when you close it. To have it '
+      + 'kept while you are away, enrol a key under <b>Background services</b> on the '
+      + 'Alerts tab.',
 
     'history-shared':
       'Alliance craft are recorded once for the whole alliance, whichever member\'s '
