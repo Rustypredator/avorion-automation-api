@@ -204,6 +204,24 @@ local function hyperspaceOf(entry)
     }
 end
 
+-- The two numbers a client watching a fleet actually wants: how much of the hull and of
+-- the shield is left, each as a fraction of that craft's own maximum. Both are nil where
+-- the row will not say, which is not the same as zero.
+local function conditionOf(entry)
+    local _, hull = safe(function() return entry:getDurabilityProperties() end)
+    local _, shield = safe(function() return entry:getShields() end)
+
+    hull, shield = tonumber(hull), tonumber(shield)
+
+    if hull == nil and shield == nil then return nil end
+
+    return
+    {
+        hull = hull and Serialize.number(hull, 0) or nil,
+        shield = shield and Serialize.number(shield, 0) or nil,
+    }
+end
+
 local function durabilityOf(entry)
     local maxHp, percentage, malusFactor, malusReason, damaged = safe(function()
         return entry:getDurabilityProperties()
@@ -408,6 +426,10 @@ function ShipData.summary(owner, name)
     local entityType = safe(function() return faction:getShipType(name) end)
     local availability = safe(function() return faction:getShipAvailability(name) end)
 
+    -- One row read for the captain and the condition together. The listing is called for
+    -- every craft of a fleet, so reading the row twice would double the cost of it.
+    local entry = ShipDatabaseEntry(owner.index, name)
+
     return
     {
         name = name,
@@ -420,7 +442,12 @@ function ShipData.summary(owner, name)
         -- for stations above all, whose `usable` is always NotAShip: a captain is what
         -- lets a craft be automated without its owner in the sector. Not `captain`, which
         -- the detail read below fills with the captain's details.
-        hasCaptain = ShipData.hasCaptain(owner.index, name),
+        hasCaptain = entry ~= nil and safe(function() return entry:getCaptain() end) ~= nil,
+        -- Hull and shield, so "which of my craft is hurt" is one call rather than one per
+        -- craft. Out of the database row, which the game rewrites when it saves or when
+        -- the sector unloads - a craft being shot at right now is reported live on its own
+        -- automation feed instead, see entity/orderchain.lua.
+        condition = entry ~= nil and conditionOf(entry) or nil,
     }
 end
 

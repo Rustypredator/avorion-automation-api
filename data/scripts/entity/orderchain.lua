@@ -26,6 +26,9 @@
 if onServer() then
 
 local AutomationApiJson = include("automationapi/json")
+-- For the location library's Server value key. Nothing else in this file needs Config,
+-- and it is a table of constants, so including it on every craft costs nothing.
+local AutomationApiConfig = include("automationapi/config")
 
 -- How long a sector has to stay free of enemies before a fight counts as over. The AI's
 -- enemy check flickers while a ship is mid-jump into the sector or cloaked, and resuming a
@@ -72,6 +75,54 @@ local AUTOMATION_API_LOOT_RETRY = 120
 local AUTOMATION_API_STANDING = {"enemies", "loot"}
 local AUTOMATION_API_STANDING_MODES = {idle = true, interrupt = true}
 
+-- The flee order is a standing order too, but it carries thresholds and a destination
+-- rather than a mode, and it is never "idle only" - a ship that is losing is by
+-- definition busy. So it is kept out of the list above and handled on its own.
+--
+-- Where it may send the ship:
+--
+--   known     a sector the owner has already been to, inside one jump. The plainly
+--             safest thing to do: somewhere explored beats somewhere not.
+--   safe      the nearest sector inside one jump held by a faction that is not hostile
+--             to the owner. Factions police their own space, so a ship that limps into
+--             one is defended by somebody other than itself.
+--   station   the nearest craft of the owner - a station by default - jumped towards
+--             until it is reached.
+--   location  a sector from the owner's location library, by name.
+--   sector    fixed coordinates.
+--
+-- The last three can be further than one jump, and are walked towards a hop at a time:
+-- see automationApiFleeTarget.
+local AUTOMATION_API_FLEE_KINDS =
+    {known = true, safe = true, station = true, location = true, sector = true}
+
+-- Jumps one flee may make before it stops, whatever it has or has not reached.
+local AUTOMATION_API_FLEE_HOPS_MAX = 10
+
+-- A flee that cannot leave yet - a jump cooldown, a route the engine refuses, nothing
+-- worth jumping to - looks again this often rather than every tick, and gives up after
+-- the second. Giving up leaves the ship where it is with its chain cleared; the order is
+-- still on, so it tries again the next time it is hurt.
+local AUTOMATION_API_FLEE_RETRY = 5
+local AUTOMATION_API_FLEE_MAX = 240
+
+-- Sectors looked at when picking somewhere to run to. A well travelled owner knows
+-- thousands, and each candidate costs an engine call to validate, so the search stops
+-- once it has this many to choose between.
+local AUTOMATION_API_FLEE_CANDIDATES = 24
+
+-- Random sectors tried when the owner knows nowhere inside jump range. Unexplored space
+-- is still better than the sector being lost in.
+local AUTOMATION_API_FLEE_RANDOM_TRIES = 24
+
+-- Hull and shield are published for whoever is watching - the console, and the bridge's
+-- notification rules, which is the whole point of reporting them at all. They are rounded
+-- into buckets and rate limited first: a ship under fire changes both every tick, and
+-- every publish is an event in that ship's feed.
+local AUTOMATION_API_VITALS_STEP = 0.05
+local AUTOMATION_API_VITALS_FIGHTING = 5
+local AUTOMATION_API_VITALS_QUIET = 30
+
 -- Cargo transfers. The reach is vanilla's (entity/transfercrewgoods.lua,
 -- checkPermissionsAndDistance): the nearest points of the two craft at most 20 apart, or
 -- as far as the longer transporter reaches.
@@ -79,11 +130,77 @@ local AUTOMATION_API_TRANSFER_REACH = 20
 local AUTOMATION_API_APPROACH_MAX = 300     -- docking or flying alongside, at most
 local AUTOMATION_API_APPROACH_REPEAT = 3    -- the fly target is renewed, as the target moves
 
+-- Off, and at half hull when it is switched on: a threshold has to be something, and a
+-- ship that has lost half of itself is losing the fight.
+local function automationApiDefaultFlee()
+    return
+    {
+        enabled = false,
+        hull = 0.5,
+        shield = 0,
+        requireEnemies = true,
+        to = {kind = "known"},
+        hops = 1,
+    }
+end
+
+-- Folds a flee order from a request or from a save into `target`, field by field.
+--
+-- Partial by design: what a caller leaves out stays as the ship has it, the same way the
+-- other standing orders work. Nothing is trusted to be the right type - this arrives as
+-- JSON across invokeEntityFunction, and could have been written by a different version of
+-- the mod on the other side.
+local function automationApiApplyFlee(target, order)
+    if type(order) ~= "table" then return end
+
+    if order.enabled ~= nil then target.enabled = order.enabled == true end
+    if order.requireEnemies ~= nil then
+        target.requireEnemies = order.requireEnemies ~= false
+    end
+
+    -- Fractions of this ship's own maximum, so the same rule fits a freighter and a
+    -- battleship. 0 switches that half of the test off.
+    for _, name in ipairs({"hull", "shield"}) do
+        local value = tonumber(order[name])
+        if value then target[name] = math.max(0, math.min(1, value)) end
+    end
+
+    local hops = tonumber(order.hops)
+    if hops then
+        target.hops = math.max(1, math.min(AUTOMATION_API_FLEE_HOPS_MAX, math.floor(hops)))
+    end
+
+    if type(order.to) == "table" and AUTOMATION_API_FLEE_KINDS[order.to.kind] then
+        local to = {kind = order.to.kind}
+
+        if to.kind == "sector" then
+            to.x, to.y = tonumber(order.to.x), tonumber(order.to.y)
+            if to.x and to.y then
+                to.x, to.y = math.floor(to.x), math.floor(to.y)
+            else
+                to = nil
+            end
+        elseif to.kind == "location" then
+            if type(order.to.name) == "string" and order.to.name ~= "" then
+                to.name = order.to.name
+            else
+                to = nil
+            end
+        elseif to.kind == "station" then
+            -- "any" takes the nearest craft of the fleet rather than only a station.
+            to.name = order.to.name == "any" and "any" or nil
+        end
+
+        if to then target.to = to end
+    end
+end
+
 local function automationApiDefaultStanding()
     return
     {
         enemies = {enabled = false, mode = "idle"},
         loot = {enabled = false, mode = "idle"},
+        flee = automationApiDefaultFlee(),
     }
 end
 
@@ -111,6 +228,14 @@ local automationApi =
     -- previous one ended
     transfer = nil,
     lastTransfer = nil,
+    -- a flee in progress, or nil, and how the previous one ended. Kept apart from
+    -- `reaction` because a flee outranks everything including a reaction, and because it
+    -- never puts a chain back: the orders a ship was flying led into the fight it ran from.
+    flee = nil,
+    lastFlee = nil,
+    -- the hull and shield fractions last published, bucketed; see automationApiTickVitals
+    vitals = nil,
+    vitalsIn = 0,
 }
 
 local function automationApiLog(format, ...)
@@ -137,6 +262,53 @@ local function automationApiEnemiesPresent()
     end)
 
     return ok and present == true
+end
+
+-- The ship's hull and shield, each as a fraction of its maximum, or nil where the engine
+-- will not say. Read off the entity rather than the ship database row, which only catches
+-- up when the game saves - a ship losing its hull now is exactly the case where the saved
+-- copy is worthless.
+local function automationApiVitals()
+    local ok, hull, shield = pcall(function()
+        local ship = Entity()
+
+        local maxHull = tonumber(ship.maxDurability) or 0
+        local maxShield = tonumber(ship.shieldMaxDurability) or 0
+
+        return maxHull > 0 and (tonumber(ship.durability) or 0) / maxHull or nil,
+               maxShield > 0 and (tonumber(ship.shieldDurability) or 0) / maxShield or nil
+    end)
+
+    if not ok then return nil, nil end
+
+    return hull, shield
+end
+
+-- How far this ship can jump. HyperspaceEngine().reach is what the engine validates a
+-- jump against; maxReach ignores a damaged or unpowered engine, so it is only a fallback
+-- for a build that does not expose the first.
+--
+-- Not automationApiReach: the cargo transfer section further down already has one of
+-- those, for how far two craft can pass goods, and a local defined later would shadow
+-- this one everywhere the flee order uses it.
+local function automationApiJumpReach()
+    for _, field in ipairs({"reach", "maxReach"}) do
+        local ok, value = pcall(function() return HyperspaceEngine()[field] end)
+        if ok and tonumber(value) then return tonumber(value) end
+    end
+
+    return 0
+end
+
+-- The Player or Alliance that owns this ship, as a faction handle, or nil.
+local function automationApiOwnFaction()
+    local ok, faction = pcall(function() return Galaxy():findFaction(Entity().factionIndex) end)
+    if ok and faction then return faction end
+
+    ok, faction = pcall(function() return Faction(Entity().factionIndex) end)
+    if ok and faction then return faction end
+
+    return nil
 end
 
 local function automationApiJumpValid(fromX, fromY, toX, toY)
@@ -354,6 +526,21 @@ local function automationApiDescribeTransfer(transfer)
     }
 end
 
+local function automationApiDescribeFlee(flee)
+    return
+    {
+        reason = flee.reason,
+        phase = flee.phase,
+        hops = flee.hops,
+        hopsLeft = flee.hopsLeft,
+        from = flee.from,
+        target = flee.target and {x = flee.target.x, y = flee.target.y} or nil,
+        hull = flee.hull,
+        shield = flee.shield,
+        to = flee.to,
+    }
+end
+
 local function automationApiDescribe()
     local x, y = Sector():getCoordinates()
     local standing = automationApi.settings.standing
@@ -363,9 +550,21 @@ local function automationApiDescribe()
         described[name] = {enabled = standing[name].enabled == true, mode = standing[name].mode}
     end
 
+    -- The flee order carries thresholds and a destination instead of a mode, so it is
+    -- described whole rather than through the loop above.
+    described.flee =
+    {
+        enabled = standing.flee.enabled == true,
+        hull = standing.flee.hull,
+        shield = standing.flee.shield,
+        requireEnemies = standing.flee.requireEnemies ~= false,
+        hops = standing.flee.hops,
+        to = standing.flee.to,
+    }
+
     return
     {
-        version = 1,
+        version = 2,
         -- kept for clients from before standing orders: the enemies order, in any mode
         autoAggressive = standing.enemies.enabled == true,
         attackCivilians = automationApi.settings.attackCivilians == true,
@@ -382,6 +581,11 @@ local function automationApiDescribe()
         transfer = automationApi.transfer and automationApiDescribeTransfer(automationApi.transfer)
                    or nil,
         lastTransfer = automationApi.lastTransfer,
+        flee = automationApi.flee and automationApiDescribeFlee(automationApi.flee) or nil,
+        lastFlee = automationApi.lastFlee,
+        -- hull and shield as fractions of this ship's own maximum, rounded; nil until the
+        -- ship has published any, which it only does once something is watching it
+        vitals = automationApi.vitals,
     }
 end
 
@@ -1447,11 +1651,541 @@ local function automationApiTickTransfer(transfer, timeStep)
     end
 end
 
+-- #### VITALS #### --
+
+-- Hull and shield, published so a client - and the notification rules the bridge runs off
+-- this feed - can see a ship being worn down without polling every craft every second.
+--
+-- Bucketed and rate limited, because the whole point is that it rides along on the order
+-- info the ship already publishes: a value that moves every tick would turn one ship in a
+-- fight into a hundred events a minute and push everything else out of its log.
+local function automationApiBucket(value)
+    if value == nil then return nil end
+
+    value = math.max(0, math.min(1, value))
+    local steps = math.floor(value / AUTOMATION_API_VITALS_STEP + 0.5)
+
+    return steps * AUTOMATION_API_VITALS_STEP
+end
+
+-- Reads them now and resets the timer, without publishing: the caller is about to
+-- publish something these belong with. Used when the value itself is the news - a fight
+-- starting, a ship deciding to run - rather than one more step of a slow drift.
+local function automationApiRefreshVitals()
+    local hull, shield = automationApiVitals()
+    if hull == nil and shield == nil then return end
+
+    automationApi.vitals = {hull = automationApiBucket(hull), shield = automationApiBucket(shield)}
+    automationApi.vitalsIn = AUTOMATION_API_VITALS_FIGHTING
+end
+
+local function automationApiTickVitals(timeStep, enemies, onlyWhenHurt)
+    automationApi.vitalsIn = (automationApi.vitalsIn or 0) - timeStep
+    if automationApi.vitalsIn > 0 then return end
+
+    automationApi.vitalsIn = enemies and AUTOMATION_API_VITALS_FIGHTING
+                             or AUTOMATION_API_VITALS_QUIET
+
+    local hull, shield = automationApiVitals()
+    if hull == nil and shield == nil then return end
+
+    local current = {hull = automationApiBucket(hull), shield = automationApiBucket(shield)}
+    local last = automationApi.vitals
+
+    -- An undamaged craft that has never said anything says nothing. Without this, a
+    -- server coming up would put one "everything is fine" event in every craft's log.
+    if onlyWhenHurt and last == nil
+       and (current.hull or 1) >= 1 and (current.shield or 1) >= 1 then
+        return
+    end
+
+    if last and last.hull == current.hull and last.shield == current.shield then return end
+
+    automationApi.vitals = current
+    automationApiPublish()
+end
+
+-- #### FLEEING #### --
+--
+-- The standing order that takes a ship out of a fight it is losing. It outranks
+-- everything - a plan, a reaction, a transfer on its way - because none of those matter
+-- once the ship is about to be lost, and unlike a reaction it never puts a chain back:
+-- the orders it interrupted are what flew the ship into the fight.
+--
+-- The thresholds are fractions of the ship's own maximum, so "below 81% hull" means what
+-- it says on a freighter and on a battleship alike. Either or both may be set; 0 means
+-- that half is not watched.
+--
+-- Everything here runs on the ship because nothing else can: hull and shield as they are
+-- now, which sector the ship is in, and whether it may jump out of it are all sector-side
+-- questions, and the answer is needed within a tick or two rather than at the next poll.
+
+local function automationApiFleeSquared(ax, ay, bx, by)
+    local dx, dy = bx - ax, by - ay
+    return dx * dx + dy * dy
+end
+
+-- Sectors the ship could jump to right now. The owner's own knowledge first - somewhere
+-- that has been visited is worth more than somewhere that has not - and random sectors
+-- inside the same reach to fall back on, because being anywhere else still beats staying.
+--
+-- Bounded twice over: known sectors are filtered on distance before anything is asked of
+-- the engine, and the search stops as soon as it has enough to choose between.
+local function automationApiFleeCandidates(fromX, fromY, reach)
+    local found = {}
+    local seen = {[fromX .. ":" .. fromY] = true}
+
+    local function offer(x, y)
+        x, y = math.floor(x), math.floor(y)
+
+        local key = x .. ":" .. y
+        if seen[key] then return false end
+        seen[key] = true
+
+        if automationApiFleeSquared(fromX, fromY, x, y) > reach * reach then return false end
+        if not automationApiJumpValid(fromX, fromY, x, y) then return false end
+
+        found[#found + 1] = {x = x, y = y, known = false}
+        return true
+    end
+
+    local faction = automationApiOwnFaction()
+    local views = {}
+    if faction then pcall(function() views = {faction:getKnownSectors()} end) end
+
+    for _, view in ipairs(views) do
+        local x, y = tonumber(view.x), tonumber(view.y)
+
+        -- The distance test is deliberately before offer(): a galaxy-wide list of known
+        -- sectors is long, and only the handful within reach is worth an engine call.
+        if x and y and automationApiFleeSquared(fromX, fromY, x, y) <= reach * reach then
+            if offer(x, y) then found[#found].known = true end
+            if #found >= AUTOMATION_API_FLEE_CANDIDATES then return found end
+        end
+    end
+
+    if #found > 0 then return found end
+
+    for _ = 1, AUTOMATION_API_FLEE_RANDOM_TRIES do
+        local angle = math.random() * math.pi * 2
+        local radius = reach * (0.5 + math.random() * 0.5)
+
+        offer(fromX + math.cos(angle) * radius, fromY + math.sin(angle) * radius)
+        if #found >= AUTOMATION_API_FLEE_CANDIDATES then break end
+    end
+
+    return found
+end
+
+-- Whether a sector belongs to somebody who will not shoot at this ship. Faction space is
+-- policed by its owner, so limping into it means somebody else is doing the fighting.
+-- No man's space, and space held by a faction at war with the owner, are not it.
+local function automationApiFriendlySector(x, y)
+    local ok, holder = pcall(function() return Galaxy():getControllingFaction(x, y) end)
+    if not ok or not holder then return false end
+
+    local okOurs, ours = pcall(function() return Entity().factionIndex end)
+    if not okOurs then return false end
+
+    if holder.index == ours then return true end
+
+    local okRelation, relation = pcall(function() return holder:getRelations(ours) end)
+    if not okRelation then return false end
+
+    -- Some builds answer with a Relation rather than a level.
+    if type(relation) == "table" then relation = relation.level end
+
+    return (tonumber(relation) or 0) >= 0
+end
+
+-- The location libraries this ship may read: its owner's, and - for a player's ship -
+-- that player's alliance's, the same pair the API resolves a destination against.
+local function automationApiLibraryIndices()
+    local indices = {}
+
+    local ok, index = pcall(function() return Entity().factionIndex end)
+    if ok and tonumber(index) then indices[#indices + 1] = tonumber(index) end
+
+    local faction = automationApiOwnFaction()
+    if faction then
+        local okAlliance, alliance = pcall(function() return faction.allianceIndex end)
+        alliance = tonumber(okAlliance and alliance or nil)
+        if alliance and alliance ~= 0 and alliance ~= indices[1] then
+            indices[#indices + 1] = alliance
+        end
+    end
+
+    return indices
+end
+
+-- A named sector from the location library, read straight out of the Server value the
+-- library is stored in. The ship cannot call the API, and the store is one JSON document
+-- per faction, so reading it here costs one value read and no round trip.
+local function automationApiLocationSector(name)
+    for _, index in ipairs(automationApiLibraryIndices()) do
+        local ok, raw = pcall(function()
+            return Server():getValue(AutomationApiConfig.locationValuePrefix .. tostring(index))
+        end)
+
+        if ok and type(raw) == "string" and raw ~= "" then
+            local decoded, data = pcall(AutomationApiJson.decode, raw)
+
+            if decoded and type(data) == "table" and type(data.locations) == "table" then
+                local entry = data.locations[name]
+                if type(entry) == "table" and tonumber(entry.x) and tonumber(entry.y) then
+                    return {x = math.floor(tonumber(entry.x)), y = math.floor(tonumber(entry.y))}
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- The owner's nearest other craft, stations first. A station is the better answer - it
+-- does not move, it usually has defences, and it is where the owner's other ships are -
+-- but a ship of the fleet is still company, so one is taken when there is no station.
+local function automationApiNearestOwnCraft(fromX, fromY, wanted)
+    local factions = {}
+
+    local own = automationApiOwnFaction()
+    if own then factions[#factions + 1] = own end
+
+    if own then
+        local ok, alliance = pcall(function() return own.allianceIndex end)
+        if ok and tonumber(alliance) and alliance ~= 0 then
+            local okHandle, handle = pcall(function() return Galaxy():findFaction(alliance) end)
+            if okHandle and handle then factions[#factions + 1] = handle end
+        end
+    end
+
+    local selfName
+    pcall(function() selfName = Entity().name end)
+
+    local best, bestStation, bestDistance, bestStationDistance
+
+    for _, faction in ipairs(factions) do
+        local names = {}
+        pcall(function() names = {faction:getShipNames()} end)
+
+        for _, name in ipairs(names) do
+            if name ~= selfName then
+                local okAt, x, y = pcall(function() return faction:getShipPosition(name) end)
+                x, y = tonumber(okAt and x or nil), tonumber(okAt and y or nil)
+
+                if x and y and (x ~= fromX or y ~= fromY) then
+                    local distance = automationApiFleeSquared(fromX, fromY, x, y)
+
+                    local okType, kind = pcall(function() return faction:getShipType(name) end)
+                    local station = okType and kind == EntityType.Station
+
+                    if station and (bestStationDistance == nil or distance < bestStationDistance) then
+                        bestStation, bestStationDistance = {x = x, y = y}, distance
+                    end
+                    if bestDistance == nil or distance < bestDistance then
+                        best, bestDistance = {x = x, y = y}, distance
+                    end
+                end
+            end
+        end
+    end
+
+    if wanted ~= "any" and bestStation then return bestStation end
+
+    return bestStation or best
+end
+
+-- The sector a flee order names, or nil when it names none - "known" and "safe" are
+-- asking for somewhere rather than for a place.
+local function automationApiFleeDestination(to, fromX, fromY)
+    if to.kind == "sector" then
+        local x, y = tonumber(to.x), tonumber(to.y)
+        if x and y then return {x = math.floor(x), y = math.floor(y)} end
+        return nil
+    end
+
+    if to.kind == "location" then
+        return automationApiLocationSector(tostring(to.name or ""))
+    end
+
+    if to.kind == "station" then
+        return automationApiNearestOwnCraft(fromX, fromY, to.name == "any" and "any" or "station")
+    end
+
+    return nil
+end
+
+-- Where this flee sends the ship from where it is standing now, as {x, y, final}.
+--
+-- `final` says whether arriving there ends the flee. A named destination further away
+-- than one jump is walked towards a hop at a time rather than routed: the planner is a
+-- galaxy-side, sliced-across-ticks search and a ship being shot at cannot wait for one,
+-- and a greedy step towards the destination is out of this sector either way, which is
+-- the urgent half.
+local function automationApiFleeTarget(flee)
+    local x, y = Sector():getCoordinates()
+    local reach = automationApiJumpReach()
+    if reach <= 0 then return nil, "no_hyperspace" end
+
+    local to = type(flee.to) == "table" and flee.to or {kind = "known"}
+    local wanted = automationApiFleeDestination(to, x, y)
+
+    if wanted and wanted.x == x and wanted.y == y then
+        return nil, "already_there"
+    end
+
+    if wanted and automationApiFleeSquared(x, y, wanted.x, wanted.y) <= reach * reach
+       and automationApiJumpValid(x, y, wanted.x, wanted.y) then
+        return {x = wanted.x, y = wanted.y, final = true}
+    end
+
+    local candidates = automationApiFleeCandidates(x, y, reach)
+    if #candidates == 0 then
+        return nil, wanted and "no_route" or "nowhere_to_go"
+    end
+
+    -- A destination out of reach: the candidate that gets closest to it.
+    if wanted then
+        local best, bestDistance
+
+        for _, candidate in ipairs(candidates) do
+            local distance = automationApiFleeSquared(candidate.x, candidate.y, wanted.x, wanted.y)
+            if bestDistance == nil or distance < bestDistance then
+                best, bestDistance = candidate, distance
+            end
+        end
+
+        -- Only if it is actually progress. A ring of candidates that all lead away from
+        -- the destination means the ship cannot get there, and jumping further from it
+        -- to satisfy the order would be worse than simply getting out of this sector.
+        if best and bestDistance < automationApiFleeSquared(x, y, wanted.x, wanted.y) then
+            return {x = best.x, y = best.y, final = false}
+        end
+    end
+
+    if to.kind == "safe" then
+        local best, bestDistance
+
+        for _, candidate in ipairs(candidates) do
+            if automationApiFriendlySector(candidate.x, candidate.y) then
+                local distance = automationApiFleeSquared(x, y, candidate.x, candidate.y)
+                if bestDistance == nil or distance < bestDistance then
+                    best, bestDistance = candidate, distance
+                end
+            end
+        end
+
+        if best then return {x = best.x, y = best.y, final = true} end
+    end
+
+    -- Known space first, and a random one of those: a predictable bolthole is one an
+    -- attacker can follow the ship to every time.
+    local known = {}
+    for _, candidate in ipairs(candidates) do
+        if candidate.known then known[#known + 1] = candidate end
+    end
+
+    local pool = #known > 0 and known or candidates
+    local pick = pool[math.random(1, #pool)]
+
+    return {x = pick.x, y = pick.y, final = to.kind == "known" or to.kind == "safe"}
+end
+
+local function automationApiEndFlee(outcome, reason)
+    local flee = automationApi.flee
+    if not flee then return end
+
+    local x, y = Sector():getCoordinates()
+
+    automationApi.flee = nil
+    automationApi.lastFlee =
+    {
+        reason = flee.reason,
+        outcome = outcome,
+        detail = reason,
+        hops = flee.hops - (flee.hopsLeft or 0),
+        from = flee.from,
+        sector = {x = x, y = y},
+        hull = flee.hull,
+        shield = flee.shield,
+    }
+
+    automationApiPublish()
+end
+
+-- Puts the next jump on the chain, or reports that there is none to put there.
+local function automationApiFleeJump(flee)
+    local target, why = automationApiFleeTarget(flee)
+
+    if not target then
+        flee.phase = "stuck"
+        flee.detail = why
+        flee.retryIn = AUTOMATION_API_FLEE_RETRY
+        return false
+    end
+
+    flee.target = target
+    flee.phase = "jumping"
+    flee.retryIn = nil
+
+    automationApiReplaceChain({{action = OrderType.Jump, x = target.x, y = target.y,
+                                automationApi = "flee"}})
+
+    return true
+end
+
+-- Drops everything the ship was doing and runs. `reason` is which threshold tripped.
+local function automationApiStartFlee(reason, hull, shield)
+    local x, y = Sector():getCoordinates()
+    local settings = automationApi.settings.standing.flee
+
+    if automationApi.plan then
+        automationApiEndPlan("fled", "The ship broke off to flee.")
+    end
+    if automationApi.reaction then
+        automationApiEndReaction("fled", false)
+    end
+    if automationApi.transfer then
+        automationApiStopApproach(automationApi.transfer)
+        automationApiEndTransfer("replaced", "The ship broke off to flee.")
+    end
+
+    local hops = math.max(1, math.min(AUTOMATION_API_FLEE_HOPS_MAX,
+                                      math.floor(tonumber(settings.hops) or 1)))
+
+    local flee =
+    {
+        reason = reason,
+        phase = "jumping",
+        hops = hops,
+        hopsLeft = hops,
+        from = {x = x, y = y},
+        to = settings.to,
+        hull = hull,
+        shield = shield,
+        age = 0,
+    }
+
+    automationApi.flee = flee
+    automationApiRefreshVitals()
+
+    if not automationApiFleeJump(flee) then
+        -- Nowhere to go yet. The chain is cleared anyway: whatever it held was flying the
+        -- ship deeper into the fight, and the flee looks again in a moment.
+        OrderChain.clearAllOrders()
+    end
+
+    automationApiPublish()
+end
+
+-- Whether the ship is hurt enough to run. Returns which threshold tripped, or nil.
+local function automationApiFleeTriggered(flee, enemies)
+    if not flee.enabled then return nil end
+    if flee.requireEnemies ~= false and not enemies then return nil end
+
+    local hull, shield = automationApiVitals()
+
+    local hullLimit = tonumber(flee.hull) or 0
+    if hullLimit > 0 and hull ~= nil and hull < hullLimit then return "hull", hull, shield end
+
+    local shieldLimit = tonumber(flee.shield) or 0
+    if shieldLimit > 0 and shield ~= nil and shield < shieldLimit then
+        return "shield", hull, shield
+    end
+
+    return nil
+end
+
+-- Returns true while the flee has the ship, which is what keeps every other automation
+-- from touching it.
+local function automationApiTickFlee(timeStep, enemies)
+    local settings = automationApi.settings.standing.flee
+    local flee = automationApi.flee
+
+    if not flee then
+        if not automationApiMayAct() then return false end
+
+        local reason, hull, shield = automationApiFleeTriggered(settings, enemies)
+        if not reason then return false end
+
+        automationApiStartFlee(reason, hull, shield)
+        return automationApi.flee ~= nil
+    end
+
+    flee.age = (flee.age or 0) + timeStep
+
+    -- Switched off mid-flight. The ship stops where it is rather than finishing the hop:
+    -- whoever turned the order off is watching, and is a better judge than this is.
+    if not settings.enabled then
+        OrderChain.clearAllOrders()
+        automationApiEndFlee("switched_off")
+        return false
+    end
+
+    if flee.phase == "stuck" then
+        flee.retryIn = (flee.retryIn or 0) - timeStep
+
+        if flee.age >= AUTOMATION_API_FLEE_MAX then
+            automationApiEndFlee("failed", flee.detail)
+            return false
+        end
+
+        if flee.retryIn <= 0 then automationApiFleeJump(flee) end
+        return true
+    end
+
+    -- Somebody gave the ship other orders while it was running. They win: the flee is one
+    -- jump order on the chain and anything else there was put on deliberately.
+    if #OrderChain.chain > 0 and not automationApiChainTagged("flee") then
+        automationApiEndFlee("replaced", "Other orders replaced the jump.")
+        return false
+    end
+
+    local x, y = Sector():getCoordinates()
+    local arrived = flee.target and x == flee.target.x and y == flee.target.y
+
+    if arrived then
+        flee.hopsLeft = math.max(0, (flee.hopsLeft or 1) - 1)
+
+        -- The destination itself, or as far as the order allows: either way it is over.
+        -- "escaped" is the second case - out of the fight, but short of where it was told
+        -- to go, which a caller watching a named destination needs to be able to tell.
+        if flee.target.final or flee.hopsLeft <= 0 then
+            OrderChain.clearAllOrders()
+            automationApiEndFlee(flee.target.final and "arrived" or "escaped")
+            return false
+        end
+
+        -- Out of the fight but not yet where it was told to go, and it may jump again.
+        automationApiFleeJump(flee)
+        automationApiPublish()
+        return true
+    end
+
+    -- Still in the sector with the chain run out: the jump was refused or cleared under
+    -- it. Treat it the way a flee that found nowhere to go is treated.
+    if #OrderChain.chain == 0 or OrderChain.finished then
+        flee.phase = "stuck"
+        flee.detail = flee.detail or "jump_refused"
+        flee.retryIn = AUTOMATION_API_FLEE_RETRY
+        return true
+    end
+
+    if flee.age >= AUTOMATION_API_FLEE_MAX then
+        OrderChain.clearAllOrders()
+        automationApiEndFlee("failed", "timeout")
+        return false
+    end
+
+    return true
+end
+
 local function automationApiWatching()
     local standing = automationApi.settings.standing
     return automationApi.plan ~= nil or automationApi.reaction ~= nil
-           or automationApi.transfer ~= nil
+           or automationApi.transfer ~= nil or automationApi.flee ~= nil
            or standing.enemies.enabled or standing.loot.enabled
+           or standing.flee.enabled
 end
 
 local function automationApiTick(timeStep)
@@ -1460,6 +2194,12 @@ local function automationApiTick(timeStep)
     -- fill every ship's event log with enemies coming and going.
     if not automationApiWatching() then
         automationApi.enemies = false
+
+        -- One exception: a craft with nothing switched on still says when it is hurt.
+        -- That is what a notification rule about hull is asking for, and it costs four
+        -- property reads every AUTOMATION_API_VITALS_QUIET seconds and publishes nothing
+        -- at all while the craft is whole.
+        automationApiTickVitals(timeStep, false, true)
         return
     end
 
@@ -1467,8 +2207,18 @@ local function automationApiTick(timeStep)
 
     if enemies ~= automationApi.enemies then
         automationApi.enemies = enemies
+        -- A fight starting or ending is exactly when the condition of the ship matters,
+        -- so the rate limit is dropped for the tick below rather than making a client
+        -- wait out the quiet interval for the number it came for.
+        automationApi.vitalsIn = 0
         automationApiPublish()
     end
+
+    automationApiTickVitals(timeStep, enemies)
+
+    -- Before everything else, and it answers for the ship while it has it. A ship that is
+    -- losing has nothing to gain from finishing its route, its fight or its docking.
+    if automationApiTickFlee(timeStep, enemies) then return end
 
     if automationApi.plan then
         automationApiTickPlan(automationApi.plan, timeStep, enemies)
@@ -1596,6 +2346,8 @@ function OrderChain.automationApiConfigure(payload)
                 if AUTOMATION_API_STANDING_MODES[order.mode] then standing[name].mode = order.mode end
             end
         end
+
+        automationApiApplyFlee(standing.flee, spec.standing.flee)
     end
 
     -- A reaction whose order was just switched off stops, and the ship goes back to what
@@ -1741,6 +2493,12 @@ callable(OrderChain, "automationApiTransfer")
 function OrderChain.automationApiStop()
     if not automationApiPermitted() then return end
 
+    -- A flee first, and it always clears the chain: the one order on it is the jump out.
+    if automationApi.flee then
+        OrderChain.clearAllOrders()
+        automationApiEndFlee("stopped", "Stopped through the API.")
+    end
+
     if automationApi.transfer then
         automationApiStopApproach(automationApi.transfer)
         automationApiEndTransfer("stopped", "Stopped through the API.")
@@ -1796,6 +2554,8 @@ function OrderChain.secure()
         lootRuns = automationApi.lootRuns,
         transfer = automationApi.transfer,
         lastTransfer = automationApi.lastTransfer,
+        flee = automationApi.flee,
+        lastFlee = automationApi.lastFlee,
     }
 
     return data
@@ -1828,6 +2588,9 @@ function OrderChain.restore(data)
                 standing.enemies.enabled = true
             end
 
+            -- A ship saved before the flee order simply has none, and keeps the default.
+            automationApiApplyFlee(standing.flee, stored.flee)
+
             automationApi.settings.standing = standing
         end
         automationApi.reaction = type(saved.reaction) == "table" and saved.reaction or nil
@@ -1849,6 +2612,20 @@ function OrderChain.restore(data)
             automationApi.transfer = transfer
         else
             automationApi.transfer = nil
+        end
+
+        automationApi.lastFlee = type(saved.lastFlee) == "table" and saved.lastFlee or nil
+
+        -- A flee caught mid-jump picks up where it was: the jump order comes back with the
+        -- chain, and a ship that arrived while the sector was unloaded finds itself at the
+        -- target on the first tick and finishes.
+        local flee = saved.flee
+        if type(flee) == "table" then
+            flee.age = 0
+            flee.retryIn = 0
+            automationApi.flee = flee
+        else
+            automationApi.flee = nil
         end
     end
 

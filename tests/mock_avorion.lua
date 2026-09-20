@@ -375,13 +375,18 @@ function M.install()
             ship.automation = ship.automation or {autoAggressive = false, attackCivilians = false}
             local automation = ship.automation
             automation.standing = automation.standing
-                or {enemies = {enabled = false, mode = "idle"}, loot = {enabled = false, mode = "idle"}}
+                or {enemies = {enabled = false, mode = "idle"},
+                    loot = {enabled = false, mode = "idle"},
+                    -- the flee order's defaults, as entity/orderchain.lua sets them
+                    flee = {enabled = false, hull = 0.5, shield = 0, requireEnemies = true,
+                            hops = 1, to = {kind = "known"}}}
 
             local spec = Json.decode(payload)
             if spec.attackCivilians ~= nil then automation.attackCivilians = spec.attackCivilians end
             if spec.autoAggressive ~= nil then automation.standing.enemies.enabled = spec.autoAggressive end
 
-            -- merged part by part, as the ship merges them
+            -- Merged part by part, as the ship merges them. A destination is one value
+            -- and is replaced whole, which is what the decoded table does here.
             for name, order in pairs(spec.standing or {}) do
                 for key, value in pairs(order) do automation.standing[name][key] = value end
             end
@@ -393,6 +398,7 @@ function M.install()
             ship.automation.plan = nil
             ship.automation.reaction = nil
             ship.automation.transfer = nil
+            ship.automation.flee = nil
             ship.chain = {}
             ship.chainIndex = 0
         end,

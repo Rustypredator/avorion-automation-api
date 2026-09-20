@@ -33,6 +33,7 @@ local ShipEvents = include("automationapi/shipevents")
 local RoutePlanner = include("automationapi/routeplanner")
 local Missions = include("automationapi/handlers/missions")
 local Movement = include("automationapi/handlers/movement")
+local LocationLibrary = include("automationapi/locations")
 
 local Navigation = {}
 
@@ -74,19 +75,151 @@ end
 local STANDING_ORDERS = {"enemies", "loot"}
 local STANDING_MODES = {idle = true, interrupt = true}
 
-local function standingOf(value)
+-- The flee order is a standing order with thresholds and a destination instead of a mode,
+-- so it is parsed on its own. See the FLEEING section of entity/orderchain.lua for what
+-- the ship does with each destination kind.
+local STANDING_ALL = {"enemies", "loot", "flee"}
+local FLEE_KINDS = {"known", "safe", "station", "location", "sector"}
+
+-- A hull or shield threshold. Fractions of the craft's own maximum, so one rule fits a
+-- freighter and a battleship; anything above 1 is read as a percentage, since a fraction
+-- cannot be. 0 switches that half of the test off.
+local function fractionOf(field, value)
+    if type(value) ~= "number" or value ~= value or value < 0 or value > 100 then
+        Router.fail(400, "bad_threshold",
+                    "'" .. field .. "' is a fraction from 0 to 1, or a percentage up to 100.")
+    end
+
+    if value > 1 then value = value / 100 end
+
+    -- Whole percent. The ship rounds what it publishes into 5% buckets for its event feed,
+    -- but the threshold itself is compared against the real value, so this is only here to
+    -- keep the confirmation and the stored copy exactly equal.
+    return math.floor(value * 100 + 0.5) / 100
+end
+
+local function fleeDestinationOf(ctx, owner, value)
+    if type(value) ~= "table" then
+        Router.fail(400, "bad_flee_to", "'standing.flee.to' is an object with a 'kind'.",
+                    {known = Json.array(FLEE_KINDS)})
+    end
+
+    local kind = string.lower(tostring(value.kind or ""))
+
+    local known = {}
+    for _, name in ipairs(FLEE_KINDS) do known[name] = true end
+
+    if not known[kind] then
+        Router.fail(400, "bad_flee_to",
+                    "'standing.flee.to.kind' is one of " .. table.concat(FLEE_KINDS, ", ") .. ".",
+                    {known = Json.array(FLEE_KINDS)})
+    end
+
+    local to = {kind = kind}
+
+    if kind == "sector" then
+        to.x, to.y = Routes.coordinates(value, "standing.flee.to")
+    elseif kind == "location" then
+        local name = LocationLibrary.cleanName(value.name)
+        if not name then
+            Router.fail(400, "bad_flee_to",
+                        "'standing.flee.to.name' is the name of a location in the library.")
+        end
+
+        -- Checked here so a typo is an error now rather than a ship that runs somewhere
+        -- unexpected in the middle of a fight. The ship reads the same two libraries.
+        local found = LocationLibrary.get(owner.index, name)
+        if not found and owner.kind == "player" and ctx.player.alliance then
+            found = LocationLibrary.get(ctx.player.alliance.index, name)
+        end
+
+        if not found then
+            Router.fail(404, "no_such_location",
+                        "No location called '" .. name .. "' in your library.")
+        end
+
+        to.name = name
+    elseif kind == "station" then
+        -- "any" widens it from the nearest station to the nearest craft of the fleet.
+        if value.name ~= nil then
+            if value.name ~= "any" and value.name ~= "station" then
+                Router.fail(400, "bad_flee_to",
+                            "'standing.flee.to.name' is 'station' or 'any' for this kind.")
+            end
+            if value.name == "any" then to.name = "any" end
+        end
+    end
+
+    return to
+end
+
+local function fleeOf(ctx, owner, order)
+    if type(order) ~= "table" then
+        Router.fail(400, "bad_standing",
+                    "'standing.flee' is an object with 'enabled', thresholds and a 'to'.")
+    end
+
+    local parsed = {}
+
+    for _, name in ipairs({"enabled", "requireEnemies"}) do
+        if order[name] ~= nil then
+            if type(order[name]) ~= "boolean" then
+                Router.fail(400, "bad_standing",
+                            "'standing.flee." .. name .. "' must be true or false.")
+            end
+            parsed[name] = order[name]
+        end
+    end
+
+    for _, name in ipairs({"hull", "shield"}) do
+        if order[name] ~= nil then
+            parsed[name] = fractionOf("standing.flee." .. name, order[name])
+        end
+    end
+
+    if order.hops ~= nil then
+        local hops = tonumber(order.hops)
+        if type(order.hops) ~= "number" or hops ~= math.floor(hops) or hops < 1 or hops > 10 then
+            Router.fail(400, "bad_flee_hops", "'standing.flee.hops' is a whole number, 1 to 10.")
+        end
+        parsed.hops = math.floor(hops)
+    end
+
+    if order.to ~= nil then
+        parsed.to = fleeDestinationOf(ctx, owner, order.to)
+    end
+
+    if next(parsed) == nil then
+        Router.fail(400, "bad_standing",
+                    "'standing.flee' needs at least one of 'enabled', 'hull', 'shield', "
+                    .. "'requireEnemies', 'hops' or 'to'.")
+    end
+
+    -- A flee order that watches neither half would never fire. Caught here rather than
+    -- letting a caller switch one on and wonder why nothing ever happens.
+    if parsed.enabled == true and (parsed.hull or 0) == 0 and (parsed.shield or 0) == 0
+       and order.hull ~= nil and order.shield ~= nil then
+        Router.fail(400, "bad_threshold",
+                    "A flee order with both thresholds at 0 would never fire. Set "
+                    .. "'hull', 'shield' or both.")
+    end
+
+    return parsed
+end
+
+local function standingOf(ctx, owner, value)
     if type(value) ~= "table" then
         Router.fail(400, "bad_standing", "'standing' is an object of standing orders.",
-                    {known = Json.array(STANDING_ORDERS)})
+                    {known = Json.array(STANDING_ALL)})
     end
 
     local known = {}
-    for _, name in ipairs(STANDING_ORDERS) do known[name] = true end
+    for _, name in ipairs(STANDING_ALL) do known[name] = true end
 
     for name, _ in pairs(value) do
         if not known[name] then
             Router.fail(400, "bad_standing", "Unknown standing order '" .. tostring(name) .. "'.",
-                        {known = Json.array(STANDING_ORDERS)})
+                        {known = Json.array(STANDING_ALL)})
         end
     end
 
@@ -130,9 +263,13 @@ local function standingOf(value)
         end
     end
 
+    if value.flee ~= nil then
+        standing.flee = fleeOf(ctx, owner, value.flee)
+    end
+
     if next(standing) == nil then
         Router.fail(400, "bad_standing", "'standing' names no standing order.",
-                    {known = Json.array(STANDING_ORDERS)})
+                    {known = Json.array(STANDING_ALL)})
     end
 
     return standing
@@ -140,6 +277,23 @@ end
 
 -- Whether the ship's published state holds the standing orders that were sent. A ship on a
 -- mod version from before standing orders publishes none, and never confirms.
+local function sameValue(actual, wanted)
+    if type(wanted) ~= "table" then return actual == wanted end
+    if type(actual) ~= "table" then return false end
+
+    for key, value in pairs(wanted) do
+        if not sameValue(actual[key], value) then return false end
+    end
+
+    -- A destination is replaced whole, never merged, so a leftover field on the ship's
+    -- copy - the name of the location it used to run to - means it is not what was sent.
+    for key, _ in pairs(actual) do
+        if wanted[key] == nil then return false end
+    end
+
+    return true
+end
+
 local function standingReported(automation, requested)
     local reported = automation.standing
     if type(reported) ~= "table" then return false end
@@ -149,7 +303,7 @@ local function standingReported(automation, requested)
         if type(actual) ~= "table" then return false end
 
         for key, value in pairs(order) do
-            if actual[key] ~= value then return false end
+            if not sameValue(actual[key], value) then return false end
         end
     end
 
@@ -562,7 +716,7 @@ function Navigation.register(router)
         end
 
         if body.standing ~= nil then
-            settings.standing = standingOf(body.standing)
+            settings.standing = standingOf(ctx, owner, body.standing)
         end
 
         if body.autoAggressive ~= nil and settings.standing and settings.standing.enemies
@@ -610,7 +764,7 @@ function Navigation.register(router)
                             {ship = params.name, owner = Owner.describe(owner)},
                             function(automation)
                                 return automation.plan == nil and automation.reaction == nil
-                                       and automation.transfer == nil
+                                       and automation.transfer == nil and automation.flee == nil
                             end)
     end)
 

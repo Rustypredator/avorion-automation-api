@@ -148,12 +148,20 @@ local function newWorld()
         flyCalls = 0,
         dockDone = false,
         docked = {},     -- station name -> the ship is in its docking area
+        hull = 1,        -- fractions of the ship's own maximum; nil for "the engine will
+        shield = 1,      -- not say", which is what a craft without shields looks like
+        known = {},      -- faction index -> list of {x, y} that faction has been to
+        controlled = {}, -- "x:y" -> faction index holding that sector
+        relations = {},  -- faction index -> relation level towards the ship's owner
+        fleet = {},      -- faction index -> {name = {x, y, station}}
+        values = {},     -- Server values, which is where the location library lives
+        randoms = nil,   -- a fixed sequence for math.random, so a pick is testable
     }
     world.ship = craft({name = "Self", faction = 1, capacity = 100})
     _G.callingPlayer = nil
 end
 
-_G.EntityType = {Loot = 8}
+_G.EntityType = {Loot = 8, Ship = 1, Station = 2}
 _G.ComponentType = {CargoLoot = 71, DockingPositions = 30}
 _G.FighterOrders = {Attack = 1, Return = 3, CollectLoot = 9}
 _G.StatsBonuses = {FighterCargoPickup = 48}
@@ -173,8 +181,77 @@ _G.checkEntityInteractionPermissions = function()
     return world.permitted and {index = 1} or nil
 end
 
+-- A Player or Alliance handle, as the flee order reads one: what that faction has seen,
+-- what it owns and, for a player, which alliance it is in.
+local function factionHandle(index)
+    return
+    {
+        index = index,
+        isPlayer = world.players[index] ~= nil,
+        isAlliance = world.players[index] == nil,
+        allianceIndex = (world.players[index] or {}).allianceIndex,
+        getKnownSectors = function()
+            return table.unpack(world.known[index] or {})
+        end,
+        getShipNames = function()
+            local names = {}
+            for name in pairs(world.fleet[index] or {}) do names[#names + 1] = name end
+            table.sort(names)
+            return table.unpack(names)
+        end,
+        getShipPosition = function(_, name)
+            local craftSpec = (world.fleet[index] or {})[name]
+            if not craftSpec then error("no such craft") end
+            return craftSpec.x, craftSpec.y
+        end,
+        getShipType = function(_, name)
+            local craftSpec = (world.fleet[index] or {})[name]
+            return craftSpec and craftSpec.station and EntityType.Station or EntityType.Ship
+        end,
+        -- as the engine answers it: a level, from the other faction's point of view
+        getRelations = function(_, other) return world.relations[index] end,
+    }
+end
+
+_G.Galaxy = function()
+    return
+    {
+        findFaction = function(_, index) return factionHandle(index) end,
+        getControllingFaction = function(_, x, y)
+            local index = world.controlled[x .. ":" .. y]
+            return index and factionHandle(index) or nil
+        end,
+    }
+end
+
+_G.Faction = function(index) return factionHandle(index) end
+
+_G.Server = function()
+    return
+    {
+        getValue = function(_, key) return world.values[key] end,
+        setValue = function(_, key, value) world.values[key] = value end,
+    }
+end
+
+-- math.random with a script, so "a random known sector" is a sector this test chose.
+local automationApiRealRandom = math.random
+math.random = function(a, b)
+    if world and world.randoms and #world.randoms > 0 then
+        return table.remove(world.randoms, 1)
+    end
+    if a == nil then return automationApiRealRandom() end
+    return automationApiRealRandom(a, b)
+end
+
 _G.Entity = function()
     local ship = world.ship
+    -- The engine reports absolutes; the extension turns them into fractions itself, so
+    -- the model keeps a maximum of 100 and scales the test's fraction onto it.
+    ship.maxDurability = world.hull ~= nil and 100 or 0
+    ship.durability = (world.hull or 0) * 100
+    ship.shieldMaxDurability = world.shield ~= nil and 100 or 0
+    ship.shieldDurability = (world.shield or 0) * 100
     ship.getCaptain = function() return world.captain end
     ship.getPilotIndices = function() return table.unpack(world.pilots) end
     ship.isJumpRouteValid = function(_, ax, ay, bx, by) return true end
@@ -267,6 +344,7 @@ end
 _G.HyperspaceEngine = function()
     return
     {
+        reach = world.range,
         isJumpRouteValid = function(_, ax, ay, bx, by)
             if world.blocked[bx .. ":" .. by] then return false, "Jump route is blocked." end
             local d = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
@@ -1440,6 +1518,224 @@ plan({id = "t1", hops = {{x = 5, y = 0, kind = "jump"}}})
 OrderChain.automationApiStop()
 check(#OrderChain.chain == 0 and state().plan == nil and state().last.outcome == "stopped",
       "stop clears the chain and ends the plan")
+
+
+-- #### FLEEING #### --
+
+print("\nfleeing: thresholds")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+
+standing({flee = {enabled = true, hull = 0.5}})
+check(state().standing.flee.enabled == true and state().standing.flee.hull == 0.5
+      and state().standing.flee.to.kind == "known",
+      "the flee order is published with its thresholds and destination")
+
+world.hull = 0.6
+tick()
+check(state().flee == nil, "a healthy ship does not run")
+
+world.hull = 0.4
+tick()
+check(state().flee == nil, "nor does a hurt one with nobody shooting at it")
+
+world.enemies = true
+tick()
+check(actions() == "J3:0" and state().flee ~= nil and state().flee.reason == "hull",
+      "hull below the threshold with enemies about sends the ship to a known sector")
+check(state().vitals and state().vitals.hull == 0.4, "and its hull is published with it")
+
+jumpTo(3, 0)
+check(state().flee == nil and state().lastFlee.outcome == "arrived"
+      and state().lastFlee.reason == "hull" and state().lastFlee.from.x == 0,
+      "arriving ends the flee, and says where it ran from")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0, shield = 0.5, requireEnemies = false}})
+world.shield = 0.4
+tick()
+check(state().flee ~= nil and state().flee.reason == "shield",
+      "the shield threshold fires on its own, and without enemies when told to")
+
+print("\nfleeing: what it interrupts")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0.5}, enemies = {enabled = true, mode = "interrupt"}})
+plan({id = "r1", hops = {{x = 5, y = 0, kind = "jump"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(state().plan == nil and state().last.outcome == "fled" and state().flee ~= nil
+      and actions() == "J3:0",
+      "a flee breaks off a plan rather than waiting for it")
+check(state().reaction == nil, "and the enemies order does not get the ship instead")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({enemies = {enabled = true, mode = "interrupt"}, flee = {enabled = true, hull = 0.5}})
+world.enemies = true
+tick()
+check(state().reaction and state().reaction.kind == "enemies",
+      "an undamaged ship fights as before")
+world.hull = 0.4
+tick()
+check(state().flee ~= nil and state().lastReaction.outcome == "fled",
+      "and breaks off that fight once it is losing it")
+
+print("\nfleeing: where to")
+
+newWorld()
+loadOrderChain()
+world.range = 6
+world.known[1] = {{x = 3, y = 0}, {x = 5, y = 0}}
+world.controlled["5:0"] = 7
+world.relations[7] = 25000
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "safe"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J5:0", "'safe' runs for space held by a faction that is not hostile")
+
+newWorld()
+loadOrderChain()
+world.range = 6
+world.known[1] = {{x = 3, y = 0}, {x = 5, y = 0}}
+world.controlled["5:0"] = 7
+world.relations[7] = -50000
+world.randoms = {1}   -- so "one of the known sectors" is the first of them
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "safe"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J3:0", "and passes over space held by somebody at war with the owner")
+
+newWorld()
+loadOrderChain()
+world.values["automationapi_locations_1"] =
+    Json.encode({version = 1, locations = {Home = {x = 2, y = 0}}})
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "location", name = "Home"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J2:0", "'location' reads the owner's library out of its Server value")
+jumpTo(2, 0)
+check(state().lastFlee.outcome == "arrived", "and reaching it ends the flee")
+
+newWorld()
+loadOrderChain()
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "sector", x = 4, y = 3}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J4:3", "'sector' jumps to the coordinates it was given")
+
+print("\nfleeing: walking to somewhere out of reach")
+
+newWorld()
+loadOrderChain()
+world.fleet[1] = {Yard = {x = 20, y = 0, station = true}, Tug = {x = 1, y = 1}}
+world.known[1] = {{x = 5, y = 0}, {x = 10, y = 0}, {x = -5, y = 0}}
+standing({flee = {enabled = true, hull = 0.5, hops = 2, to = {kind = "station"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J5:0", "a station out of jump range is walked towards, not routed")
+jumpTo(5, 0)
+check(actions() == "J10:0" and state().flee ~= nil, "one hop at a time, while hops are left")
+jumpTo(10, 0)
+check(state().flee == nil and state().lastFlee.outcome == "escaped"
+      and state().lastFlee.hops == 2,
+      "and running out of hops ends it as escaped rather than arrived")
+
+newWorld()
+loadOrderChain()
+world.fleet[1] = {Tug = {x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0.5, to = {kind = "station", name = "any"}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(actions() == "J3:0", "'any' takes the nearest craft of the fleet when there is no station")
+
+print("\nfleeing: when it cannot")
+
+newWorld()
+loadOrderChain()
+world.range = 0
+standing({flee = {enabled = true, hull = 0.5}})
+world.enemies = true
+world.hull = 0.4
+tick()
+check(state().flee and state().flee.phase == "stuck" and #OrderChain.chain == 0,
+      "a ship that cannot jump clears its chain and keeps trying")
+world.range = 5
+world.known[1] = {{x = 3, y = 0}}
+tick(6)   -- past AUTOMATION_API_FLEE_RETRY
+check(actions() == "J3:0", "and goes as soon as it can")
+
+newWorld()
+loadOrderChain()
+world.range = 0
+standing({flee = {enabled = true, hull = 0.5}})
+world.enemies = true
+world.hull = 0.4
+tick()
+tick(1000)
+check(state().flee == nil and state().lastFlee.outcome == "failed",
+      "a flee that never gets anywhere gives up rather than holding the ship for ever")
+
+print("\nfleeing: stopping and reloading")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0.5}})
+world.enemies = true
+world.hull = 0.4
+tick()
+OrderChain.automationApiStop()
+check(state().flee == nil and state().lastFlee.outcome == "stopped" and #OrderChain.chain == 0,
+      "stop ends a flee in flight")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0.5}})
+world.enemies = true
+world.hull = 0.4
+tick()
+standing({flee = {enabled = false}})
+tick()
+check(state().flee == nil and state().lastFlee.outcome == "switched_off",
+      "switching the order off calls the ship back")
+
+newWorld()
+loadOrderChain()
+world.known[1] = {{x = 3, y = 0}}
+standing({flee = {enabled = true, hull = 0.75, hops = 3, to = {kind = "sector", x = 9, y = 9}}})
+world.enemies = true
+world.hull = 0.4
+tick()
+local fleeing = OrderChain.secure()
+loadOrderChain()
+OrderChain.restore(fleeing)
+OrderChain.updateShipOrderInfo()
+check(state().flee ~= nil and state().standing.flee.hull == 0.75
+      and state().standing.flee.hops == 3 and state().standing.flee.to.x == 9,
+      "a flee and its settings survive a reload")
+
+newWorld()
+loadOrderChain()
+standing({flee = {enabled = true, hull = 2, hops = 99, to = {kind = "nonsense"}}})
+check(state().standing.flee.hull == 1 and state().standing.flee.hops == 10
+      and state().standing.flee.to.kind == "known",
+      "the ship clamps what it is sent and ignores a destination it does not know")
 
 print("")
 if failures > 0 then print(failures .. " check(s) failed"); os.exit(1) end

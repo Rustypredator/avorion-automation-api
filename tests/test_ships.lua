@@ -101,6 +101,15 @@ check(Json.isArray(body.ships), "ships is a JSON array")
 check(body.ships[1].name == "Little Scout", "sorted by name")
 check(body.ships[1].owner.kind == "player", "carries owner identity")
 
+-- What a client watching a fleet reads to tell a hurt craft from a whole one, without
+-- one detail call per craft.
+local hound
+for _, ship in ipairs(body.ships) do
+    if ship.name == "Ore Hound" then hound = ship end
+end
+check(hound and hound.condition and hound.condition.hull == 0.87 and hound.condition.shield == 1,
+      "the listing carries hull and shield as fractions")
+
 local _, body = call("GET", "/ships", {type = "station"})
 check(body.count == 1 and body.ships[1].name == "Home Base", "type=station filters to stations")
 

@@ -470,6 +470,60 @@ local status, body = call("POST", "/ships/Pathfinder/automation/stop")
 check(status == 200 and body.automation.plan == nil, "stop ends the plan")
 check(body.automation.autoAggressive == true, "and leaves the settings as they were")
 
+
+print("\nthe flee standing order")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {enabled = true, to = {kind = "elsewhere"}}}})
+check(status == 400 and body.error.code == "bad_flee_to"
+      and body.error.details.known ~= nil,
+      "an unknown flee destination is a 400 that lists the known ones")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {hull = 150}}})
+check(status == 400 and body.error.code == "bad_threshold", "so is a threshold over 100")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {enabled = true, hull = 0, shield = 0}}})
+check(status == 400 and body.error.code == "bad_threshold",
+      "and switching the order on with nothing to watch")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {to = {kind = "location", name = "Nowhere"}}}})
+check(status == 404 and body.error.code == "no_such_location",
+      "a location that is not in the library is refused where it is set, not mid-fight")
+
+local status = call("POST", "/locations/Bolthole", {x = 4, y = 4})
+check(status == 200, "a location is put in the library")
+
+Mock.entityCalls = {}
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {enabled = true, hull = 81, shield = 50,
+                                               hops = 2,
+                                               to = {kind = "location", name = "Bolthole"}}}})
+check(status == 200 and body.confirmed == true, "a full flee order is confirmed by the ship")
+check(body.automation.standing.flee.hull == 0.81 and body.automation.standing.flee.shield == 0.5,
+      "a threshold given as a percentage is stored as the fraction it means")
+check(body.automation.standing.flee.to.kind == "location"
+      and body.automation.standing.flee.to.name == "Bolthole"
+      and body.automation.standing.flee.hops == 2,
+      "and the destination reaches the ship whole")
+check(#Mock.entityCalls == 1, "in one call")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {to = {kind = "sector", x = 7, y = -2}}}})
+check(status == 200 and body.automation.standing.flee.to.kind == "sector"
+      and body.automation.standing.flee.to.x == 7
+      and body.automation.standing.flee.to.name == nil,
+      "a new destination replaces the old one rather than merging into it")
+check(body.automation.standing.flee.enabled == true and body.automation.standing.flee.hull == 0.81,
+      "and the rest of the order stays as it was")
+
+local status, body = call("POST", "/ships/Pathfinder/automation",
+                          {standing = {flee = {to = {kind = "safe"}}}, attackCivilians = true})
+check(status == 200 and body.automation.standing.flee.to.kind == "safe",
+      "'safe' needs nothing else with it")
+
 -- #### TRAVEL MISSIONS #### --
 
 print("\nthe travel mission checks its destination wherever it is started from")
