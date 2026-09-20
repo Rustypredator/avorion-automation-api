@@ -90,6 +90,10 @@
 # for features that want a secure context - so trust the CA, as docs/local-testing.md
 # describes.
 #
+# The push notifications on the console's Alerts tab need none of this: they are sent by
+# the notifier service, not by the browser. If they are all you were after, plain HTTP is
+# enough and this whole site can be ignored.
+#
 # Every name a browser uses to reach the stack must be listed, separated by spaces, because
 # the certificate is issued for exactly those: "localhost 127.0.0.1 192.168.1.20 gamebox.lan".
 # (Caddy substitutes the variable inside one token, so a bare comma is refused.)
