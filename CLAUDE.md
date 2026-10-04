@@ -66,6 +66,11 @@ data/scripts/                   everything the game loads
     missionrules.lua  pure arithmetic for mission automation limits/candidates
     programrules.lua  order program vocabulary: actions, conditions, validation, evaluation
     transferrules.lua cargo transfer request vocabulary, shared by /transfer and program steps
+    items.lua         faction inventory reads: getItems() is a FLAT 0-based sparse map of
+                      {item, amount}, NOT what the docs say; per-type field lists because
+                      reading a field a type lacks raises + logs a traceback
+    itemrules.lua     one {stat, op, value} vocabulary for both the inventory filters and
+                      the trash rules; rank order (rarity/material) compared by name
     analysis.lua      background area analysis runner (async, deferred responses)
     factionscope.lua  fakes getParentFaction() while vanilla command code runs
     routes.lua        calculateJumpPath wrapper, coordinate parsing, travel destination gates,
@@ -74,7 +79,8 @@ data/scripts/                   everything the game loads
     routeplanner.lua  own weighted A* with preferences, boss-farm loop picker
     sectors.lua       known sectors + seed-based prediction (SectorSpecifics)
     devsetup.lua      NOT loaded; console helpers: spawn a test ship, spawnBoss, bossLab
-                      (boss + loot + carrier in a sector, prints engine answers)
+                      (boss + loot + carrier in a sector, prints engine answers), inventory
+                      (dump a faction's slots), stock (fill one with generated loot)
     handlers/         one module per endpoint group, each exposes .register(router)
       meta.lua              GET /ping
       keys.lua              /keys: the caller's own API keys, renamed and revoked. NOT
@@ -91,6 +97,11 @@ data/scripts/                   everything the game loads
       movement.lua          /travel (mission alias), /orders (in-sector order chain)
       navigation.lua        /route, /farm, /automation (talks to entity/orderchain.lua)
       transfer.lua          /ships/{name}/transfer: holds to pick from, cargo moves via the ship
+      inventory.lua         /inventory*: listing, filters, facets, favourite/trash tags, and
+                            the trash manager (rules in Server values + sliced sweeper .tick).
+                            Reads AND writes go straight from the galaxy script - the
+                            inventory is on the faction, not in a player script, so no job
+                            queue and no owner_offline (verified on a real server, offline)
       map.lua               /galaxy/*, /map/* (sliced scans across ticks)
       economy.lua           /stations, /stations/{name}, /economy,
                             /stations/{name}/events, /economy/events (station feed)
@@ -123,7 +134,9 @@ web/                            browser console, no build step, no deps, NOT shi
   api.js      request queue with priorities/pacing (mod cap is about 20 calls/s)
   app.js      the whole console UI (fleet, missions, orders + standing orders incl. flee,
               cargo transfer, Automation tab (programs + mission rules + standing orders per
-              craft), Keys tab (the player's API keys off /keys + background service
+              craft), Inventory tab (server-side filtered item table + the trash manager's
+              rule builder, driven by /inventory/vocabulary so it needs no stat list of its
+              own), Keys tab (the player's API keys off /keys + background service
               enrolment off /services), Alerts tab (push channels + rules, off the bridge),
               economy + station activity log (live feed merged with history), industry)
   map.js      canvas galaxy map, heatmap/travel overlays
@@ -202,6 +215,12 @@ tools/
 - `os.rename` can report success and still lose the file.
 - Engine enums are userdata, so `pairs()` yields nothing. Use `enums.lua`.
 - `getScripts()` / `getSecuredScriptValues()` are keyed by script index, not a 1..n sequence.
+- `Inventory:getItems()` is a flat `index -> {item, amount}` map, 0-based and sparse - the
+  generated docs say `table<type, table<index, item>>` and are wrong. Reading a property an
+  item type does not carry (`price` on a turret, `dps` on an upgrade, `type` on a Material)
+  raises AND logs a traceback per call, so items.lua reads a fixed list per type and never
+  probes. A turret's `title` is a `Format`: `text` is the unfilled template, `evaluate()`
+  the readable line, and `translated` is a function rather than a property.
 - `Simulation.getCommandUIData` raises for idle ships. `sectorspecifics` exposes statics only
   through an instance. `orderchain` exposes only `callable()` functions.
 - Player names are not identities. Use player indices.

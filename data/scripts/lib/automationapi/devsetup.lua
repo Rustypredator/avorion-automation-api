@@ -589,4 +589,64 @@ function DevSetup.bossLab(playerIndex, x, y, step, kind)
     runSectorCode(x, y, true, LAB_CODE, "run", playerIndex, step, kind)
 end
 
+-- #### INVENTORY #### --
+
+-- What the engine actually hands back for a faction's inventory, printed one line per
+-- item. getItems() is keyed by InventoryItemType and then by slot index, neither of which
+-- is a 1..n sequence, so this exists mostly to prove that at a glance.
+--
+--   /run include("automationapi/devsetup").inventory(1)
+--   /run include("automationapi/devsetup").inventory(1, "alliance")
+function DevSetup.inventory(playerIndex, which)
+    local faction = Player(playerIndex)
+    if which == "alliance" then faction = faction.alliance end
+    if not faction then print("devsetup: no such faction") return end
+
+    local inventory = faction:getInventory()
+    print(string.format("devsetup: %d/%d slots occupied", inventory.occupiedSlots,
+                        inventory.maxSlots))
+
+    for index, slot in pairs(inventory:getItems()) do
+        local item = slot.item
+        local dps = ""
+        local ok, value = pcall(function() return item.dps end)
+        if ok and value then dps = string.format(" dps=%.1f", value) end
+
+        print(string.format("devsetup: key=%s(%s) amount=%s type=%s %s rarity=%s(%s) fav=%s trash=%s%s",
+                            tostring(index), type(index), tostring(slot.amount),
+                            tostring(item.itemType),
+                            tostring(item.name), tostring(item.rarity.name),
+                            tostring(item.rarity.type), tostring(item.favorite),
+                            tostring(item.trash), dps))
+    end
+end
+
+-- Fills an inventory with generated turrets and system upgrades, so the item endpoints
+-- have something to list on a fresh character.
+--
+--   /run include("automationapi/devsetup").stock(1, 20)
+function DevSetup.stock(playerIndex, count)
+    local SectorTurretGenerator = include("sectorturretgenerator")
+    local UpgradeGenerator = include("upgradegenerator")
+
+    local player = Player(playerIndex)
+    local inventory = player:getInventory()
+    local x, y = player:getSectorCoordinates()
+
+    local turrets = SectorTurretGenerator()
+    local upgrades = UpgradeGenerator()
+
+    for i = 1, (count or 10) do
+        local rarity = Rarity(math.random(RarityType.Petty, RarityType.Exotic))
+
+        if i % 2 == 0 then
+            inventory:add(InventoryTurret(turrets:generate(x, y, 0, rarity)))
+        else
+            inventory:add(upgrades:generateSectorSystem(x, y, rarity))
+        end
+    end
+
+    print(string.format("devsetup: inventory now holds %d items", inventory.occupiedSlots))
+end
+
 return DevSetup

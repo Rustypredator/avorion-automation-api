@@ -666,10 +666,141 @@ const dynamic = {
     '/ships/Ore%20Hound/missions/trade/preview': tradePreview,
     '/ships/Ore%20Hound/missions/supply/preview': supplyPreview,
     '/ships/Ore%20Hound/route': flownRoute,
-    '/ships/Ore%20Hound/automation': saveStanding
+    '/ships/Ore%20Hound/automation': saveStanding,
+    '/inventory/trash': saveTrashRules,
+    '/inventory/trash/preview': trashPreview,
+    '/inventory/tags': (sent) => ({
+        owner: trashRules.owner, changed: (sent.indices || []).length,
+        results: (sent.indices || []).map((index) => ({ index: index, ok: true,
+                                                        reason: 'written' }))
+    })
 };
 
+
+/* ------------------------------- inventory ------------------------------- */
+
+/* Three turrets and an upgrade, which is enough for the filter bar to narrow, the table
+   to rank and a rule to split. Slot indices are 0-based and sparse, as the engine's are -
+   the tag buttons carry them and getting that wrong tags the wrong item. */
+const invItems = [
+    { index: 0, amount: 2, type: 'turret', name: 'Pea Shooter', title: 'Petty Pea Shooter',
+      rarity: { name: 'Petty', type: -1, value: -1 }, favorite: false, trash: false,
+      category: 'Armed', slotType: 'Armed', dps: 12, hullDps: 12, shieldDps: 12,
+      tech: 3, slots: 1, material: { name: 'Iron', value: 0 } },
+    { index: 3, amount: 1, type: 'turret', name: 'Railgun Turret',
+      rarity: { name: 'Exotic', type: 4, value: 4 }, favorite: false, trash: false,
+      category: 'Armed', slotType: 'Armed', dps: 2100, hullDps: 3150, shieldDps: 420,
+      tech: 48, slots: 2, material: { name: 'Avorion', value: 6 } },
+    { index: 5, amount: 1, type: 'turret', name: 'Mining Turret',
+      rarity: { name: 'Common', type: 0, value: 0 }, favorite: true, trash: false,
+      category: 'Mining', slotType: 'Unarmed', dps: 30, efficiency: 0.3, tech: 6, slots: 1,
+      material: { name: 'Iron', value: 0 } },
+    { index: 9, amount: 1, type: 'upgrade', name: 'Cargo Extension',
+      rarity: { name: 'Rare', type: 2, value: 2 }, favorite: false, trash: false,
+      price: 25000 }
+];
+
+const invVocabulary = {
+    stats: [
+        { stat: 'category', kind: 'choice', ops: ['is', 'isNot', 'oneOf'],
+          values: ['Armed', 'Mining', 'Salvaging', 'Heal', 'None'] },
+        { stat: 'dps', kind: 'number', ops: ['atLeast', 'atMost', 'is', 'isNot'] },
+        { stat: 'damageType', kind: 'choice', ops: ['is', 'isNot', 'oneOf'],
+          values: ['Physical', 'Energy', 'AntiMatter', 'Electric', 'Plasma', 'Fragments', 'None'] },
+        { stat: 'favorite', kind: 'flag', ops: ['is'] },
+        { stat: 'material', kind: 'rank', ops: ['atLeast', 'atMost', 'is', 'isNot', 'oneOf'],
+          values: ['Iron', 'Titanium', 'Naonite', 'Trinium', 'Xanion', 'Ogonite', 'Avorion'] },
+        { stat: 'rarity', kind: 'rank', ops: ['atLeast', 'atMost', 'is', 'isNot', 'oneOf'],
+          values: ['Petty', 'Common', 'Uncommon', 'Rare', 'Exceptional', 'Exotic', 'Legendary'] },
+        { stat: 'slotType', kind: 'choice', ops: ['is', 'isNot', 'oneOf'],
+          values: ['Unspecified', 'Armed', 'Unarmed', 'PointDefense'] },
+        { stat: 'tech', kind: 'number', ops: ['atLeast', 'atMost', 'is', 'isNot'] },
+        { stat: 'type', kind: 'choice', ops: ['is', 'isNot', 'oneOf'],
+          values: ['turret', 'template', 'upgrade', 'item', 'usable'] }
+    ],
+    marks: ['trash', 'favorite', 'keep'],
+    types: ['turret', 'template', 'upgrade', 'item', 'usable'],
+    rarities: ['Petty', 'Common', 'Uncommon', 'Rare', 'Exceptional', 'Exotic', 'Legendary'],
+    materials: ['Iron', 'Titanium', 'Naonite', 'Trinium', 'Xanion', 'Ogonite', 'Avorion'],
+    maxRules: 24, maxConditions: 10
+};
+
+/* The fake endpoint applies the two filters the checks below use, so that what the table
+   shows is what the server was asked for rather than what the page kept from last time. */
+function inventoryListing(query) {
+    let items = invItems.slice();
+
+    const type = query.get('type');
+    const dpsMax = query.get('dpsMax');
+    const category = query.get('category');
+
+    if (type) { items = items.filter((item) => item.type === type); }
+    if (category) { items = items.filter((item) => item.category === category); }
+    if (dpsMax) { items = items.filter((item) => item.dps != null && item.dps <= Number(dpsMax)); }
+
+    if (query.get('sort') === 'dps') {
+        items.sort((a, b) => (b.dps || 0) - (a.dps || 0));
+    }
+
+    return {
+        owner: { kind: 'player', index: 1, name: 'Rusty' },
+        inventory: { occupied: invItems.length, maxSlots: 1000, slots: invItems.length,
+                     described: invItems.length, truncated: false },
+        matched: items.length, page: 1, pageSize: 100, items: items
+    };
+}
+
+let trashRules = {
+    owner: { kind: 'player', index: 1, name: 'Rusty' },
+    enabled: false, restore: false, skipTagged: false, rules: [], revision: 0,
+    interval: 120, now: 3600,
+    sweep: { phase: 'idle', message: 'Nothing has run yet.', passes: 0, nextIn: 0,
+             counts: {}, log: [] }
+};
+
+function saveTrashRules(sent) {
+    trashRules = Object.assign({}, trashRules, {
+        enabled: !!sent.enabled, restore: !!sent.restore, skipTagged: !!sent.skipTagged,
+        rules: sent.rules || [], revision: trashRules.revision + 1
+    });
+    return trashRules;
+}
+
+function trashPreview(sent) {
+    const rules = (sent && sent.rules && sent.rules.length) ? sent.rules : trashRules.rules;
+    const threshold = (((rules[0] || {}).conditions || [])
+        .filter((c) => c.stat === 'dps')[0] || {}).value;
+
+    const hits = invItems.filter((item) => !item.favorite && item.dps != null
+                                           && threshold != null && item.dps <= threshold);
+
+    return {
+        owner: trashRules.owner,
+        inventory: { occupied: invItems.length, maxSlots: 1000 },
+        enabled: !!(sent && sent.enabled),
+        counts: { trash: hits.length, favorite: 0, restore: 0,
+                  unchanged: invItems.length - hits.length },
+        changes: hits.map((item) => ({
+            index: item.index, name: item.name, type: item.type,
+            rarity: item.rarity.name, dps: item.dps, amount: item.amount,
+            was: { favorite: item.favorite, trash: item.trash },
+            becomes: 'trash', rule: (rules[0] || {}).name
+        })),
+        total: hits.length, page: 1, pageSize: 100
+    };
+}
+
 const routes = {
+    '/inventory': (query) => inventoryListing(query),
+    '/inventory/vocabulary': invVocabulary,
+    get '/inventory/stats'() {
+        return { owner: trashRules.owner, slots: invItems.length, items: 5, favorites: 1,
+                 trashed: 0, byType: { turret: 3, upgrade: 1 },
+                 byRarity: { Petty: 1, Common: 1, Rare: 1, Exotic: 1 },
+                 byCategory: { Armed: 2, Mining: 1 },
+                 inventory: { occupied: invItems.length, maxSlots: 1000 } };
+    },
+    get '/inventory/trash'() { return trashRules; },
     get '/notifications'() { return notifySummary(); },
     get '/services'() { return enrolSummary(); },
     get '/keys'() { return keySummary(); },
@@ -2288,6 +2419,124 @@ const ready = window.document.readyState === 'loading'
     await settle(300);
     check(posts.filter((p) => p.path === '/notifications/channels/test').length === 1,
           'a channel can be tested from the page');
+
+
+    console.log('\nthe inventory tab');
+
+    $('.tab[data-view="inventory"]').click();
+    await settle(500);
+
+    const inv = () => $('#inventory-body');
+    const invClick = (node) => node.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    const invChange = (node, value) => {
+        if (value !== undefined) { node.value = value; }
+        node.dispatchEvent(new window.Event('change', { bubbles: true }));
+    };
+
+    check($$('#inventory-body tbody tr').length === 4, 'every slot is listed');
+    check(/4 of .* slots/.test(inv().textContent),
+          'with what the inventory holds against its size');
+
+    /* The filter bar goes to the server rather than being applied here, so what is worth
+       pinning is that the query carries it - a bar that quietly filtered in the browser
+       would be right on four items and wrong on a thousand. */
+    invChange(inv().querySelector('[data-inv-filter="type"]'), 'turret');
+    await settle(600);
+    check($$('#inventory-body tbody tr').length === 3, 'picking an item type narrows the table');
+
+    invChange(inv().querySelector('[data-inv-filter="dpsMax"]'), '100');
+    await settle(600);
+    const narrowed = $$('#inventory-body tbody tr').map((row) => row.textContent);
+    check(narrowed.length === 2 && !/Railgun/.test(narrowed.join(' ')),
+          'and a dps ceiling leaves the railgun out');
+
+    invChange(inv().querySelector('[data-inv-sort]'), 'dps');
+    await settle(600);
+    check(/Mining Turret/.test($$('#inventory-body tbody tr')[0].textContent),
+          'sorting is the server\u2019s too, highest first by default');
+
+    invClick(inv().querySelector('[data-act="inv-clear"]'));
+    await settle(600);
+    check($$('#inventory-body tbody tr').length === 4, 'clearing the filter brings them back');
+
+    // Marking by hand. The slot index is what the write is addressed by.
+    invClick(inv().querySelector('[data-inv-tag-one="3"][data-mark="trash"]'));
+    await settle(300);
+
+    const tagged = posts.filter((p) => p.path === '/inventory/tags').pop();
+    check(tagged && tagged.body.mark === 'trash' && tagged.body.indices[0] === 3,
+          'a row\u2019s trash button marks that slot, by its engine index');
+
+    // And in bulk, which is the reason the checkboxes exist.
+    invChange(inv().querySelector('[data-inv-pick-all]'), undefined);
+    $('[data-inv-pick-all]').checked = true;
+    invChange($('[data-inv-pick-all]'));
+    await settle(100);
+    check(/4 selected/.test(inv().textContent), 'the header checkbox picks the page');
+
+    invClick(inv().querySelector('[data-act="inv-mark"][data-mark="favorite"]'));
+    await settle(300);
+    const bulk = posts.filter((p) => p.path === '/inventory/tags').pop();
+    check(bulk && bulk.body.indices.length === 4 && bulk.body.mark === 'favorite',
+          'and one call marks all of them');
+
+    console.log('\nthe trash manager');
+
+    check(/turned off/.test(inv().textContent), 'the manager starts off, and says so');
+
+    invClick(inv().querySelector('[data-act="trash-edit"]'));
+    await settle(100);
+    invClick(inv().querySelector('[data-act="trash-rule-add"]'));
+    await settle(100);
+
+    const rule = () => $('#inventory-body .editor');
+    check(rule().querySelector('[data-trash-rule="0"][data-trash-field="name"]'),
+          'a new rule opens with a name, a mark and one condition');
+    check(rule().querySelector('[data-trash-rule="0"][data-trash-cond="0"][data-trash-field="stat"]'),
+          'whose stat comes from the vocabulary the server published');
+
+    invChange(rule().querySelector('[data-trash-rule="0"][data-trash-field="name"]'), 'weak guns');
+    invChange(rule().querySelector('[data-trash-rule="0"][data-trash-cond="0"][data-trash-field="value"]'), '50');
+
+    /* A rarity threshold is a dropdown of names rather than a number box: the server
+       takes "Rare", and offering a number here would be offering a 400. */
+    invClick(rule().querySelector('[data-act="trash-cond-add"][data-trash-rule="0"]'));
+    await settle(50);
+    invChange(rule().querySelector('[data-trash-rule="0"][data-trash-cond="1"][data-trash-field="stat"]'), 'rarity');
+    await settle(50);
+
+    const rarityValue = $('#inventory-body [data-trash-rule="0"][data-trash-cond="1"][data-trash-field="value"]');
+    check(rarityValue && rarityValue.tagName === 'SELECT',
+          'changing the stat to rarity turns the value box into a list of rarities');
+    invChange(rarityValue, 'Rare');
+    invChange($('#inventory-body [data-trash-rule="0"][data-trash-cond="1"][data-trash-field="op"]'), 'atMost');
+
+    $('#inventory-body [data-trash-form="enabled"]').checked = true;
+    invChange($('#inventory-body [data-trash-form="enabled"]'));
+
+    invClick($('#inventory-body [data-act="trash-preview-form"]'));
+    await settle(300);
+
+    const previewed = posts.filter((p) => p.path === '/inventory/trash/preview').pop();
+    check(previewed && previewed.body.rules[0].name === 'weak guns',
+          'previewing sends the rules being edited, not the saved ones');
+    check(previewed.body.rules[0].conditions.length === 2
+          && previewed.body.rules[0].conditions[0].value === 50
+          && previewed.body.rules[0].conditions[1].value === 'Rare',
+          'with a number sent as a number and a rarity as its name');
+    check(/would be marked trash/.test(inv().textContent) && /Pea Shooter/.test(inv().textContent),
+          'and the preview says what it would do, by item');
+
+    invClick($('#inventory-body [data-act="trash-save"]'));
+    await settle(300);
+
+    const savedRules = posts.filter((p) => p.path === '/inventory/trash').pop();
+    check(savedRules && savedRules.body.enabled === true && savedRules.body.rules.length === 1,
+          'saving turns it on with the rule');
+    check(savedRules.body.ifRevision === 0,
+          'against the revision it was loaded at, so two people cannot clobber each other');
+    check(/sweeping every 120s/.test(inv().textContent),
+          'and the page says it is running');
 
     console.log('');
     if (failures === 0) {

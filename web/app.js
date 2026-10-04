@@ -75,6 +75,20 @@
     notifications: { data: null, loaded: false, error: null },
     channelForm: null,
     ruleForm: null,
+    /* The faction's inventory, off /inventory, and the trash manager's rules off
+       /inventory/trash. `filter` is the bar above the table and goes to the server as
+       query parameters rather than being applied here - an endgame inventory is a
+       thousand items and the browser is not the thing that should be narrowing it.
+       `vocabulary` is read once and is what the rule builder is made of. */
+    inventory: {
+      data: null, stats: null, vocabulary: null, loaded: false, error: null,
+      owner: 'player', filter: null, sort: '', order: 'desc', page: 1, pageSize: 100
+    },
+    invSelected: {},          // slot index -> true, for the bulk mark buttons
+    trash: { data: null, loaded: false, error: null },
+    trashForm: null,          // the rule editor, while it is open
+    trashPreview: null,       // the last dry run, shown under the rules
+
     /* This player's own API keys, off /keys: the Keys tab names and revokes them.
        `keyEdit` is the rename box open on one, `keyRevoke` the fingerprint of the one
        being asked about before it goes. Making a key is not here - that is /apikey new
@@ -440,6 +454,20 @@
    */
 
   var EXPLAIN = {
+    'inventory':
+      'Your turrets, system upgrades and the rest, read straight out of the game. Works '
+      + 'while you are logged out: the inventory lives on the faction, not on a running '
+      + 'player script. Favourite and trash are the game\'s own two flags - the ones the '
+      + 'scrapyard and the research station read when you tell them to take everything '
+      + 'marked trash.',
+
+    'trash-manager':
+      'Thresholds the server applies by itself. It walks a few items per server tick and '
+      + 'writes at most a few tags per tick, so a thousand-item hoard takes seconds of '
+      + 'wall clock and never blocks the tick - which is the whole difference between '
+      + 'this and marking the lot in one go. Rules are tried in order, first match wins, '
+      + 'and favourites and mission items are never touched whatever they say.',
+
     'fleet-reads':
       'Everything here reads the ship database, so it works while the sector is unloaded '
       + 'and while you are logged out. Writes need the owning player in game.',
@@ -1270,6 +1298,12 @@
         return loadNotifications(false);
       }
     });
+    loop('inventory', EVERY.automations, function () {
+      /* Only while the tab is open, and never under an open rule editor - a redraw would
+         throw away what is being typed. The sweeper's progress line is the reason this
+         polls at all; the item list itself changes only when the player plays. */
+      if (S.view === 'inventory' && !S.trashForm) { return loadInventory(false); }
+    });
     loop('keys', EVERY.mission, function () {
       // Same reasoning as the alerts loop, and the same care around an open editor: a
       // redraw under the rename box would throw away what is being typed, and one under
@@ -1343,6 +1377,11 @@
     if (name === 'keys') {
       renderKeys();
       if (S.connected) { loadKeys(true); }
+    }
+    if (name === 'inventory') {
+      if (!S.inventory.filter) { S.inventory.filter = blankInventoryFilter(); }
+      renderInventory();
+      if (S.connected) { loadInventory(true); }
     }
   }
 
@@ -10547,6 +10586,878 @@
     $('#galaxy-body').innerHTML = '<div class="cards">' + cards.join('') + '</div>';
   }
 
+  /* =============================== INVENTORY ===============================
+
+     Two halves of one job. The top of the tab is a filterable table of everything in the
+     faction's inventory, which is the part a person uses to decide what is junk. The
+     bottom is the trash manager: the same filter vocabulary, saved as rules the server
+     applies by itself, slowly, in the background.
+
+     The filter bar maps one-to-one onto GET /inventory's query parameters rather than
+     filtering in the browser, because an endgame inventory is a thousand items and the
+     browser should not be the thing deciding which of them to show.
+
+     The rule builder is driven by GET /inventory/vocabulary rather than by a list of
+     stats written down here, so a stat added to the mod appears in this UI without the
+     console being changed.                                                            */
+
+  /* Every field the filter bar can set, all empty. Kept as one function because the
+     "clear" button and the first render both want exactly this. */
+  function blankInventoryFilter() {
+    return { type: '', category: '', slotType: '', damageType: '', material: '',
+             rarityMin: '', rarityMax: '', dpsMin: '', dpsMax: '', techMin: '',
+             search: '', tag: '' };
+  }
+
+  function blankTrashRule() {
+    return { name: '', mark: 'trash', enabled: true,
+             conditions: [{ stat: 'dps', op: 'atMost', value: 100 }] };
+  }
+
+  function invVocabulary() {
+    return (S.inventory.vocabulary || { stats: [], rarities: [], types: [] });
+  }
+
+  function invStat(name) {
+    var stats = invVocabulary().stats || [];
+    for (var i = 0; i < stats.length; i++) {
+      if (stats[i].stat === name) { return stats[i]; }
+    }
+    return null;
+  }
+
+  /* The query GET /inventory is asked. Empty fields are left out entirely: the endpoint
+     treats a missing parameter as "no opinion", and sending an empty one is an error. */
+  function invQuery() {
+    var f = S.inventory.filter;
+    var query = { pageSize: String(S.inventory.pageSize), page: String(S.inventory.page) };
+
+    if (S.inventory.owner !== 'player') { query.owner = S.inventory.owner; }
+    if (f.type) { query.type = f.type; }
+    if (f.category) { query.category = f.category; }
+    if (f.slotType) { query.slotType = f.slotType; }
+    if (f.damageType) { query.damageType = f.damageType; }
+    if (f.material) { query.material = f.material; }
+    if (f.rarityMin) { query.rarityMin = f.rarityMin; }
+    if (f.rarityMax) { query.rarityMax = f.rarityMax; }
+    if (f.dpsMin !== '') { query.dpsMin = f.dpsMin; }
+    if (f.dpsMax !== '') { query.dpsMax = f.dpsMax; }
+    if (f.techMin !== '') { query.techMin = f.techMin; }
+    if (f.search) { query.search = f.search; }
+    if (f.tag) { query.tag = f.tag; }
+    if (S.inventory.sort) { query.sort = S.inventory.sort; }
+    if (S.inventory.order) { query.order = S.inventory.order; }
+
+    return query;
+  }
+
+  function loadInventory(userInitiated) {
+    if (!S.connected) { return Promise.resolve(); }
+
+    var priority = userInitiated ? Api.P.USER : Api.P.POLL;
+    var owner = S.inventory.owner;
+    var ownerQuery = owner === 'player' ? null : { owner: owner };
+
+    var waiting = [
+      Api.get('/inventory', invQuery(), { priority: priority, label: 'inventory' })
+        .then(function (body) { S.inventory.data = body; S.inventory.error = null; })
+        .catch(function (error) {
+          if (error.code === 'cancelled') { return; }
+          S.inventory.data = null;
+          S.inventory.error = error;
+        }),
+
+      Api.get('/inventory/stats', ownerQuery, { priority: Api.P.POLL, label: 'inventory stats' })
+        .then(function (body) { S.inventory.stats = body; })
+        .catch(function () { S.inventory.stats = null; }),
+
+      loadTrash(priority)
+    ];
+
+    /* The vocabulary never changes while the server runs, so it is read once and kept.
+       Everything the rule builder offers comes out of it. */
+    if (!S.inventory.vocabulary) {
+      waiting.push(Api.get('/inventory/vocabulary', null,
+                           { priority: Api.P.POLL, label: 'inventory vocabulary' })
+        .then(function (body) { S.inventory.vocabulary = body; })
+        .catch(function () {}));
+    }
+
+    S.inventory.loaded = true;
+
+    return Promise.all(waiting).then(renderInventory);
+  }
+
+  function loadTrash(priority) {
+    var owner = S.inventory.owner;
+
+    return Api.get('/inventory/trash', owner === 'player' ? null : { owner: owner },
+                   { priority: priority || Api.P.POLL, label: 'trash rules' })
+      .then(function (body) {
+        S.trash = { data: body, loaded: true, error: null, receivedAt: Date.now() };
+      })
+      .catch(function (error) {
+        if (error.code === 'cancelled') { return; }
+        S.trash = { data: null, loaded: true, error: error };
+      });
+  }
+
+  function renderInventory() {
+    var host = $('#inventory-body');
+    if (!host) { return; }
+
+    if (!S.connected) {
+      host.innerHTML = '<div class="empty"><p>Connect first.</p></div>';
+      return;
+    }
+
+    host.innerHTML = invHead() + invFilters() + invTable() + trashSection();
+  }
+
+  function invHead() {
+    var stats = S.inventory.stats;
+    var bits = [];
+
+    if (stats && stats.inventory) {
+      bits.push(num(stats.inventory.occupied) + ' of ' + num(stats.inventory.maxSlots) + ' slots');
+      bits.push(num(stats.items) + ' items');
+      if (stats.favorites) { bits.push(num(stats.favorites) + ' favourited'); }
+      if (stats.trashed) { bits.push(num(stats.trashed) + ' marked trash'); }
+    }
+
+    return '<div class="section"><h2>Inventory ' + explain('inventory') + '</h2>'
+      + '<div class="row">'
+      + '<div class="seg" id="inv-owner" data-value="' + esc(S.inventory.owner) + '">'
+      + '<button data-v="player"' + (S.inventory.owner === 'player' ? ' class="on"' : '') + '>Mine</button>'
+      + '<button data-v="alliance"' + (S.inventory.owner === 'alliance' ? ' class="on"' : '') + '>Alliance</button>'
+      + '</div>'
+      + '<span class="mute2">' + bits.join(' · ') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-act="inv-refresh">refresh</button>'
+      + '</div></div>';
+  }
+
+  function invSelect(field, label, values, current, blank) {
+    var options = ['<option value="">' + esc(blank || 'any') + '</option>'];
+
+    values.forEach(function (value) {
+      options.push('<option value="' + esc(value) + '"'
+        + (current === value ? ' selected' : '') + '>' + esc(value) + '</option>');
+    });
+
+    return '<label class="field"><span>' + esc(label) + '</span>'
+      + '<select data-inv-filter="' + esc(field) + '" style="width:auto">'
+      + options.join('') + '</select></label>';
+  }
+
+  function invNumber(field, label, current, width) {
+    return '<label class="field"><span>' + esc(label) + '</span>'
+      + '<input type="number" data-inv-filter="' + esc(field) + '" value="' + esc(current)
+      + '" style="width:' + (width || 80) + 'px"></label>';
+  }
+
+  function invFilters() {
+    var f = S.inventory.filter;
+    var vocab = invVocabulary();
+    var rarities = vocab.rarities || [];
+    var materials = vocab.materials || [];
+    var categories = (invStat('category') || {}).values || [];
+    var slotTypes = (invStat('slotType') || {}).values || [];
+    var damageTypes = (invStat('damageType') || {}).values || [];
+
+    /* Sorting is offered over every numeric stat the server knows, which is why this is
+       built from the vocabulary rather than from a list of columns. */
+    var sortable = (vocab.stats || []).filter(function (stat) {
+      return stat.kind === 'number' || stat.kind === 'rank';
+    }).map(function (stat) { return stat.stat; });
+
+    return '<div class="section"><h2>Filter</h2>'
+      + '<div class="row">'
+      + invSelect('type', 'Item', vocab.types || [], f.type)
+      + invSelect('category', 'Weapon', categories, f.category)
+      + invSelect('slotType', 'Slot', slotTypes, f.slotType)
+      + invSelect('damageType', 'Damage', damageTypes, f.damageType)
+      + '</div>'
+      + '<div class="row" style="margin-top:6px">'
+      + invSelect('rarityMin', 'Rarity from', rarities, f.rarityMin)
+      + invSelect('rarityMax', 'to', rarities, f.rarityMax)
+      + invSelect('material', 'Material from', materials, f.material)
+      + invNumber('dpsMin', 'DPS from', f.dpsMin)
+      + invNumber('dpsMax', 'to', f.dpsMax)
+      + invNumber('techMin', 'Tech from', f.techMin)
+      + '</div>'
+      + '<div class="row" style="margin-top:6px">'
+      + '<label class="field" style="flex:1"><span>Name</span>'
+      + '<input type="search" data-inv-filter="search" value="' + esc(f.search)
+      + '" placeholder="chaingun, railgun, cargo…"></label>'
+      + '<div class="seg" data-inv-tag>'
+      + ['', 'favorite', 'trash', 'untagged'].map(function (tag) {
+          return '<button data-v="' + esc(tag) + '"' + (f.tag === tag ? ' class="on"' : '')
+            + '>' + esc(tag === '' ? 'all' : tag) + '</button>';
+        }).join('')
+      + '</div>'
+      + '<label class="field"><span>Sort</span><select data-inv-sort style="width:auto">'
+      + '<option value="">slot</option>'
+      + sortable.map(function (name) {
+          return '<option value="' + esc(name) + '"'
+            + (S.inventory.sort === name ? ' selected' : '') + '>' + esc(name) + '</option>';
+        }).join('')
+      + '</select></label>'
+      + '<div class="seg" data-inv-order>'
+      + '<button data-v="desc"' + (S.inventory.order === 'desc' ? ' class="on"' : '') + '>high first</button>'
+      + '<button data-v="asc"' + (S.inventory.order === 'asc' ? ' class="on"' : '') + '>low first</button>'
+      + '</div>'
+      + '<button class="ghost small" data-act="inv-clear">clear</button>'
+      + '</div></div>';
+  }
+
+  /* The headline stat differs by what the thing is: a gun is judged on dps, a mining
+     laser on how much ore it recovers, an upgrade on what it costs. One column, filled
+     with whichever of those the row actually has. */
+  function invHeadline(item) {
+    if (item.category === 'Mining' || item.category === 'Salvaging') {
+      return item.efficiency == null ? '—' : pct(item.efficiency) + ' eff';
+    }
+    if (item.dps != null) { return num(item.dps, 0) + ' dps'; }
+    if (item.price != null) { return num(item.price) + ' cr'; }
+    return '—';
+  }
+
+  function invTagBadge(item) {
+    if (item.favorite) { return '<span class="badge good">favourite</span>'; }
+    if (item.trash) { return '<span class="badge warn">trash</span>'; }
+    return '';
+  }
+
+  function invTable() {
+    var state = S.inventory;
+
+    if (state.error) {
+      return '<div class="section">'
+        + errorBox('Could not read the inventory', state.error)
+        + (state.error.status === 404
+          ? '<div class="note">This server runs a version of the mod without '
+            + '<code>/inventory</code>.</div>' : '')
+        + '</div>';
+    }
+
+    if (!state.loaded || !state.data) {
+      return '<div class="section"><p class="muted">loading…</p></div>';
+    }
+
+    var data = state.data;
+    var items = data.items || [];
+    var selected = Object.keys(S.invSelected).length;
+
+    var rows = items.map(function (item) {
+      var checked = S.invSelected[item.index] ? ' checked' : '';
+
+      return '<tr' + (item.trash ? ' class="dim"' : '') + '>'
+        + '<td><input type="checkbox" data-inv-pick="' + esc(item.index) + '"' + checked + '></td>'
+        + '<td><b>' + esc(item.name || '?') + '</b>'
+        + (item.amount > 1 ? ' <span class="mute2">×' + esc(item.amount) + '</span>' : '')
+        + (item.title && item.title !== item.name
+          ? '<div class="mute2">' + esc(item.title) + '</div>' : '')
+        + '</td>'
+        + '<td>' + esc(item.type) + '</td>'
+        + '<td>' + esc((item.rarity || {}).name || '—') + '</td>'
+        + '<td>' + esc(item.category || item.slotType || '—') + '</td>'
+        + '<td class="num">' + invHeadline(item) + '</td>'
+        + '<td class="num">' + (item.hullDps == null ? '—' : num(item.hullDps, 0)) + '</td>'
+        + '<td class="num">' + (item.shieldDps == null ? '—' : num(item.shieldDps, 0)) + '</td>'
+        + '<td class="num">' + (item.tech == null ? '—' : num(item.tech)) + '</td>'
+        + '<td>' + esc((item.material || {}).name || '—') + '</td>'
+        + '<td class="num">' + (item.slots == null ? '—' : num(item.slots, 1)) + '</td>'
+        + '<td>' + invTagBadge(item) + '</td>'
+        + '<td class="num">'
+        + '<button class="ghost small" data-inv-tag-one="' + esc(item.index) + '" data-mark="favorite"'
+        + ' title="favourite - the trash manager never touches a favourite">★</button>'
+        + '<button class="ghost small" data-inv-tag-one="' + esc(item.index) + '" data-mark="trash"'
+        + ' title="mark as trash">🗑</button>'
+        + '<button class="ghost small" data-inv-tag-one="' + esc(item.index) + '" data-mark="none"'
+        + ' title="clear both marks">∅</button>'
+        + '</td></tr>';
+    }).join('');
+
+    var pages = Math.max(1, Math.ceil((data.matched || 0) / (data.pageSize || 1)));
+
+    return '<div class="section">'
+      + '<h2>' + num(data.matched) + ' matching '
+      + (data.matched === 1 ? 'item' : 'items') + '</h2>'
+      + (selected
+        ? '<div class="row" style="margin-bottom:6px">'
+          + '<span class="mute2">' + num(selected) + ' selected</span>'
+          + '<button class="ghost small" data-act="inv-mark" data-mark="trash">mark trash</button>'
+          + '<button class="ghost small" data-act="inv-mark" data-mark="favorite">favourite</button>'
+          + '<button class="ghost small" data-act="inv-mark" data-mark="none">clear marks</button>'
+          + '<button class="ghost small" data-act="inv-unpick">deselect</button>'
+          + '</div>'
+        : '')
+      + (items.length
+        ? '<div class="scroll-x"><table><thead><tr>'
+          + '<th><input type="checkbox" data-inv-pick-all></th>'
+          + '<th>Name</th><th>Kind</th><th>Rarity</th><th>Class</th><th class="num">Rating</th>'
+          + '<th class="num">vs hull</th><th class="num">vs shield</th><th class="num">Tech</th>'
+          + '<th>Material</th><th class="num">Slots</th><th>Tag</th><th></th>'
+          + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+        : '<p class="muted">Nothing here matches that filter.</p>')
+      + (pages > 1
+        ? '<div class="row" style="margin-top:8px">'
+          + '<button class="ghost small" data-act="inv-page" data-page="' + (data.page - 1) + '"'
+          + (data.page <= 1 ? ' disabled' : '') + '>previous</button>'
+          + '<span class="mute2">page ' + num(data.page) + ' of ' + num(pages) + '</span>'
+          + '<button class="ghost small" data-act="inv-page" data-page="' + (data.page + 1) + '"'
+          + (data.page >= pages ? ' disabled' : '') + '>next</button>'
+          + '</div>'
+        : '')
+      + '</div>';
+  }
+
+  /* ---------------------------- the trash manager ---------------------------- */
+
+  /* The sweeper's log is stamped with the server's unpausedRuntime, which means nothing
+     on its own. The trash endpoint reports what that clock reads now, so the two make an
+     age; the drift since the response arrived is added back in. */
+  function trashAgo(at) {
+    var data = S.trash.data || {};
+    if (typeof at !== 'number' || typeof data.now !== 'number') { return ''; }
+
+    return duration(Math.max(0, data.now - at + (Date.now() - (S.trash.receivedAt || 0)) / 1000))
+      + ' ago';
+  }
+
+  function trashSection() {
+    var state = S.trash;
+
+    if (state.error) {
+      return '<div class="section"><h2>Trash manager</h2>'
+        + errorBox('Could not read the trash rules', state.error) + '</div>';
+    }
+
+    if (!state.loaded || !state.data) {
+      return '<div class="section"><h2>Trash manager</h2><p class="muted">loading…</p></div>';
+    }
+
+    var data = state.data;
+    var form = S.trashForm;
+
+    return '<div class="section"><h2>Trash manager ' + explain('trash-manager') + '</h2>'
+      + '<p class="mute2">Rules the server applies to this inventory by itself. It works '
+      + 'through a few items per tick in the background, so marking a full hoard takes '
+      + 'seconds of wall clock and no noticeable share of any one of them. Favourites and '
+      + 'mission items are never touched.</p>'
+      + (form ? trashEditor(form) : trashSummary(data))
+      + trashSweep(data)
+      + (S.trashPreview ? trashPreviewBox(S.trashPreview) : '');
+  }
+
+  function trashSummary(data) {
+    var rules = (data.rules || []).map(function (rule, position) {
+      return '<div class="order-row">'
+        + '<span class="idx">' + (position + 1) + '</span>'
+        + '<span class="badge ' + (rule.mark === 'trash' ? 'warn'
+          : rule.mark === 'favorite' ? 'good' : 'info') + '">' + esc(rule.mark) + '</span>'
+        + '<b>' + esc(rule.name) + '</b>'
+        + '<span class="mute2">' + esc(conditionsText(rule.conditions)) + '</span>'
+        + (rule.enabled === false ? '<span class="badge">off</span>' : '')
+        + '</div>';
+    }).join('');
+
+    return '<div class="row">'
+      + '<label class="check"><input type="checkbox" data-trash="enabled"'
+      + (data.enabled ? ' checked' : '') + '><span>run it</span></label>'
+      + '<span class="mute2">' + (data.enabled
+        ? 'sweeping every ' + esc(String(data.interval)) + 's'
+        : 'turned off - nothing is marked') + '</span>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-act="trash-edit">edit rules</button>'
+      + '<button class="ghost small" data-act="trash-preview">preview</button>'
+      + '<button class="ghost small" data-act="trash-run"'
+      + (data.enabled ? '' : ' disabled') + '>sweep now</button>'
+      + '</div>'
+      + (rules ? '<div style="margin-top:8px">' + rules + '</div>'
+               : '<p class="muted" style="margin-top:8px">No rules yet. '
+                 + 'Nothing will be marked until there are.</p>');
+  }
+
+  /* "dps at most 400 and rarity at most Rare" - the rule as a sentence, for the list. */
+  function conditionsText(conditions) {
+    if (!conditions || !conditions.length) { return 'everything'; }
+
+    return conditions.map(function (c) {
+      var value = Array.isArray(c.value) ? c.value.join(' or ') : String(c.value);
+      var op = c.op === 'atMost' ? '≤' : c.op === 'atLeast' ? '≥'
+        : c.op === 'isNot' ? 'is not' : c.op === 'oneOf' ? 'is one of' : c.op;
+      return c.stat + ' ' + op + ' ' + value;
+    }).join(' and ');
+  }
+
+  function trashConditionRow(rulePosition, position, condition) {
+    var vocab = invVocabulary();
+    var stat = invStat(condition.stat) || { kind: 'number', ops: ['atMost'] };
+
+    var path = 'data-trash-rule="' + rulePosition + '" data-trash-cond="' + position + '"';
+
+    var stats = (vocab.stats || []).map(function (entry) {
+      return '<option value="' + esc(entry.stat) + '"'
+        + (entry.stat === condition.stat ? ' selected' : '') + '>' + esc(entry.stat) + '</option>';
+    }).join('');
+
+    var ops = (stat.ops || []).map(function (op) {
+      return '<option value="' + esc(op) + '"'
+        + (op === condition.op ? ' selected' : '') + '>' + esc(op) + '</option>';
+    }).join('');
+
+    /* An enum stat gets the list the server would accept; a number gets a number box; a
+       flag gets true/false. Offering anything else is offering a 400. */
+    var value;
+    if (stat.kind === 'flag') {
+      value = '<select ' + path + ' data-trash-field="value">'
+        + '<option value="true"' + (condition.value === true ? ' selected' : '') + '>true</option>'
+        + '<option value="false"' + (condition.value === false ? ' selected' : '') + '>false</option>'
+        + '</select>';
+    } else if (stat.values) {
+      value = '<select ' + path + ' data-trash-field="value">'
+        + stat.values.map(function (name) {
+            return '<option value="' + esc(name) + '"'
+              + (condition.value === name ? ' selected' : '') + '>' + esc(name) + '</option>';
+          }).join('')
+        + '</select>';
+    } else if (stat.kind === 'text') {
+      value = '<input type="text" ' + path + ' data-trash-field="value" value="'
+        + esc(condition.value == null ? '' : condition.value) + '">';
+    } else {
+      value = '<input type="number" step="any" ' + path + ' data-trash-field="value" value="'
+        + esc(condition.value == null ? '' : condition.value) + '" style="width:110px">';
+    }
+
+    return '<div class="row tight" style="margin-top:4px">'
+      + '<select ' + path + ' data-trash-field="stat" style="width:auto">' + stats + '</select>'
+      + '<select ' + path + ' data-trash-field="op" style="width:auto">' + ops + '</select>'
+      + value
+      + '<button class="ghost small" data-act="trash-cond-del" data-trash-rule="' + rulePosition
+      + '" data-trash-cond="' + position + '">remove</button>'
+      + '</div>';
+  }
+
+  function trashRuleEditor(rule, position) {
+    var conditions = (rule.conditions || []).map(function (condition, index) {
+      return trashConditionRow(position, index, condition);
+    }).join('');
+
+    return '<div class="editor" style="margin-bottom:8px">'
+      + '<div class="row">'
+      + '<span class="idx">' + (position + 1) + '</span>'
+      + '<label class="field"><span>Name</span>'
+      + '<input type="text" data-trash-rule="' + position + '" data-trash-field="name"'
+      + ' value="' + esc(rule.name) + '" placeholder="weak guns"></label>'
+      + '<label class="field"><span>Then</span>'
+      + '<select data-trash-rule="' + position + '" data-trash-field="mark" style="width:auto">'
+      + ['trash', 'favorite', 'keep'].map(function (mark) {
+          return '<option value="' + esc(mark) + '"'
+            + (rule.mark === mark ? ' selected' : '') + '>' + esc(mark) + '</option>';
+        }).join('')
+      + '</select></label>'
+      + '<label class="check"><input type="checkbox" data-trash-rule="' + position + '"'
+      + ' data-trash-field="enabled"' + (rule.enabled !== false ? ' checked' : '')
+      + '><span>on</span></label>'
+      + '<span class="spacer"></span>'
+      + '<button class="ghost small" data-act="trash-rule-up" data-trash-rule="' + position + '"'
+      + (position === 0 ? ' disabled' : '') + '>↑</button>'
+      + '<button class="ghost small" data-act="trash-rule-del" data-trash-rule="' + position
+      + '">remove</button>'
+      + '</div>'
+      + conditions
+      + '<div class="row" style="margin-top:6px">'
+      + '<button class="ghost small" data-act="trash-cond-add" data-trash-rule="' + position
+      + '">add a condition</button>'
+      + '<span class="mute2">every condition has to hold</span>'
+      + '</div></div>';
+  }
+
+  function trashEditor(form) {
+    return '<div class="editor">'
+      + '<p class="mute2">Rules are tried in order and the first that matches decides, so '
+      + 'a <b>keep</b> rule above a <b>trash</b> rule is how an exception is written. '
+      + 'A trash rule with no conditions is refused — it would mark the lot.</p>'
+      + (form.rules || []).map(trashRuleEditor).join('')
+      + '<div class="row" style="margin-top:6px">'
+      + '<button class="ghost small" data-act="trash-rule-add">add a rule</button>'
+      + '</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<label class="check"><input type="checkbox" data-trash-form="enabled"'
+      + (form.enabled ? ' checked' : '') + '><span>run it</span></label>'
+      + '<label class="check" title="Take marks back off items that no longer match any rule. '
+      + 'Off by default: something marked by hand stays marked."><input type="checkbox"'
+      + ' data-trash-form="restore"' + (form.restore ? ' checked' : '')
+      + '><span>unmark what no longer matches</span></label>'
+      + '<label class="check" title="Only decide about items nobody has tagged yet.">'
+      + '<input type="checkbox" data-trash-form="skipTagged"'
+      + (form.skipTagged ? ' checked' : '') + '><span>leave anything already tagged alone</span></label>'
+      + '</div>'
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="primary small" data-act="trash-save">save</button>'
+      + '<button class="ghost small" data-act="trash-preview-form">preview these</button>'
+      + '<button class="ghost small" data-act="trash-cancel">cancel</button>'
+      + '</div></div>';
+  }
+
+  function trashSweep(data) {
+    var sweep = data.sweep || {};
+    var last = sweep.lastPass;
+
+    var line = sweep.phase === 'running' && sweep.progress
+      ? 'sweeping: ' + num(sweep.progress.done) + ' of ' + num(sweep.progress.total) + ' items'
+      : (sweep.message || 'nothing has run yet');
+
+    return '<div class="row" style="margin-top:10px">'
+      + '<span class="badge ' + (sweep.phase === 'running' ? 'busy' : 'info') + '">'
+      + esc(sweep.phase || 'idle') + '</span>'
+      + '<span class="mute2">' + esc(line) + '</span>'
+      + (sweep.phase !== 'running' && data.enabled && sweep.nextIn != null
+        ? '<span class="mute2">next in ' + num(Math.round(sweep.nextIn)) + 's</span>' : '')
+      + (last
+        ? '<span class="mute2">last pass: ' + num(last.scanned) + ' looked at, '
+          + num(last.marked) + ' marked'
+          + (last.restored ? ', ' + num(last.restored) + ' unmarked' : '')
+          + (last.failed ? ', ' + num(last.failed) + ' failed' : '')
+          + '</span>'
+        : '')
+      + '</div>'
+      + ((sweep.log || []).length
+        ? '<details class="card auto-log" style="margin-top:8px"><summary>What it marked '
+          + '<span class="mute2">' + sweep.log.length + '</span></summary>'
+          + sweep.log.slice().reverse().map(function (entry) {
+              return '<div class="log-line">'
+                + '<span class="t">' + esc(trashAgo(entry.at)) + '</span>'
+                + '<span class="m">' + esc(entry.message)
+                + (entry.detail ? ' <span class="dim">· ' + esc(entry.detail) + '</span>' : '')
+                + '</span></div>';
+            }).join('')
+          + '</details>'
+        : '');
+  }
+
+  function trashPreviewBox(preview) {
+    var rows = (preview.changes || []).map(function (change) {
+      return '<tr><td><b>' + esc(change.name || '?') + '</b>'
+        + (change.amount > 1 ? ' <span class="mute2">×' + esc(change.amount) + '</span>' : '')
+        + '</td>'
+        + '<td>' + esc(change.type) + '</td>'
+        + '<td>' + esc(change.rarity || '—') + '</td>'
+        + '<td class="num">' + (change.dps == null ? '—' : num(change.dps, 0)) + '</td>'
+        + '<td><span class="badge ' + (change.becomes === 'trash' ? 'warn'
+          : change.becomes === 'favorite' ? 'good' : 'info') + '">'
+        + esc(change.becomes) + '</span></td>'
+        + '<td class="mute2">' + esc(change.rule || '') + '</td></tr>';
+    }).join('');
+
+    return '<div class="section" style="margin-top:12px"><h2>Preview</h2>'
+      + '<p class="mute2">Nothing below has been changed. '
+      + num(preview.counts.trash) + ' would be marked trash, '
+      + num(preview.counts.favorite) + ' favourited, '
+      + num(preview.counts.restore) + ' unmarked, '
+      + num(preview.counts.unchanged) + ' left alone.</p>'
+      + (rows
+        ? '<div class="scroll-x"><table><thead><tr><th>Name</th><th>Kind</th><th>Rarity</th>'
+          + '<th class="num">DPS</th><th>Becomes</th><th>Rule</th></tr></thead>'
+          + '<tbody>' + rows + '</tbody></table></div>'
+          + (preview.total > preview.changes.length
+            ? '<p class="mute2">and ' + num(preview.total - preview.changes.length) + ' more</p>'
+            : '')
+        : '<p class="muted">These rules would change nothing.</p>')
+      + '<div class="row" style="margin-top:8px">'
+      + '<button class="ghost small" data-act="trash-preview-close">close</button></div>'
+      + '</div>';
+  }
+
+  /* ------------------------------- actions ------------------------------- */
+
+  function invOwnerQuery() {
+    return S.inventory.owner === 'player' ? null : { owner: S.inventory.owner };
+  }
+
+  function markItems(indices, mark) {
+    if (!indices.length) { return; }
+
+    Api.post('/inventory/tags', { indices: indices, mark: mark }, invOwnerQuery(),
+             { priority: Api.P.USER, label: 'tag items' })
+      .then(function (body) {
+        var failed = (body.results || []).filter(function (r) { return !r.ok; }).length;
+
+        if (failed) {
+          toast('warn', 'Marked ' + body.changed,
+                failed + ' could not be: they moved or were sold since this list was read.');
+        } else {
+          toast('good', mark === 'none' ? 'Marks cleared' : 'Marked as ' + mark,
+                body.changed + ' item' + (body.changed === 1 ? '' : 's'));
+        }
+
+        S.invSelected = {};
+        loadInventory(true);
+      })
+      .catch(function (error) {
+        toast('bad', 'Could not change those marks', error.message);
+      });
+  }
+
+  function trashFormFrom(data) {
+    return {
+      enabled: !!data.enabled,
+      restore: !!data.restore,
+      skipTagged: !!data.skipTagged,
+      revision: data.revision || 0,
+      rules: JSON.parse(JSON.stringify(data.rules || []))
+    };
+  }
+
+  function trashPayload(form) {
+    return {
+      enabled: !!form.enabled,
+      restore: !!form.restore,
+      skipTagged: !!form.skipTagged,
+      rules: (form.rules || []).map(function (rule) {
+        return {
+          name: rule.name,
+          mark: rule.mark,
+          enabled: rule.enabled !== false,
+          conditions: (rule.conditions || []).map(function (c) {
+            return { stat: c.stat, op: c.op, value: c.value };
+          })
+        };
+      })
+    };
+  }
+
+  function saveTrash() {
+    var form = S.trashForm;
+    if (!form) { return; }
+
+    var payload = trashPayload(form);
+    payload.ifRevision = form.revision;
+
+    Api.post('/inventory/trash', payload, invOwnerQuery(),
+             { priority: Api.P.USER, label: 'save trash rules' })
+      .then(function (body) {
+        S.trash = { data: body, loaded: true, error: null, receivedAt: Date.now() };
+        S.trashForm = null;
+        toast('good', 'Rules saved', body.enabled ? 'The sweeper will pick them up now.'
+                                                  : 'The sweeper is turned off.');
+        renderInventory();
+      })
+      .catch(function (error) {
+        toast('bad', 'Could not save those rules', error.message);
+      });
+  }
+
+  function previewTrash(fromForm) {
+    var payload = fromForm && S.trashForm ? trashPayload(S.trashForm) : {};
+
+    Api.post('/inventory/trash/preview', payload, invOwnerQuery(),
+             { priority: Api.P.USER, label: 'preview trash' })
+      .then(function (body) {
+        S.trashPreview = body;
+        renderInventory();
+      })
+      .catch(function (error) {
+        toast('bad', 'Could not work out what those rules would do', error.message);
+      });
+  }
+
+  function invClick(button) {
+    var act = button.dataset.act;
+
+    if (act === 'inv-refresh') { loadInventory(true); return true; }
+
+    if (act === 'inv-clear') {
+      S.inventory.filter = blankInventoryFilter();
+      S.inventory.page = 1;
+      loadInventory(true);
+      return true;
+    }
+
+    if (act === 'inv-page') {
+      S.inventory.page = Math.max(1, Number(button.dataset.page) || 1);
+      loadInventory(true);
+      return true;
+    }
+
+    if (act === 'inv-unpick') { S.invSelected = {}; renderInventory(); return true; }
+
+    if (act === 'inv-mark') {
+      markItems(Object.keys(S.invSelected).map(Number), button.dataset.mark);
+      return true;
+    }
+
+    if (button.dataset.invTagOne !== undefined) {
+      markItems([Number(button.dataset.invTagOne)], button.dataset.mark);
+      return true;
+    }
+
+    if (act === 'trash-edit') {
+      S.trashForm = trashFormFrom(S.trash.data || {});
+      renderInventory();
+      return true;
+    }
+
+    if (act === 'trash-cancel') { S.trashForm = null; renderInventory(); return true; }
+    if (act === 'trash-save') { saveTrash(); return true; }
+    if (act === 'trash-preview') { previewTrash(false); return true; }
+    if (act === 'trash-preview-form') { previewTrash(true); return true; }
+    if (act === 'trash-preview-close') { S.trashPreview = null; renderInventory(); return true; }
+
+    if (act === 'trash-run') {
+      Api.post('/inventory/trash/run', {}, invOwnerQuery(),
+               { priority: Api.P.USER, label: 'sweep now' })
+        .then(function () {
+          toast('good', 'Sweeping', 'It works through a few items per tick; watch the line below.');
+          loadTrash(Api.P.USER).then(renderInventory);
+        })
+        .catch(function (error) { toast('bad', 'Could not start a sweep', error.message); });
+      return true;
+    }
+
+    if (act === 'trash-rule-add') {
+      S.trashForm = S.trashForm || trashFormFrom(S.trash.data || {});
+      S.trashForm.rules.push(blankTrashRule());
+      renderInventory();
+      return true;
+    }
+
+    var rulePosition = Number(button.dataset.trashRule);
+
+    if (act === 'trash-rule-del' && S.trashForm) {
+      S.trashForm.rules.splice(rulePosition, 1);
+      renderInventory();
+      return true;
+    }
+
+    if (act === 'trash-rule-up' && S.trashForm && rulePosition > 0) {
+      var moved = S.trashForm.rules.splice(rulePosition, 1)[0];
+      S.trashForm.rules.splice(rulePosition - 1, 0, moved);
+      renderInventory();
+      return true;
+    }
+
+    if (act === 'trash-cond-add' && S.trashForm) {
+      S.trashForm.rules[rulePosition].conditions.push({ stat: 'dps', op: 'atMost', value: 100 });
+      renderInventory();
+      return true;
+    }
+
+    if (act === 'trash-cond-del' && S.trashForm) {
+      S.trashForm.rules[rulePosition].conditions.splice(Number(button.dataset.trashCond), 1);
+      renderInventory();
+      return true;
+    }
+
+    return false;
+  }
+
+  /* The value box's type depends on the stat, so changing the stat rebuilds the row - and
+     carries a value that is still legal across, rather than leaving a number sitting in a
+     field the server would reject. */
+  function defaultConditionValue(statName) {
+    var stat = invStat(statName) || {};
+
+    if (stat.kind === 'flag') { return true; }
+    if (stat.values && stat.values.length) {
+      return stat.kind === 'rank' ? stat.values[Math.floor(stat.values.length / 2)]
+                                  : stat.values[0];
+    }
+    if (stat.kind === 'text') { return ''; }
+
+    return 0;
+  }
+
+  function invChange(target) {
+    if (target.dataset.invFilter !== undefined) {
+      // the search box has its own debounced input handler; a change on blur would
+      // only re-ask the same question
+      if (target.dataset.invFilter === 'search') { return true; }
+
+      S.inventory.filter[target.dataset.invFilter] = target.value;
+      S.inventory.page = 1;
+      loadInventory(true);
+      return true;
+    }
+
+    if (target.dataset.invSort !== undefined) {
+      S.inventory.sort = target.value;
+      loadInventory(true);
+      return true;
+    }
+
+    if (target.dataset.invPick !== undefined) {
+      var index = Number(target.dataset.invPick);
+      if (target.checked) { S.invSelected[index] = true; } else { delete S.invSelected[index]; }
+      renderInventory();
+      return true;
+    }
+
+    if (target.dataset.invPickAll !== undefined) {
+      S.invSelected = {};
+      if (target.checked) {
+        ((S.inventory.data || {}).items || []).forEach(function (item) {
+          S.invSelected[item.index] = true;
+        });
+      }
+      renderInventory();
+      return true;
+    }
+
+    /* The "run it" switch outside the editor saves on its own: it is the one setting
+       somebody reaches for without wanting to think about rules at all. */
+    if (target.dataset.trash === 'enabled') {
+      var current = trashFormFrom(S.trash.data || {});
+      current.enabled = target.checked;
+      S.trashForm = current;
+      saveTrash();
+      return true;
+    }
+
+    if (target.dataset.trashForm !== undefined && S.trashForm) {
+      S.trashForm[target.dataset.trashForm] = target.checked;
+      return true;
+    }
+
+    if (target.dataset.trashRule !== undefined && S.trashForm) {
+      var rule = S.trashForm.rules[Number(target.dataset.trashRule)];
+      if (!rule) { return true; }
+
+      var field = target.dataset.trashField;
+
+      if (target.dataset.trashCond !== undefined) {
+        var condition = rule.conditions[Number(target.dataset.trashCond)];
+        if (!condition) { return true; }
+
+        if (field === 'stat') {
+          condition.stat = target.value;
+          var stat = invStat(target.value) || {};
+          if ((stat.ops || []).indexOf(condition.op) < 0) { condition.op = (stat.ops || ['is'])[0]; }
+          condition.value = defaultConditionValue(target.value);
+          renderInventory();
+        } else if (field === 'op') {
+          condition.op = target.value;
+        } else {
+          var kind = (invStat(condition.stat) || {}).kind;
+          condition.value = kind === 'flag' ? target.value === 'true'
+            : kind === 'number' ? Number(target.value)
+            : target.value;
+        }
+
+        return true;
+      }
+
+      if (field === 'enabled') { rule.enabled = target.checked; }
+      else { rule[field] = target.value; }
+
+      return true;
+    }
+
+    return false;
+  }
+
   /* ================================== KEYS =================================
    *
    * A player's own credentials, in two halves that only mean anything together: the API
@@ -11654,6 +12565,49 @@
     });
 
     $('#keys-body').addEventListener('change', function (e) { keysChange(e.target); });
+
+    $('#inventory-body').addEventListener('click', function (e) {
+      var seg = e.target.closest('[data-inv-tag] button, [data-inv-order] button');
+      if (seg) {
+        if (seg.parentNode.hasAttribute('data-inv-tag')) {
+          S.inventory.filter.tag = seg.dataset.v;
+          S.inventory.page = 1;
+        } else {
+          S.inventory.order = seg.dataset.v;
+        }
+        loadInventory(true);
+        return;
+      }
+
+      var owner = e.target.closest('#inv-owner button');
+      if (owner) {
+        S.inventory.owner = owner.dataset.v;
+        S.invSelected = {};
+        S.trashForm = null;
+        S.trashPreview = null;
+        S.inventory.page = 1;
+        loadInventory(true);
+        return;
+      }
+
+      var button = e.target.closest('button');
+      if (button) { invClick(button); }
+    });
+
+    $('#inventory-body').addEventListener('change', function (e) { invChange(e.target); });
+
+    /* Typing a name should not fire a request per keystroke; everything else on the bar
+       is a select and goes straight through. */
+    var invSearchDebounce = null;
+    $('#inventory-body').addEventListener('input', function (e) {
+      if (e.target.dataset.invFilter !== 'search') { return; }
+
+      S.inventory.filter.search = e.target.value.trim();
+      S.inventory.page = 1;
+
+      clearTimeout(invSearchDebounce);
+      invSearchDebounce = setTimeout(function () { loadInventory(true); }, 300);
+    });
 
     $('#industry-refresh').addEventListener('click', function () { loadIndustry(true); });
 

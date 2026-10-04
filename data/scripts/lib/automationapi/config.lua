@@ -6,7 +6,7 @@
 
 local Config = {}
 
-Config.version = "0.7.1"
+Config.version = "0.8.0"
 
 -- API surface version. Bump the major when a response shape changes incompatibly;
 -- external clients should check this on /ping and refuse to run against a surprise.
@@ -134,6 +134,41 @@ Config.missionAutomationIndexValue = "automationapi_missionauto_factions"
 -- Server value key prefix of the mission library, one document per owning faction: named
 -- rules that programs' mission steps fly.
 Config.missionLibraryValuePrefix = "automationapi_missionlib_"
+
+-- #### INVENTORY AND THE TRASH MANAGER #### --
+
+-- The inventory listing is read whole on every request: getItems() hands back one table
+-- per occupied slot and an endgame inventory can hold a thousand of them. Paging limits
+-- what is encoded and sent, not what is read, so this caps the read itself.
+Config.maxInventorySlots = 2000
+
+-- How often the trash sweeper starts a pass over one faction's inventory, in seconds. A
+-- pass is the expensive part - one getItems() and a walk over every slot - so this is the
+-- real cost knob. Items picked up between two passes keep their tags until the next one.
+Config.trashSweepInterval = 120
+
+-- The pass itself is sliced across server ticks, which is the whole point of it: a trash
+-- manager that marks a full inventory inside one tick is a trash manager that freezes the
+-- server for as long as that takes. These are per tick of the bridge's poll loop, which
+-- runs every Config.pollInterval, so the defaults walk about 250 slots and write about 15
+-- tags a second - an inventory of a thousand items takes a few seconds of wall clock and
+-- no measurable share of any single tick.
+Config.trashSweepItemsPerTick = 50
+Config.trashSweepWritesPerTick = 3
+
+-- Factions whose inventory is swept in the same tick. One at a time keeps the per-tick
+-- cost flat no matter how many players have the manager turned on; the rest wait their
+-- turn, which costs them nothing but time.
+Config.trashSweepFactionsPerTick = 1
+
+-- Recent decisions kept per faction, so the console can show what the sweeper did and
+-- which rule did it.
+Config.trashSweepLogSize = 50
+
+-- Server value keys: one ruleset per owning faction, and the index of factions that have
+-- one, which is what the sweeper walks.
+Config.trashRulesValuePrefix = "automationapi_trash_"
+Config.trashRulesIndexValue = "automationapi_trash_factions"
 
 -- #### LOCATIONS #### --
 

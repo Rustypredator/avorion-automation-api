@@ -12,7 +12,7 @@ galaxy map.
 
 [![Steam Workshop](https://img.shields.io/badge/Steam_Workshop-Automation_API-1b2838?logo=steam&logoColor=white)](https://steamcommunity.com/sharedfiles/filedetails/?id=3799355928)
 [![Avorion 2.5+](https://img.shields.io/badge/Avorion-2.5%2B-1f6feb)](https://www.avorion.net/)
-[![version 0.7.1](https://img.shields.io/badge/version-0.7.1-8957e5)](modinfo.lua)
+[![version 0.8.0](https://img.shields.io/badge/version-0.8.0-8957e5)](modinfo.lua)
 [![server-side only](https://img.shields.io/badge/server--side-only-2ea043)](#install)
 [![Lua 5.2 sandbox](https://img.shields.io/badge/Lua-5.2%20sandbox-2C2D72?logo=lua&logoColor=white)](#how-it-talks-to-the-outside-world)
 [![license](https://img.shields.io/github/license/Rustypredator/avorion-automation-api?color=3fb950)](LICENSE)
@@ -116,7 +116,7 @@ either side.
 Start it. The server console should show `Found 1 mods` and then two lines from the mod:
 
 ```
-AutomationAPI: v0.7.1 ready, API v1, transport directory: moddata/AutomationAPI
+AutomationAPI: v0.8.0 ready, API v1, transport directory: moddata/AutomationAPI
 AutomationAPI: transport directories ready: requests, responses, events, keys
 ```
 
@@ -226,6 +226,26 @@ The standing orders on the **Orders** and **Automation** tabs include **break of
 set a hull or shield threshold in percent and where the craft should go, and it clears its
 chain and jumps out rather than dying where it stands. Beside it the console shows the hull
 and shield the craft itself last published, and how its last run ended.
+
+The **Inventory** tab is everything the faction holds - turrets, system upgrades, usable
+items - in one table, with a filter bar over item type, weapon class, slot type, damage
+type, rarity range, material, dps and tech level, plus a name search and the game's own
+favourite/trash marks. Filtering and sorting happen on the server, so a thousand-item hoard
+narrows as fast as a small one. Rows carry both `vs hull` and `vs shield` dps, which is what
+makes two guns of the same raw dps comparable. Tick rows to favourite or bin them in bulk.
+
+Underneath it is the **trash manager**: thresholds the server applies by itself, so junk is
+already marked by the time you dock at a scrapyard. A rule is a mark - trash, favourite or
+keep - and the conditions that have to hold; rules are tried in order and the first that
+matches decides, so a *keep exotics* rule above a *trash anything under 400 dps* rule is how
+an exception is written. **Preview** shows exactly what a rule set would do, item by item,
+before anything is written. Favourites and mission items are never touched.
+
+It is built to be slow on purpose. The sweeper walks a few items per server tick and writes
+at most a few marks per tick, so marking a full inventory takes seconds of wall clock and
+never blocks the tick - which is the whole difference between this and a trash manager that
+freezes the server while it works. The tab shows the pass as it goes and logs what it
+marked and why.
 
 The **Keys** tab is your credentials: the API keys the mod issued you, and which of them
 the bridge's background services are allowed to call the API with. See
@@ -489,6 +509,10 @@ Full reference in [docs/api.md](docs/api.md).
 | `GET /stations`, `GET /stations/{name}` | your stations' books: production, goods, earnings |
 | `GET /economy` | the faction ledger, and what its stations have made |
 | `GET /stations/{name}/events`, `GET /economy/events` | what stations actually did: trades at real prices, production cycles, reload catch-up |
+| `GET /inventory`, `POST /inventory/search` | every turret, upgrade and item the faction holds, filtered on any stat - rarity, dps, tech, material, weapon class |
+| `GET /inventory/stats`, `GET /inventory/vocabulary` | what is in there by type and rarity, and every stat a filter or rule may name |
+| `POST /inventory/tags` | set the game's own favourite and trash flags on slots, in a batch |
+| `GET`/`POST /inventory/trash`, `.../preview`, `.../run` | the trash manager: thresholds the server applies by itself, a few items per tick so it never stalls |
 | `GET /galaxy/info`, `GET /galaxy/route` | galaxy shape, and route planning |
 | `GET /map/sectors`, `GET /map/sectors/{x}/{y}` | known sectors |
 | `GET /map/predict/{x}/{y}`, `GET /map/search` | unvisited sectors, from the seed |
@@ -511,6 +535,11 @@ key holder online". Alliance craft raise their callbacks on the Alliance object 
 online member's agent registers against them, so an alliance fleet keeps recording while any
 one member is in game - whoever that is. Only personal craft go quiet when their own owner
 logs out. `recording` and `watchers` on the event feed say which case you are in.
+
+**The inventory is the exception to the paragraph above.** It lives on the Player or
+Alliance object rather than in a running player script, so reading it *and* setting an
+item's favourite or trash mark both work with everyone logged out - verified against a real
+server with nobody in game. The trash manager therefore keeps sweeping on an empty galaxy.
 
 **Mission automation** keeps its rules on the server and its loop in the bridge, so no client
 has to stay connected - but each start it makes is still a start, and waits until the owner

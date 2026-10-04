@@ -9,7 +9,7 @@ Service metadata. Call it first to check the API version.
 
 ```json
 {
-  "api": 1, "mod": "0.7.1", "game": "2.5.13",
+  "api": 1, "mod": "0.8.0", "game": "2.5.13",
   "galaxy": {"name": "defaultgalaxy", "seed": "..."},
   "server": {"runtime": 1234.5, "players": 1},
   "player": {"index": 1, "name": "...", "online": true,
@@ -2101,6 +2101,336 @@ It is capped at 10000 sectors per request and is deliberately spread across serv
 rather than run in one, so it takes a few seconds of wall clock and does not stall the
 server. Sectors are ruled out by a cheap seed hash first, and only the ~3% holding regular
 content cost a full generator run.
+
+# Inventory
+
+The faction's own inventory: turrets, system upgrades, usable items and the rest, plus the
+two flags the game keeps on each of them - **favourite** and **trash**. Those are not this
+mod's invention: they are what the scrapyard's "sell all trash" and the research station's
+auto-research read, and what the star and the bin icon in the game's own inventory window
+set.
+
+Everything here works with the owning player logged out. The inventory lives on the Player
+or Alliance rather than in a running player script, so reads and tag writes both go
+straight from the galaxy bridge - there is no job queue in this path and no
+`409 owner_offline`.
+
+Two things are worth knowing before building against it:
+
+- **Slot indices are 0-based and sparse.** They are the engine's own, they are the only
+  handle a tag write has, and they shift as items are added and removed. An index read
+  thirty seconds ago may hold something else now, which is why every write re-reads the
+  slot and refuses one whose item no longer matches (see
+  [POST /inventory/tags](#post-inventorytags)).
+- **A stack is one slot with one flag.** Favouriting a stack of five favourites all five.
+
+## The stat vocabulary
+
+Filters and trash rules are written in one vocabulary, because they are the same question:
+"which of these is junk" is how you decide, and "mark these as junk" is the rule you then
+write. A condition is `{stat, op, value}`:
+
+```json
+{"stat": "dps", "op": "atMost", "value": 400}
+{"stat": "rarity", "op": "atMost", "value": "Rare"}
+{"stat": "category", "op": "oneOf", "value": ["Mining", "Salvaging"]}
+{"stat": "name", "op": "contains", "value": "Chaingun"}
+```
+
+| kind | stats | operators |
+|---|---|---|
+| number | `dps`, `hullDps`, `shieldDps`, `damage`, `fireRate`, `reach`, `accuracy`, `efficiency`, `shieldPenetration`, `tech`, `slots`, `size`, `numWeapons`, `energyPerSecond`, `crew`, `price`, `energy`, `amount` | `atMost`, `atLeast`, `is`, `isNot` |
+| rank | `rarity`, `material` | `atMost`, `atLeast`, `is`, `isNot`, `oneOf` |
+| choice | `type`, `category`, `slotType`, `damageType` | `is`, `isNot`, `oneOf` |
+| text | `name`, `weaponName` | `contains`, `is`, `isNot` |
+| flag | `armed`, `coaxial`, `seeker`, `ancient`, `favorite`, `trash`, `missionRelevant`, `stackable` | `is` |
+
+A **rank** is ordered and compared by name, not by number: `rarity atMost Rare` means Petty,
+Common, Uncommon or Rare, whatever integers the engine happens to use for them (Petty really
+is -1). Rarities run `Petty, Common, Uncommon, Rare, Exceptional, Exotic, Legendary` and
+materials `Iron, Titanium, Naonite, Trinium, Xanion, Ogonite, Avorion`. Names are matched
+without regard to case and stored in their canonical spelling.
+
+**A stat the item does not carry never matches.** A system upgrade has no `dps`, so
+`dps atMost 400` leaves every upgrade out rather than sweeping them all in. Rules that mean
+to span item types say so with a `type` condition.
+
+`GET /inventory/vocabulary` publishes all of the above, so a client need not hardcode it.
+
+## GET /inventory
+
+The caller's items, filtered, sorted and paged.
+
+| query | values | default |
+|---|---|---|
+| `owner` | `player`, `alliance` | `player` |
+| `type` | `turret`, `template`, `upgrade`, `item`, `usable` | all |
+| `category` | `Armed`, `Mining`, `Salvaging`, `Heal`, `None` | all |
+| `slotType` | `Unspecified`, `Armed`, `Unarmed`, `PointDefense` | all |
+| `damageType` | `Physical`, `Energy`, `AntiMatter`, ... | all |
+| `material` | a material name; means "this or better" | all |
+| `rarityMin`, `rarityMax` | a rarity name, inclusive | all |
+| `dpsMin`, `dpsMax`, `techMin` | numbers | - |
+| `search` | part of the name, case-insensitive | - |
+| `tag` | `favorite`, `trash`, `untagged` | all |
+| `sort` | any stat above | slot order |
+| `order` | `asc`, `desc` | `asc` |
+| `page`, `pageSize` | 1 - 1000 | 1, 100 |
+
+```jsonc
+{
+  "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "inventory": {"occupied": 26, "maxSlots": 1000, "slots": 26, "described": 26, "truncated": false},
+  "matched": 11, "page": 1, "pageSize": 100,
+  "items": [
+    {
+      "index": 17, "amount": 1, "type": "turret", "name": "Triple Chaingun Turret",
+      "title": "Ionized Triple Minigun T-P", "weaponName": "Chaingun", "prefix": "Ionized",
+      "rarity": {"type": 4, "value": 4, "name": "Exotic"},
+      "favorite": false, "trash": false, "stackable": false, "missionRelevant": false,
+      "category": "Armed", "slotType": "Armed", "damageType": "Physical",
+      "dps": 94.8, "damage": 6.3, "fireRate": 5.01, "reach": 500, "accuracy": 0.98,
+      "hullMultiplier": 1.5, "shieldMultiplier": 0.2, "hullDps": 142.2, "shieldDps": 18.9,
+      "efficiency": 0, "tech": 22, "maxTech": 24,
+      "material": {"value": 3, "name": "Trinium"},
+      "slots": 1.5, "size": 1, "numWeapons": 3,
+      "armed": true, "coaxial": false, "seeker": false, "ancient": false,
+      "energyPerSecond": 0, "crew": 2
+    },
+    {
+      "index": 12, "amount": 4, "type": "upgrade", "name": "Cargo Extension",
+      "rarity": {"type": 2, "value": 2, "name": "Rare"},
+      "favorite": false, "trash": false, "stackable": true, "missionRelevant": false,
+      "price": 25000, "icon": "data/textures/icons/...", "script": "data/scripts/systems/cargo.lua",
+      "energy": 0
+    }
+  ]
+}
+```
+
+Which fields a record carries depends on what the item is: a turret has weapon stats and no
+`price`, an upgrade has a `price` and no weapon stats. That is the engine's doing, not a
+choice here - reading a property an item type does not have raises inside the game and
+writes a traceback to the server log, so each type is read against a fixed list.
+
+`hullDps` and `shieldDps` are `dps` already multiplied by the turret's hull and shield
+multipliers, which is what makes two guns of the same `dps` comparable.
+
+`truncated` is `true` when the inventory holds more slots than one read describes (2000),
+in which case `matched` counts only what was read.
+
+## POST /inventory/search
+
+The same listing for filters that do not fit in a query string. `sort`, `order`, `page` and
+`pageSize` stay in the query, so a search can be paged through without resending it.
+
+```json
+{"conditions": [{"stat": "type", "op": "is", "value": "turret"},
+                {"stat": "category", "op": "is", "value": "Armed"},
+                {"stat": "dps", "op": "atMost", "value": 400}]}
+```
+
+Every condition has to hold. The answer is that of `GET /inventory`, plus the normalised
+`conditions` back.
+
+## GET /inventory/stats
+
+Facet counts over the whole inventory, for a client deciding which filters are worth
+offering.
+
+```json
+{
+  "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "slots": 26, "items": 36, "favorites": 2, "trashed": 6,
+  "byType": {"turret": 11, "upgrade": 8, "usable": 7},
+  "byRarity": {"Petty": 1, "Common": 2, "Rare": 8, "Exceptional": 2, "Exotic": 11, "Legendary": 2},
+  "byCategory": {"Armed": 6, "Mining": 5},
+  "inventory": {"occupied": 26, "maxSlots": 1000, "slots": 26, "described": 26, "truncated": false}
+}
+```
+
+`slots` counts occupied slots and `items` what those slots hold, which differ wherever
+anything stacks.
+
+## GET /inventory/vocabulary
+
+Every stat, operator and value name the API accepts.
+
+```json
+{
+  "stats": [{"stat": "rarity", "kind": "rank", "ops": ["atLeast", "atMost", "is", "isNot", "oneOf"],
+             "values": ["Petty", "Common", "Uncommon", "Rare", "Exceptional", "Exotic", "Legendary"]}],
+  "marks": ["trash", "favorite", "keep"],
+  "types": ["turret", "template", "upgrade", "item", "usable"],
+  "rarities": ["Petty", "..."], "materials": ["Iron", "..."],
+  "maxRules": 24, "maxConditions": 10
+}
+```
+
+## POST /inventory/tags
+
+Sets the two flags by hand, in a batch. Alliance inventories need the `SpendItems`
+privilege, which is what the game's own shops check before they cycle an item's tags.
+
+```jsonc
+{"indices": [3, 7, 12], "mark": "trash"}     // trash | favorite | none
+```
+
+or, per slot:
+
+```jsonc
+{
+  "items": [{"index": 3, "trash": true},
+            {"index": 7, "favorite": true}],
+  "strict": true                              // default; see below
+}
+```
+
+A flag left out keeps whatever the item already had, so favouriting something does not
+require knowing its trash flag. Asking for both at once is not possible - the game shows
+one or the other - so the one named in the call wins.
+
+```json
+{
+  "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "changed": 2,
+  "results": [
+    {"index": 3, "ok": true, "name": "Chaingun Turret", "favorite": false, "trash": true, "reason": "written"},
+    {"index": 7, "ok": true, "name": "Mining Turret", "favorite": false, "trash": true, "reason": "unchanged"},
+    {"index": 12, "ok": false, "reason": "gone"}
+  ]
+}
+```
+
+Each slot answers for itself rather than failing the request, so a client marking thirty
+items does not lose twenty-nine of them to one stale row. `reason` is `written`,
+`unchanged` (the item already had those flags, so nothing was written), `gone` (the slot is
+empty now) or `changed` (it holds a different item than the one read). `strict: false`
+skips the identity check and writes by index alone.
+
+# The trash manager
+
+Thresholds the server applies to the inventory by itself: below this rarity, below this
+dps, mark it as trash, and then sell or research the lot in one go in game.
+
+**It is deliberately slow.** Marking a late-game inventory is a few hundred `setItemTags`
+calls plus the property reads to decide each one, and doing that in a single pass means the
+server does nothing else until it finishes. Instead a pass is started at most every
+`trashSweepInterval` (120s) and only takes the list of occupied slot numbers in the tick
+that starts it; deciding about an item and writing its flags happen afterwards, a few per
+tick, bounded by `trashSweepItemsPerTick` (50) and `trashSweepWritesPerTick` (3). A pass
+over a thousand items takes a few seconds of wall clock and a sliver of each tick in
+between. Nothing is waiting for it.
+
+Each slot is re-read at the moment it is written, so a pass that started before an item was
+sold does not mark whatever landed in its slot afterwards.
+
+Two things are never marked, whatever the rules say:
+
+- **a favourite.** Favourite is the player saying "not this one"; a rule that overrode it
+  would make the flag useless.
+- **a mission item.** The game hides those from selling for a reason, and marking one as
+  trash points the scrapyard straight at it.
+
+## GET /inventory/trash
+
+The rules, and what the sweeper has been doing.
+
+```json
+{
+  "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "enabled": true, "restore": false, "skipTagged": false,
+  "rules": [
+    {"name": "hands off the good stuff", "mark": "keep", "enabled": true,
+     "conditions": [{"stat": "rarity", "op": "atLeast", "value": "Exotic"}]},
+    {"name": "weak guns", "mark": "trash", "enabled": true,
+     "conditions": [{"stat": "category", "op": "is", "value": "Armed"},
+                    {"stat": "dps", "op": "atMost", "value": 400}]}
+  ],
+  "revision": 3,
+  "updatedBy": {"index": 1, "name": "Rusty"}, "updatedAt": 1757719400,
+  "interval": 120, "now": 64498.8,
+  "sweep": {
+    "phase": "idle", "message": "26 items looked at, 6 marked, 0 unmarked.",
+    "since": 64498.8, "passes": 1, "nextIn": 109.3,
+    "progress": null,
+    "counts": {"scanned": 26, "marked": 6, "restored": 0, "skipped": 20, "failed": 0},
+    "lastPass": {"at": 64498.8, "duration": 0.6, "scanned": 26, "marked": 6, "restored": 0, "failed": 0},
+    "log": [{"at": 64498.4, "message": "Double Chaingun Turret -> trash (weak guns)"}]
+  }
+}
+```
+
+`phase` is `idle` or `running`; while running, `progress` is `{done, total}`. Times in
+`sweep` are the server's own runtime clock, which is why `now` says what that clock reads -
+the two make an age.
+
+## POST /inventory/trash
+
+Saves the whole ruleset. Rules are ordered and the order is what decides, so there is no
+sensible way to change one in isolation. Needs `SpendItems` on an alliance.
+
+```jsonc
+{
+  "enabled": true,
+  "restore": false,       // take marks back off items that no longer match any rule
+  "skipTagged": false,    // only decide about items nobody has tagged by hand
+  "ifRevision": 3,        // optional; 409 rules_changed if someone saved in the meantime
+  "rules": [
+    {"name": "weak guns", "mark": "trash", "enabled": true,
+     "conditions": [{"stat": "dps", "op": "atMost", "value": 400}]}
+  ]
+}
+```
+
+`mark` is `trash`, `favorite` or `keep`. Rules are tried in order and **the first that
+matches decides**, so a `keep` rule above a `trash` rule is how an exception is written.
+
+A `trash` or `favorite` rule with no conditions is refused with `400 bad_rule`: it would
+mark the entire inventory, which is never what anybody meant. A `keep` rule may have none -
+a catch-all at the bottom is a reasonable way to say "and nothing else".
+
+`restore` is off by default. Without it a decision only ever adds a mark, so tightening a
+threshold leaves yesterday's marks in place; with it, anything that no longer matches is
+unmarked on the next pass. Off is the safe default because something marked by hand stays
+marked.
+
+Saving with `enabled` brings the next pass forward; the pass itself still runs at the same
+pace. At most 24 rules, 10 conditions each.
+
+Turning the manager off, or saving an empty ruleset, removes the faction from the sweeper's
+list entirely - an idle faction costs nothing per tick.
+
+## POST /inventory/trash/preview
+
+What the rules would do to the inventory as it stands, changing nothing. This is the call to
+make before turning the manager on.
+
+Send a full ruleset to preview rules being edited, or `{}` to preview the stored ones.
+`page` and `pageSize` page the changes.
+
+```json
+{
+  "owner": {"kind": "player", "index": 1, "name": "Rusty"},
+  "inventory": {"occupied": 26, "maxSlots": 1000},
+  "enabled": true,
+  "counts": {"trash": 6, "favorite": 0, "restore": 0, "unchanged": 20},
+  "changes": [
+    {"index": 3, "name": "Double Chaingun Turret", "type": "turret", "rarity": "Rare",
+     "dps": 43.2, "amount": 1, "was": {"favorite": false, "trash": false},
+     "becomes": "trash", "rule": "weak guns"}
+  ],
+  "total": 6, "page": 1, "pageSize": 100
+}
+```
+
+`becomes` is `trash`, `favorite` or `restore`, and `rule` names the rule that decided.
+
+## POST /inventory/trash/run
+
+Brings the next pass forward. Answers `202` with the same `sweep` block as above; the pass
+still runs in the background at the same pace, so the answer is what the sweeper is doing,
+not what it did. `409 trash_disabled` if the ruleset is turned off.
 
 # Bridge-local endpoints
 

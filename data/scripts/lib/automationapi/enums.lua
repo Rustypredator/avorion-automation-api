@@ -46,7 +46,16 @@ Enums.malusReason = reverse(MalusReason,
     {"None", "Reconstruction", "Boarding", "RiftTeleport"})
 
 Enums.weaponCategory = reverse(WeaponCategory,
-    {"Armed", "Mining", "Salvaging", "Heal"})
+    {"Armed", "Mining", "Salvaging", "Heal", "None"})
+
+Enums.turretSlotType = reverse(TurretSlotType,
+    {"Unspecified", "Armed", "Unarmed", "PointDefense"})
+
+Enums.damageType = reverse(DamageType,
+    {"Physical", "Energy", "AntiMatter", "Electric", "Plasma", "Fragments", "None"})
+
+Enums.inventoryItemType = reverse(InventoryItemType,
+    {"Turret", "TurretTemplate", "SystemUpgrade", "VanillaItem", "UsableItem"})
 
 function Enums.name(map, value)
     if value == nil then return nil end

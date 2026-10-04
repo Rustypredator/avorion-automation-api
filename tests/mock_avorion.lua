@@ -110,7 +110,12 @@ function M.install()
         return p
     end
 
-    _G.Alliance = function()
+    -- Alliance() with no argument means "the alliance this script is attached to", which
+    -- only an alliance script has. Alliance(index) is the engine's lookup by number and
+    -- works anywhere, which is how the galaxy bridge reaches one.
+    _G.Alliance = function(index)
+        if index ~= nil then return M.alliances[index] end
+
         return M.inAllianceAgent and M.alliances[M.inAllianceAgent] or nil
     end
     _G.isAllianceScript = function() return M.inAllianceAgent ~= nil end
@@ -153,8 +158,20 @@ function M.install()
     _G.CrewProfessionType = engineEnum({None = 0, Engine = 1, Gunner = 2, Miner = 3, Repair = 4,
                              Pilot = 5, Security = 6, Attacker = 7, Number = 8})
     _G.MalusReason = engineEnum({None = 0, Reconstruction = 1, Boarding = 2, RiftTeleport = 3})
-    _G.WeaponCategory = engineEnum({Armed = 0, Mining = 1, Salvaging = 2, Heal = 3})
-    _G.AlliancePrivilege = engineEnum({ManageShips = 15, ManageStations = 14, SpendResources = 13})
+    _G.WeaponCategory = engineEnum({Armed = 0, Mining = 1, Salvaging = 2, Heal = 3, None = 4})
+    _G.AlliancePrivilege = engineEnum({ManageShips = 15, ManageStations = 14, SpendResources = 13,
+                             SpendItems = 7, TakeItems = 8, AddItems = 6})
+    _G.InventoryItemType = engineEnum({Turret = 0, TurretTemplate = 1, SystemUpgrade = 2,
+                             VanillaItem = 3, UsableItem = 4})
+    -- Petty really is -1 in the game, and a threshold that compared raw numbers rather
+    -- than positions in the rarity order would get that wrong in exactly one direction.
+    _G.RarityType = engineEnum({Petty = -1, Common = 0, Uncommon = 1, Rare = 2,
+                      Exceptional = 3, Exotic = 4, Legendary = 5})
+    _G.MaterialType = engineEnum({Iron = 0, Titanium = 1, Naonite = 2, Trinium = 3,
+                        Xanion = 4, Ogonite = 5, Avorion = 6})
+    _G.TurretSlotType = engineEnum({Unspecified = 0, Armed = 1, Unarmed = 2, PointDefense = 3})
+    _G.DamageType = engineEnum({Physical = 0, Energy = 1, AntiMatter = 2, Electric = 3,
+                      Plasma = 4, Fragments = 5, None = 6})
 
     _G.valid = function(o) return o ~= nil end
 
@@ -845,6 +862,228 @@ function M.addShip(factionIndex, name, spec)
     return spec
 end
 
+-- #### INVENTORIES #### --
+--
+-- Hostile in the one way the real inventory is hostile: reading a property the item's
+-- type does not carry RAISES rather than returning nil, exactly as the engine does (and
+-- the engine also writes a traceback to the server log every time, which is why the mod
+-- is not allowed to probe). An InventoryTurret has no price; a SystemUpgradeTemplate has
+-- no dps. A test that only ever saw nil would never catch the mod reading the wrong
+-- field for a type.
+--
+-- The value types are the same shape as the engine's: Rarity carries type, value and
+-- name, Material carries value and name and NO type.
+
+local RARITY_NAMES = {[-1] = "Petty", [0] = "Common", [1] = "Uncommon", [2] = "Rare",
+                      [3] = "Exceptional", [4] = "Exotic", [5] = "Legendary"}
+local MATERIAL_NAMES = {[0] = "Iron", [1] = "Titanium", [2] = "Naonite", [3] = "Trinium",
+                        [4] = "Xanion", [5] = "Ogonite", [6] = "Avorion"}
+
+-- Userdata-ish: only the listed fields answer, anything else raises the way the engine's
+-- "Property not found or not readable" does.
+local function strictFields(typeName, fields)
+    return setmetatable({}, {
+        __index = function(_, key)
+            if fields[key] ~= nil then return fields[key] end
+            error("Property not found or not readable: " .. typeName .. "." .. key, 0)
+        end,
+        __newindex = function(_, key, value)
+            if fields[key] == nil then
+                error("Property not found or not readable: " .. typeName .. "." .. key, 0)
+            end
+            fields[key] = value
+        end,
+    })
+end
+
+local function rarityValue(value)
+    return strictFields("Rarity", {type = value, value = value, name = RARITY_NAMES[value]})
+end
+
+local function materialValue(value)
+    -- No `type`. The real Material has none, and the mod found that out the hard way.
+    return strictFields("Material", {value = value, name = MATERIAL_NAMES[value]})
+end
+
+-- The fields each item type carries, straight off the generated API documentation. Only
+-- what the mod reads is listed; adding a field to the mod means adding it here, against
+-- the types that really have it.
+local WEAPON_FIELDS =
+{
+    "weaponName", "title", "weaponPrefix", "category", "slotType", "damageType", "dps",
+    "damage", "fireRate", "reach", "accuracy", "shotSpeed", "shieldPenetration",
+    "hullDamageMultiplier", "shieldDamageMultiplier", "bestEfficiency", "averageTech",
+    "maxTech", "material", "slots", "size", "numWeapons", "armed", "coaxial", "seeker",
+    "ancient", "baseEnergyPerSecond", "crew",
+}
+
+local COMMON_FIELDS = {"itemType", "name", "rarity", "favorite", "trash", "stackable",
+                       "missionRelevant"}
+
+local TYPE_FIELDS =
+{
+    [0] = WEAPON_FIELDS,                                    -- Turret
+    [1] = WEAPON_FIELDS,                                    -- TurretTemplate
+    [2] = {"price", "icon", "script", "seed"},              -- SystemUpgrade
+    [3] = {"price", "icon", "tradeable", "droppable"},      -- VanillaItem
+    [4] = {"price", "icon", "tradeable", "droppable", "script"}, -- UsableItem
+}
+
+local WEAPON_DEFAULTS =
+{
+    weaponName = "Chaingun", title = "Chaingun Turret", weaponPrefix = "",
+    category = 0, slotType = 1, damageType = 0, dps = 100, damage = 10, fireRate = 10,
+    reach = 500, accuracy = 0.9, shotSpeed = 1000, shieldPenetration = 0,
+    hullDamageMultiplier = 1, shieldDamageMultiplier = 1, bestEfficiency = 0,
+    averageTech = 10, maxTech = 10, slots = 1, size = 1, numWeapons = 1, armed = true,
+    coaxial = false, seeker = false, ancient = false, baseEnergyPerSecond = 0,
+}
+
+local OTHER_DEFAULTS =
+{
+    price = 1000, icon = "data/textures/icons/thing.png", script = "data/scripts/systems/x.lua",
+    seed = 1, tradeable = true, droppable = true,
+}
+
+-- spec: {type = 0..4, name, rarity, dps, ...}. Anything not given takes a default that
+-- suits the type; anything given for a type that cannot carry it is an error in the test.
+local function makeItem(spec)
+    local itemType = spec.type or 0
+    local fields =
+    {
+        itemType = itemType,
+        name = spec.name or "Item",
+        rarity = rarityValue(spec.rarity or 0),
+        favorite = spec.favorite == true,
+        trash = spec.trash == true,
+        stackable = spec.stackable ~= false,
+        missionRelevant = spec.missionRelevant == true,
+    }
+
+    local defaults = (itemType == 0 or itemType == 1) and WEAPON_DEFAULTS or OTHER_DEFAULTS
+
+    for _, name in ipairs(TYPE_FIELDS[itemType] or {}) do
+        local given = spec[name]
+        if given == nil then given = defaults[name] end
+        fields[name] = given
+    end
+
+    -- Two fields are objects rather than plain values, and only on weapons.
+    if itemType == 0 or itemType == 1 then
+        fields.material = materialValue(spec.material or 0)
+        fields.crew = strictFields("Crew", {size = spec.crew or 1})
+        -- `title` is a Format object in the game, not a string: it answers `text` with an
+        -- unfilled template and evaluate() with the readable line.
+        local title = spec.title or fields.title
+        fields.title = strictFields("Format",
+            {text = "%1%%2%", evaluate = function() return title end})
+    end
+
+    local item = strictFields(spec.typeName or "InventoryItem", fields)
+
+    -- getEnergy is a function rather than a property, and only system upgrades have it.
+    if itemType == 2 then
+        fields.getEnergy = function(_, permanent) return permanent and 100 or 50 end
+    end
+
+    return item, fields
+end
+
+-- factionIndex -> {maxSlots, slots = {[index] = {item, amount, fields}}}
+local inventories = {}
+
+local function inventoryOf(factionIndex)
+    local store = inventories[factionIndex]
+    if not store then
+        store = {maxSlots = 1000, slots = {}, nextIndex = 0}
+        inventories[factionIndex] = store
+    end
+
+    return store
+end
+
+-- Adds one item. Returns its slot index, which is 0-based and sparse exactly as the
+-- engine's is.
+function M.addItem(factionIndex, spec)
+    local store = inventoryOf(factionIndex)
+    local item, fields = makeItem(spec or {})
+
+    local index = spec and spec.index or store.nextIndex
+    store.nextIndex = math.max(store.nextIndex, index + 1)
+    store.slots[index] = {item = item, amount = (spec and spec.amount) or 1, fields = fields}
+
+    return index
+end
+
+function M.removeItem(factionIndex, index)
+    inventoryOf(factionIndex).slots[index] = nil
+end
+
+-- What the item at a slot actually holds now, for a test checking what a write did.
+function M.itemAt(factionIndex, index)
+    local slot = inventoryOf(factionIndex).slots[index]
+    return slot and slot.fields or nil
+end
+
+-- Every setItemTags the mod made, in order, so a test can assert on how MANY writes a
+-- sweep did rather than only on where it ended up.
+M.tagWrites = {}
+
+local function addInventoryApi(faction)
+    function faction:getInventory()
+        local store = inventoryOf(self.index)
+        local inventory = {}
+
+        -- The engine hands back a FLAT map, index -> {item, amount}. Not nested by type,
+        -- whatever the documentation says.
+        function inventory:getItems()
+            local items = {}
+            for index, slot in pairs(store.slots) do
+                items[index] = {item = slot.item, amount = slot.amount}
+            end
+            return items
+        end
+
+        function inventory:find(index)
+            local slot = store.slots[index]
+            return slot and slot.item or nil
+        end
+
+        function inventory:amount(index)
+            local slot = store.slots[index]
+            return slot and slot.amount or 0
+        end
+
+        function inventory:setItemTags(index, favorite, trash)
+            local slot = store.slots[index]
+            if not slot then error("no item in slot " .. tostring(index), 0) end
+
+            slot.fields.favorite = favorite == true
+            slot.fields.trash = trash == true
+
+            M.tagWrites[#M.tagWrites + 1] =
+            {
+                faction = faction.index, index = index,
+                favorite = favorite == true, trash = trash == true,
+            }
+        end
+
+        return setmetatable(inventory, {__index = function(_, key)
+            if key == "maxSlots" then return store.maxSlots end
+            if key == "occupiedSlots" then
+                local n = 0
+                for _ in pairs(store.slots) do n = n + 1 end
+                return n
+            end
+            if key == "empty" then return next(store.slots) == nil end
+
+            error("Property not found or not readable: Inventory." .. key, 0)
+        end})
+    end
+end
+
+-- (access goes through M.itemAt; the table itself is replaced on reset)
+
 -- The faction ledger, shared by Player and Alliance. Resources come back as one value
 -- per material rather than a table, exactly as the engine returns them.
 local function addLedgerApi(faction)
@@ -988,6 +1227,7 @@ function M.addPlayer(index, name)
 
     addCraftApi(p)
     addLedgerApi(p)
+    addInventoryApi(p)
 
     players[index] = p
 
@@ -1069,6 +1309,7 @@ function M.addAlliance(index, name, memberIndex, privileges, members)
 
     addCraftApi(a)
     addLedgerApi(a)
+    addInventoryApi(a)
     M.alliances[index] = a
 
     for _, who in ipairs(roster) do
@@ -1118,6 +1359,8 @@ function M.reset()
     playerValues = {}
     players = {}
     ships = {}
+    inventories = {}
+    M.tagWrites = {}
     M.alliances = {}
     M.inAllianceAgent = nil
     M.asyncQueue = {}
